@@ -1,17 +1,4 @@
-#define GLFW_INCLUDE_ES2
-#include <GLFW/glfw3.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
-
-#define VIDEO_W 640
-#define VIDEO_H 480
+#include "main.h"
 
 // FFmpeg Global State
 AVFormatContext *fmt_ctx = NULL;
@@ -24,60 +11,16 @@ AVPacket *pkt = NULL;
 int video_stream_idx = -1;
 uint8_t *buffer = NULL;
 
+// Position (x,y)   Texcoord (u,v)
+GLfloat quad[] = {
+  -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+  -1.0f, 1.0f,  0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 0.0f,
+};
+
+// HW_ACCEL
 AVBufferRef *hw_device_ctx = NULL;
 enum AVPixelFormat hw_pix_fmt;
 
-void framebuffer_size_callback(GLFWwindow *window, int width, int height);
-
-const char *vs_src = "attribute vec2 aPos;\n"
-                     "attribute vec2 aTex;\n"
-                     "varying vec2 vTex;\n"
-                     "void main() {\n"
-                     "  vTex = aTex;\n"
-                     "  gl_Position = vec4(aPos, 0.0, 1.0);\n"
-                     "}\n";
-
-const char *fs_src = "precision mediump float;\n"
-                     "varying vec2 vTex;\n"
-                     "uniform sampler2D uTex;\n"
-                     "void main() {\n"
-                     "  gl_FragColor = texture2D(uTex, vTex);\n"
-                     "}\n";
-
-// Position (x,y)   Texcoord (u,v)
-GLfloat quad[] = {
-    -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
-    -1.0f, 1.0f,  0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 0.0f,
-};
-
-GLuint create_program(const char *vs, const char *fs);
-void update_video_frame(GLuint tex_id);
-int open_video(const char *filename);
-char *read_file(const char *filename);
-void upload_yuv_textures(AVFrame *frame, GLuint texY, GLuint texU, GLuint texV);
-void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV);
-void upload_plane(GLuint texID, int width, int height, int linesize,
-                  uint8_t *data);
-
-static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
-                                        const enum AVPixelFormat *pix_fmts) {
-  for (const enum AVPixelFormat *p = pix_fmts; *p != -1; p++) {
-    if (*p == hw_pix_fmt)
-      return *p;
-  }
-  fprintf(stderr, "Failed to get HW surface format.\n");
-  return AV_PIX_FMT_NONE;
-}
-
-int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
-  int err = 0;
-  // For Fedora use AV_HWDEVICE_TYPE_VAAPI. For Embedded, you might use DRM.
-  if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
-    return err;
-  }
-  ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-  return 0;
-}
 
 int main(int argc, char **argv) {
 
@@ -107,7 +50,6 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  //
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   GLuint texY, texU, texV;
   glGenTextures(1, &texY);
@@ -134,7 +76,6 @@ int main(int argc, char **argv) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  //
 
   char *vs_code = read_file("shader.vs");
   char *fs_code = read_file("shader.fs");
@@ -145,18 +86,17 @@ int main(int argc, char **argv) {
     free(vs_code);
     free(fs_code);
   } else {
-    program = create_program(vs_src, fs_src);
+    fprintf(stderr, "Shaders couldnt opened!");
+    return -1;
   }
 
   GLint aPos = glGetAttribLocation(program, "aPos");
   GLint aTex = glGetAttribLocation(program, "aTex");
 
-  //
   // Get uniform locations
   GLint locY = glGetUniformLocation(program, "uTexY");
   GLint locU = glGetUniformLocation(program, "uTexU");
   GLint locV = glGetUniformLocation(program, "uTexV");
-  //
 
   glEnableVertexAttribArray(aPos);
   glEnableVertexAttribArray(aTex);
@@ -513,6 +453,26 @@ void upload_yuv_textures(AVFrame *frame, GLuint texY, GLuint texU,
   // 3. Upload V plane (Chroma Red)
   upload_plane(texV, frame->width / 2, frame->height / 2, frame->linesize[2],
                frame->data[2]);
+}
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
+                                        const enum AVPixelFormat *pix_fmts) {
+  for (const enum AVPixelFormat *p = pix_fmts; *p != -1; p++) {
+    if (*p == hw_pix_fmt)
+      return *p;
+  }
+  fprintf(stderr, "Failed to get HW surface format.\n");
+  return AV_PIX_FMT_NONE;
+}
+
+int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
+  int err = 0;
+  // For Fedora use AV_HWDEVICE_TYPE_VAAPI. For Embedded, you might use DRM.
+  if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
+    return err;
+  }
+  ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+  return 0;
 }
 
 char *read_file(const char *filename) {
