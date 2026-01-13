@@ -1,26 +1,35 @@
 #include "main.h"
+#include "libavcodec/packet.h"
+#include <time.h>
 
 // FFmpeg Global State
 AVFormatContext *fmt_ctx = NULL;
 AVCodecContext *dec_ctx = NULL;
 struct SwsContext *sws_ctx = NULL;
+
 AVFrame *frame = NULL;
-AVFrame *frame_rgb = NULL;
 AVFrame *frame_yuv_clean = NULL;
 AVPacket *pkt = NULL;
+
+AVRational video_time_base;
+double video_start_time = 0.0;
+int64_t first_pts = AV_NOPTS_VALUE;
+
 int video_stream_idx = -1;
-uint8_t *buffer = NULL;
 
 // Position (x,y)   Texcoord (u,v)
 GLfloat quad[] = {
-  -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
-  -1.0f, 1.0f,  0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 0.0f,
+    -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+    -1.0f, 1.0f,  0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 0.0f,
 };
 
 // HW_ACCEL
 AVBufferRef *hw_device_ctx = NULL;
 enum AVPixelFormat hw_pix_fmt;
 
+static inline double pts_to_seconds(int64_t pts) {
+  return pts * av_q2d(video_time_base);
+}
 
 int main(int argc, char **argv) {
 
@@ -45,7 +54,7 @@ int main(int argc, char **argv) {
   glGenTextures(1, &tex);
   glBindTexture(GL_TEXTURE_2D, tex);
 
-  if (open_video("zoo.mp4") < 0) {
+  if (open_video("videos/zoo.mp4") < 0) {
     fprintf(stderr, "Error: Exiting because video couldnt be opened.\n");
     return -1;
   }
@@ -105,31 +114,18 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
                         quad + 2);
 
-  double last_time = glfwGetTime();
-  double target_fps = 30.0; // Change to your video's FPS
-  double time_per_frame = 1.0 / target_fps;
   while (!glfwWindowShouldClose(window)) {
 
-    double current_time = glfwGetTime();
+    update_yuv_video_frame(texY, texU, texV);
 
-    if (current_time - last_time >= time_per_frame) {
-      // update_video_frame(tex);
-      update_yuv_video_frame(texY, texU, texV);
-      last_time = current_time;
-    }
-
-    // glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(program);
 
-    //
     // 1. Bind Textures to Units 0, 1, 2
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texY);
-
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, texU);
-
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, texV);
 
@@ -137,11 +133,8 @@ int main(int argc, char **argv) {
     glUniform1i(locY, 0);
     glUniform1i(locU, 1);
     glUniform1i(locV, 2);
-    //
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    // glBindTexture(GL_TEXTURE_2D, tex);
-    /* bind attributes, draw quad */
 
     glfwSwapBuffers(window);
     glfwPollEvents();
@@ -234,13 +227,15 @@ int open_video(const char *filename) {
     return -1;
   }
 
+  video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
+
   const AVCodec *codec = avcodec_find_decoder(
       fmt_ctx->streams[video_stream_idx]->codecpar->codec_id);
   dec_ctx = avcodec_alloc_context3(codec);
   avcodec_parameters_to_context(dec_ctx,
                                 fmt_ctx->streams[video_stream_idx]->codecpar);
 
-  // --- ADD THIS FOR HWACCEL ---
+  // --- FOR HWACCEL ---
   // Try VAAPI (standard for Linux/Fedora)
   enum AVHWDeviceType type =
       av_hwdevice_find_type_by_name("vaapi"); // "drm" or "v4l2m2m"
@@ -283,60 +278,6 @@ int open_video(const char *filename) {
   return 0;
 }
 
-void update_video_frame(GLuint tex_id) {
-  // if (av_read_frame(fmt_ctx, pkt) >= 0) {
-  //   if (pkt->stream_index == video_stream_idx) {
-  //     avcodec_send_packet(dec_ctx, pkt);
-  //     if (avcodec_receive_frame(dec_ctx, frame) == 0) {
-  //       // Convert YUV (or other) to RGB
-  //       sws_scale(sws_ctx, (uint8_t const *const *)frame->data,
-  //       frame->linesize,
-  //                 0, dec_ctx->height, frame_rgb->data, frame_rgb->linesize);
-
-  //       // Push new pixels to OpenGL
-  //       glBindTexture(GL_TEXTURE_2D, tex_id);
-  //       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dec_ctx->width,
-  //       dec_ctx->height,
-  //                       GL_RGB, GL_UNSIGNED_BYTE, frame_rgb->data[0]);
-  //     }
-  //   }
-  //   av_packet_unref(pkt);
-  // }
-
-  int ret = av_read_frame(fmt_ctx, pkt);
-
-  if (ret == AVERROR_EOF) {
-    // 1. Seek back to the beginning of the stream
-    // AVSEEK_FLAG_BACKWARD helps find the nearest keyframe before the start
-    av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-
-    // 2. Flush the decoder buffers so it doesn't try to mix old and new frames
-    avcodec_flush_buffers(dec_ctx);
-
-    // 3. Try reading again
-    ret = av_read_frame(fmt_ctx, pkt);
-  }
-
-  if (ret >= 0) {
-    if (pkt->stream_index == video_stream_idx) {
-      if (avcodec_send_packet(dec_ctx, pkt) == 0) {
-        while (avcodec_receive_frame(dec_ctx, frame) == 0) {
-          // Convert and upload
-          sws_scale(sws_ctx, (uint8_t const *const *)frame->data,
-                    frame->linesize, 0, dec_ctx->height, frame_rgb->data,
-                    frame_rgb->linesize);
-
-          glBindTexture(GL_TEXTURE_2D, tex_id);
-          glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, dec_ctx->width,
-                          dec_ctx->height, GL_RGB, GL_UNSIGNED_BYTE,
-                          frame_rgb->data[0]);
-        }
-      }
-    }
-    av_packet_unref(pkt);
-  }
-}
-
 void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
   while (1) {
     int ret = av_read_frame(fmt_ctx, pkt);
@@ -345,6 +286,8 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
     if (ret == AVERROR_EOF) {
       av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
       avcodec_flush_buffers(dec_ctx);
+      first_pts = AV_NOPTS_VALUE;
+      video_start_time = glfwGetTime();
       continue; // Try reading again from start
     }
 
@@ -364,14 +307,15 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
         //   return; // Exit function, we are done for this frame
         // }
 
-        // --- ADD THIS FOR HWACCEL ---
+        // --- FOR HWACCEL ---
         if (avcodec_receive_frame(dec_ctx, frame) == 0) {
+
+          // --- Handle HW frames ---
+          AVFrame *use_frame = frame;
 
           // Check if the frame is a hardware surface
           if (frame->format == hw_pix_fmt) {
             AVFrame *sw_frame = av_frame_alloc();
-            // Set the desired output format for the transfer to match your YUV
-            // textures
             sw_frame->format = AV_PIX_FMT_YUV420P;
 
             // Transfer GPU memory to System RAM
@@ -379,20 +323,45 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
               // Copy metadata needed for upload_yuv_textures
               sw_frame->width = frame->width;
               sw_frame->height = frame->height;
+              use_frame = sw_frame;
 
               // CRITICAL: Upload the CPU-side data
-              upload_yuv_textures(sw_frame, texY, texU, texV);
+              // upload_yuv_textures(sw_frame, texY, texU, texV);
+            } else {
+              av_frame_free(&sw_frame);
+              av_packet_unref(pkt);
+              return;
             }
-            av_frame_free(&sw_frame);
-          } else {
-            // Standard software frame path
-            upload_yuv_textures(frame, texY, texU, texV);
           }
+
+          // -------- Frame timing --------
+          if (first_pts == AV_NOPTS_VALUE) {
+            first_pts = frame->pts;
+            video_start_time = glfwGetTime();
+          }
+
+          double frame_time = pts_to_seconds(frame->pts - first_pts);
+          double now = glfwGetTime() - video_start_time;
+          double delay = frame_time - now;
+
+          if (delay > 0.0) {
+            struct timespec ts;
+            ts.tv_sec = (time_t)delay;
+            ts.tv_nsec = (long)((delay - ts.tv_sec) * 1e9);
+            nanosleep(&ts, NULL);
+          }
+
+          // -------- Upload --------
+          upload_yuv_textures(use_frame, texY, texU, texV);
+
+          if (use_frame != frame)
+            av_frame_free(&use_frame);
 
           av_packet_unref(pkt);
           return;
         }
         // ----------------------------
+        av_packet_unref(pkt);
       }
     }
 
@@ -403,7 +372,7 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
 
 void upload_plane(GLuint texID, int width, int height, int linesize,
                   uint8_t *data) {
-  // --- ADD THIS FOR HWACCEL ---
+  // --- FOR HWACCEL ---
   if (!data) {
     fprintf(stderr, "Error: Plane data is NULL for texID %d\n", texID);
     return;
@@ -467,7 +436,7 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
 
 int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
   int err = 0;
-  // For Fedora use AV_HWDEVICE_TYPE_VAAPI. For Embedded, you might use DRM.
+  // For Fedora, AV_HWDEVICE_TYPE_VAAPI. For Embedded, AV_HWDEVICE_TYPE_DRM.
   if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
     return err;
   }
