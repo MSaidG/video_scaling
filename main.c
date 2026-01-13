@@ -24,6 +24,9 @@ AVPacket *pkt = NULL;
 int video_stream_idx = -1;
 uint8_t *buffer = NULL;
 
+AVBufferRef *hw_device_ctx = NULL;
+enum AVPixelFormat hw_pix_fmt;
+
 void framebuffer_size_callback(GLFWwindow *window, int width, int height);
 
 const char *vs_src = "attribute vec2 aPos;\n"
@@ -53,7 +56,28 @@ int open_video(const char *filename);
 char *read_file(const char *filename);
 void upload_yuv_textures(AVFrame *frame, GLuint texY, GLuint texU, GLuint texV);
 void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV);
-void upload_plane(GLuint texID, int width, int height, int linesize, uint8_t *data);
+void upload_plane(GLuint texID, int width, int height, int linesize,
+                  uint8_t *data);
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
+                                        const enum AVPixelFormat *pix_fmts) {
+  for (const enum AVPixelFormat *p = pix_fmts; *p != -1; p++) {
+    if (*p == hw_pix_fmt)
+      return *p;
+  }
+  fprintf(stderr, "Failed to get HW surface format.\n");
+  return AV_PIX_FMT_NONE;
+}
+
+int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
+  int err = 0;
+  // For Fedora use AV_HWDEVICE_TYPE_VAAPI. For Embedded, you might use DRM.
+  if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
+    return err;
+  }
+  ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+  return 0;
+}
 
 int main(int argc, char **argv) {
 
@@ -162,16 +186,16 @@ int main(int argc, char **argv) {
     // 1. Bind Textures to Units 0, 1, 2
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, texY);
-    
+
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, texU);
-    
+
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, texV);
 
     // 2. Tell Shader which Unit corresponds to which Uniform
-    glUniform1i(locY, 0); 
-    glUniform1i(locU, 1); 
+    glUniform1i(locY, 0);
+    glUniform1i(locU, 1);
     glUniform1i(locV, 2);
     //
 
@@ -275,6 +299,31 @@ int open_video(const char *filename) {
   dec_ctx = avcodec_alloc_context3(codec);
   avcodec_parameters_to_context(dec_ctx,
                                 fmt_ctx->streams[video_stream_idx]->codecpar);
+
+  // --- ADD THIS FOR HWACCEL ---
+  // Try VAAPI (standard for Linux/Fedora)
+  enum AVHWDeviceType type =
+      av_hwdevice_find_type_by_name("vaapi"); // "drm" or "v4l2m2m"
+  if (type != AV_HWDEVICE_TYPE_NONE) {
+    // Find the format the hardware uses
+    printf("HW_TYPE: %d\n", type);
+    fflush(stdout);
+
+    for (int i = 0;; i++) {
+      const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+      if (!config)
+        break;
+      if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+          config->device_type == type) {
+        hw_pix_fmt = config->pix_fmt;
+        break;
+      }
+    }
+    dec_ctx->get_format = get_hw_format;
+    hw_decoder_init(dec_ctx, type);
+  }
+  // ----------------------------
+
   avcodec_open2(dec_ctx, codec, NULL);
 
   // Prepare RGB frame for OpenGL
@@ -349,38 +398,78 @@ void update_video_frame(GLuint tex_id) {
 }
 
 void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
-    while (1) {
-        int ret = av_read_frame(fmt_ctx, pkt);
+  while (1) {
+    int ret = av_read_frame(fmt_ctx, pkt);
 
-        // Handle End of File (Loop video)
-        if (ret == AVERROR_EOF) {
-            av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(dec_ctx);
-            continue; // Try reading again from start
-        }
-        
-        if (ret < 0) break; // Error or other issue
-
-        if (pkt->stream_index == video_stream_idx) {
-            // Send packet to decoder
-            if (avcodec_send_packet(dec_ctx, pkt) == 0) {
-                // Try to retrieve a frame
-                if (avcodec_receive_frame(dec_ctx, frame) == 0) {
-                    // SUCCESS: We got a video frame! Upload and stop looking.
-                    upload_yuv_textures(frame, texY, texU, texV);
-                    av_packet_unref(pkt);
-                    return; // Exit function, we are done for this frame
-                }
-            }
-        }
-        
-        // If it was audio or no frame ready, clean up and LOOP AGAIN
-        av_packet_unref(pkt);
+    // Handle End of File (Loop video)
+    if (ret == AVERROR_EOF) {
+      av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+      avcodec_flush_buffers(dec_ctx);
+      continue; // Try reading again from start
     }
+
+    if (ret < 0)
+      break; // Error or other issue
+
+    if (pkt->stream_index == video_stream_idx) {
+      // Send packet to decoder
+      if (avcodec_send_packet(dec_ctx, pkt) == 0) {
+
+        // Try to retrieve a frame
+
+        // if (avcodec_receive_frame(dec_ctx, frame) == 0) {
+        //   // SUCCESS: We got a video frame! Upload and stop looking.
+        //   upload_yuv_textures(frame, texY, texU, texV);
+        //   av_packet_unref(pkt);
+        //   return; // Exit function, we are done for this frame
+        // }
+
+        // --- ADD THIS FOR HWACCEL ---
+        if (avcodec_receive_frame(dec_ctx, frame) == 0) {
+
+          // Check if the frame is a hardware surface
+          if (frame->format == hw_pix_fmt) {
+            AVFrame *sw_frame = av_frame_alloc();
+            // Set the desired output format for the transfer to match your YUV
+            // textures
+            sw_frame->format = AV_PIX_FMT_YUV420P;
+
+            // Transfer GPU memory to System RAM
+            if (av_hwframe_transfer_data(sw_frame, frame, 0) >= 0) {
+              // Copy metadata needed for upload_yuv_textures
+              sw_frame->width = frame->width;
+              sw_frame->height = frame->height;
+
+              // CRITICAL: Upload the CPU-side data
+              upload_yuv_textures(sw_frame, texY, texU, texV);
+            }
+            av_frame_free(&sw_frame);
+          } else {
+            // Standard software frame path
+            upload_yuv_textures(frame, texY, texU, texV);
+          }
+
+          av_packet_unref(pkt);
+          return;
+        }
+        // ----------------------------
+      }
+    }
+
+    // If it was audio or no frame ready, clean up and LOOP AGAIN
+    av_packet_unref(pkt);
+  }
 }
 
 void upload_plane(GLuint texID, int width, int height, int linesize,
                   uint8_t *data) {
+  // --- ADD THIS FOR HWACCEL ---
+  if (!data) {
+    fprintf(stderr, "Error: Plane data is NULL for texID %d\n", texID);
+    return;
+  }
+  // ----------------------------
+
   glBindTexture(GL_TEXTURE_2D, texID);
 
   // If the data is already tightly packed (linesize == width), upload directly
