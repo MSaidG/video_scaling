@@ -200,8 +200,7 @@ int main(int argc, char **argv) {
     return -1;
   }
   // Pre-allocate the texture memory once
-  glBindTexture(GL_TEXTURE_2D, tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, VIDEO_W, VIDEO_H, 0, GL_RGB,
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, dec_ctx->width, dec_ctx->height, 0, GL_RGB,
                GL_UNSIGNED_BYTE, NULL);
   // Example: 640x480 RGB frame
   // glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, VIDEO_W, VIDEO_H, 0, GL_RGB,
