@@ -2,6 +2,14 @@
 #include "libavcodec/packet.h"
 #include <time.h>
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h> // Required for GL_TEXTURE_EXTERNAL_OES
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
+#include <libavutil/pixfmt.h>
+
 // FFmpeg Global State
 AVFormatContext *fmt_ctx = NULL;
 AVCodecContext *dec_ctx = NULL;
@@ -31,6 +39,67 @@ static inline double pts_to_seconds(int64_t pts) {
   return pts * av_q2d(video_time_base);
 }
 
+static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
+  return (AVDRMFrameDescriptor *)frame->data[0];
+}
+
+PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
+PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
+
+// Maps a DRM frame to an EGLImage for zero-copy access
+EGLImageKHR create_eglimage_from_frame(EGLDisplay egl_display, AVFrame *frame) {
+  // In a DRM_PRIME frame, data[0] contains the descriptor
+  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)frame->data[0];
+  if (!desc)
+    return EGL_NO_IMAGE_KHR;
+
+  if (desc->nb_layers < 1)
+    return EGL_NO_IMAGE_KHR;
+
+  // We assume the first layer contains the image data (typical for NV12/VAAPI)
+  AVDRMLayerDescriptor *layer = &desc->layers[0];
+
+  EGLint attribs[32];
+  int k = 0;
+
+  attribs[k++] = EGL_WIDTH;
+  attribs[k++] = frame->width;
+  attribs[k++] = EGL_HEIGHT;
+  attribs[k++] = frame->height;
+  attribs[k++] = EGL_LINUX_DRM_FOURCC_EXT;
+  attribs[k++] = layer->format;
+
+  // Map each plane (Plane 0 is Y, Plane 1 is UV for NV12)
+  for (int i = 0; i < layer->nb_planes; i++) {
+    int obj_idx = layer->planes[i].object_index;
+    int fd = desc->objects[obj_idx].fd;
+
+    if (i == 0) {
+      attribs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+      attribs[k++] = fd;
+      attribs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+      attribs[k++] = layer->planes[i].offset;
+      attribs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+      attribs[k++] = layer->planes[i].pitch;
+    } else if (i == 1) {
+      attribs[k++] = EGL_DMA_BUF_PLANE1_FD_EXT;
+      attribs[k++] = fd;
+      attribs[k++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
+      attribs[k++] = layer->planes[i].offset;
+      attribs[k++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
+      attribs[k++] = layer->planes[i].pitch;
+    }
+  }
+  attribs[k++] = EGL_NONE;
+
+  // Create the image from the DMA-BUF file descriptors
+  return eglCreateImageKHR(egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                           NULL, attribs);
+}
+
+void update_video_frame_egl(GLuint texID);
+
 int main(int argc, char **argv) {
 
   glfwInit();
@@ -50,41 +119,60 @@ int main(int argc, char **argv) {
   glViewport(0, 0, 800, 600);
   glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
-  GLuint tex;
-  glGenTextures(1, &tex);
-  glBindTexture(GL_TEXTURE_2D, tex);
+  // Initialize EGL Extension functions
+  eglCreateImageKHR =
+      (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+  eglDestroyImageKHR =
+      (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+
+  glEGLImageTargetTexture2DOES =
+      (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
+          "glEGLImageTargetTexture2DOES");
+  if (!glEGLImageTargetTexture2DOES) {
+    fprintf(stderr,
+            "Error: Driver does not support glEGLImageTargetTexture2DOES\n");
+    return -1;
+  }
+
+  GLuint texVideo;
+  glGenTextures(1, &texVideo);
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, texVideo);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
   if (open_video("videos/zoo.mp4") < 0) {
     fprintf(stderr, "Error: Exiting because video couldnt be opened.\n");
     return -1;
   }
 
-  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  GLuint texY, texU, texV;
-  glGenTextures(1, &texY);
-  glGenTextures(1, &texU);
-  glGenTextures(1, &texV);
+  // glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  // GLuint texY, texU, texV;
+  // glGenTextures(1, &texY);
+  // glGenTextures(1, &texU);
+  // glGenTextures(1, &texV);
 
-  // Helper to init YUV textures
-  GLuint texs[3] = {texY, texU, texV};
-  int dims[3][2] = {{dec_ctx->width, dec_ctx->height},
-                    {dec_ctx->width / 2, dec_ctx->height / 2},
-                    {dec_ctx->width / 2, dec_ctx->height / 2}};
+  // // Helper to init YUV textures
+  // GLuint texs[3] = {texY, texU, texV};
+  // int dims[3][2] = {{dec_ctx->width, dec_ctx->height},
+  //                   {dec_ctx->width / 2, dec_ctx->height / 2},
+  //                   {dec_ctx->width / 2, dec_ctx->height / 2}};
 
-  for (int i = 0; i < 3; i++) {
-    glBindTexture(GL_TEXTURE_2D, texs[i]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, dims[i][0], dims[i][1], 0,
-                 GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  }
+  // for (int i = 0; i < 3; i++) {
+  //   glBindTexture(GL_TEXTURE_2D, texs[i]);
+  //   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, dims[i][0], dims[i][1], 0,
+  //                GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+  //   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  //   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  //   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  //   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  // }
 
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
   char *vs_code = read_file("shader.vs");
   char *fs_code = read_file("shader.fs");
@@ -101,38 +189,52 @@ int main(int argc, char **argv) {
 
   GLint aPos = glGetAttribLocation(program, "aPos");
   GLint aTex = glGetAttribLocation(program, "aTex");
+  GLint locTex = glGetUniformLocation(program, "uTexture");
 
-  // Get uniform locations
-  GLint locY = glGetUniformLocation(program, "uTexY");
-  GLint locU = glGetUniformLocation(program, "uTexU");
-  GLint locV = glGetUniformLocation(program, "uTexV");
+  // // Get uniform locations
+  // GLint locY = glGetUniformLocation(program, "uTexY");
+  // GLint locU = glGetUniformLocation(program, "uTexU");
+  // GLint locV = glGetUniformLocation(program, "uTexV");
 
-  glEnableVertexAttribArray(aPos);
-  glEnableVertexAttribArray(aTex);
+  // glEnableVertexAttribArray(aPos);
+  // glEnableVertexAttribArray(aTex);
 
-  glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
-  glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
-                        quad + 2);
+  // glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+  // quad); glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 *
+  // sizeof(float),
+  //                       quad + 2);
 
   while (!glfwWindowShouldClose(window)) {
 
-    update_yuv_video_frame(texY, texU, texV);
+    // update_yuv_video_frame(texY, texU, texV);
+    update_video_frame_egl(texVideo);
 
+    glClearColor(0.0f, 0.0f, 1.0f, 1.0f); // Bright Blue
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(program);
 
-    // 1. Bind Textures to Units 0, 1, 2
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, texY);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, texU);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, texV);
+    // // 1. Bind Textures to Units 0, 1, 2
+    // glActiveTexture(GL_TEXTURE0);
+    // glBindTexture(GL_TEXTURE_2D, texY);
+    // glActiveTexture(GL_TEXTURE1);
+    // glBindTexture(GL_TEXTURE_2D, texU);
+    // glActiveTexture(GL_TEXTURE2);
+    // glBindTexture(GL_TEXTURE_2D, texV);
 
-    // 2. Tell Shader which Unit corresponds to which Uniform
-    glUniform1i(locY, 0);
-    glUniform1i(locU, 1);
-    glUniform1i(locV, 2);
+    // // 2. Tell Shader which Unit corresponds to which Uniform
+    // glUniform1i(locY, 0);
+    // glUniform1i(locU, 1);
+    // glUniform1i(locV, 2);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texVideo);
+    glUniform1i(locTex, 0);
+
+    glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
+    glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                          quad + 2);
+    glEnableVertexAttribArray(aPos);
+    glEnableVertexAttribArray(aTex);
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
@@ -142,6 +244,104 @@ int main(int argc, char **argv) {
 
   glfwTerminate();
   return 0;
+}
+
+void debug_drm_frame(AVFrame *f) {
+  if (f->format != AV_PIX_FMT_DRM_PRIME) {
+    fprintf(stderr, "[DEBUG] Not a DRM frame! Format: %d\n", f->format);
+    return;
+  }
+  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)f->data[0];
+  fprintf(stderr, "[DEBUG] Frame: %dx%d | Objects: %d | Layers: %d\n", f->width,
+          f->height, desc->nb_objects, desc->nb_layers);
+
+  for (int i = 0; i < desc->nb_layers; i++) {
+    AVDRMLayerDescriptor *layer = &desc->layers[i];
+    // Convert FourCC to string
+    uint32_t fmt = layer->format;
+    fprintf(stderr, "  Layer %d: Format %.4s (0x%x) | Planes: %d\n", i,
+            (char *)&fmt, fmt, layer->nb_planes);
+
+    for (int j = 0; j < layer->nb_planes; j++) {
+      fprintf(stderr, "    Plane %d: ObjIdx %d | Offset %ld | Pitch %ld\n", j,
+              layer->planes[j].object_index, (long)layer->planes[j].offset,
+              (long)layer->planes[j].pitch);
+    }
+  }
+}
+
+void update_video_frame_egl(GLuint texID) {
+  while (1) {
+    if (av_read_frame(fmt_ctx, pkt) < 0) {
+      av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
+      continue;
+    }
+
+    if (pkt->stream_index != video_stream_idx) {
+      av_packet_unref(pkt);
+      continue;
+    }
+
+    if (avcodec_send_packet(dec_ctx, pkt) < 0) {
+      av_packet_unref(pkt);
+      continue;
+    }
+
+    if (avcodec_receive_frame(dec_ctx, frame) == 0) {
+
+      /* 🔴 EXPECT VAAPI HERE */
+      if (frame->format != AV_PIX_FMT_VAAPI) {
+        fprintf(stderr, "Unexpected frame format: %d\n", frame->format);
+        av_frame_unref(frame);
+        av_packet_unref(pkt);
+        return;
+      }
+
+      /* ✅ MAP VAAPI → DRM_PRIME */
+      AVFrame *drm_frame = av_frame_alloc();
+
+      if (av_hwframe_map(drm_frame, frame, AV_HWFRAME_MAP_READ) < 0) {
+        fprintf(stderr, "av_hwframe_map failed\n");
+        av_frame_free(&drm_frame);
+        av_frame_unref(frame);
+        av_packet_unref(pkt);
+        return;
+      }
+
+      printf("Mapped format: %s\n", av_get_pix_fmt_name(drm_frame->format));
+
+      if (drm_frame->format != AV_PIX_FMT_DRM_PRIME) {
+        fprintf(stderr, "Mapped frame is not DRM_PRIME\n");
+        av_frame_free(&drm_frame);
+        av_frame_unref(frame);
+        av_packet_unref(pkt);
+        return;
+      }
+
+      EGLDisplay disp = eglGetCurrentDisplay();
+      EGLImageKHR img = create_eglimage_from_frame(disp, drm_frame);
+
+      if (img != EGL_NO_IMAGE_KHR) {
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, texID);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, img);
+
+        /* Destroy previous image AFTER next frame */
+        static EGLImageKHR last_img = EGL_NO_IMAGE_KHR;
+        if (last_img != EGL_NO_IMAGE_KHR)
+          eglDestroyImageKHR(disp, last_img);
+        last_img = img;
+      } else {
+        fprintf(stderr, "Failed to create EGLImage\n");
+      }
+
+      av_frame_free(&drm_frame);
+      av_frame_unref(frame);
+      av_packet_unref(pkt);
+      return;
+    }
+
+    av_packet_unref(pkt);
+  }
 }
 
 void framebuffer_size_callback(GLFWwindow *window, int width, int height) {
@@ -201,20 +401,9 @@ unsigned char *create_test_frame_data() {
 }
 
 int open_video(const char *filename) {
+  avformat_open_input(&fmt_ctx, filename, NULL, NULL);
+  avformat_find_stream_info(fmt_ctx, NULL);
 
-  fmt_ctx = NULL;
-
-  if (avformat_open_input(&fmt_ctx, filename, NULL, NULL) < 0) {
-    fprintf(stderr, "Error: Could not open file %s\n", filename);
-    return -1;
-  }
-  if (avformat_find_stream_info(fmt_ctx, NULL) < 0) {
-    fprintf(stderr, "Error: Could not find stream information\n");
-    return -1;
-  }
-
-  // Find video stream
-  video_stream_idx = -1;
   for (int i = 0; i < fmt_ctx->nb_streams; i++) {
     if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
       video_stream_idx = i;
@@ -222,61 +411,102 @@ int open_video(const char *filename) {
     }
   }
 
-  if (video_stream_idx == -1) {
-    fprintf(stderr, "Error: Could not find a video stream\n");
-    return -1;
-  }
-
-  video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
-
   const AVCodec *codec = avcodec_find_decoder(
       fmt_ctx->streams[video_stream_idx]->codecpar->codec_id);
   dec_ctx = avcodec_alloc_context3(codec);
   avcodec_parameters_to_context(dec_ctx,
                                 fmt_ctx->streams[video_stream_idx]->codecpar);
 
-  // --- FOR HWACCEL ---
-  // Try VAAPI (standard for Linux/Fedora)
-  enum AVHWDeviceType type =
-      av_hwdevice_find_type_by_name("vaapi"); // "drm" or "v4l2m2m"
-  if (type != AV_HWDEVICE_TYPE_NONE) {
-    // Find the format the hardware uses
-    printf("HW_TYPE: %d\n", type);
-    fflush(stdout);
+  video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
+  dec_ctx->get_format = get_hw_format;
 
-    for (int i = 0;; i++) {
-      const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
-      if (!config)
-        break;
-      if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-          config->device_type == type) {
-        hw_pix_fmt = config->pix_fmt;
-        break;
-      }
-    }
-    dec_ctx->get_format = get_hw_format;
-    hw_decoder_init(dec_ctx, type);
-  }
-  // ----------------------------
+  // Initialize VAAPI Device
+  av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
+  dec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
 
   avcodec_open2(dec_ctx, codec, NULL);
-
-  // Prepare RGB frame for OpenGL
   frame = av_frame_alloc();
-  frame_yuv_clean = av_frame_alloc();
-  int size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, dec_ctx->width,
-                                      dec_ctx->height, 1);
-  uint8_t *internal_buffer = av_malloc(size);
-  av_image_fill_arrays(frame_yuv_clean->data, frame_yuv_clean->linesize,
-                       internal_buffer, AV_PIX_FMT_YUV420P, dec_ctx->width,
-                       dec_ctx->height, 1);
-
-  sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-                           dec_ctx->width, dec_ctx->height, AV_PIX_FMT_YUV420P,
-                           SWS_POINT, NULL, NULL, NULL);
   pkt = av_packet_alloc();
   return 0;
 }
+
+// int open_video(const char *filename) {
+
+//   fmt_ctx = NULL;
+
+//   if (avformat_open_input(&fmt_ctx, filename, NULL, NULL) < 0) {
+//     fprintf(stderr, "Error: Could not open file %s\n", filename);
+//     return -1;
+//   }
+//   if (avformat_find_stream_info(fmt_ctx, NULL) < 0) {
+//     fprintf(stderr, "Error: Could not find stream information\n");
+//     return -1;
+//   }
+
+//   // Find video stream
+//   video_stream_idx = -1;
+//   for (int i = 0; i < fmt_ctx->nb_streams; i++) {
+//     if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+//       video_stream_idx = i;
+//       break;
+//     }
+//   }
+
+//   if (video_stream_idx == -1) {
+//     fprintf(stderr, "Error: Could not find a video stream\n");
+//     return -1;
+//   }
+
+//   video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
+
+//   const AVCodec *codec = avcodec_find_decoder(
+//       fmt_ctx->streams[video_stream_idx]->codecpar->codec_id);
+//   dec_ctx = avcodec_alloc_context3(codec);
+//   avcodec_parameters_to_context(dec_ctx,
+//                                 fmt_ctx->streams[video_stream_idx]->codecpar);
+
+//   // --- FOR HWACCEL ---
+//   // Try VAAPI (standard for Linux/Fedora)
+//   enum AVHWDeviceType type =
+//       av_hwdevice_find_type_by_name("vaapi"); // "drm" or "v4l2m2m"
+//   if (type != AV_HWDEVICE_TYPE_NONE) {
+//     // Find the format the hardware uses
+//     printf("HW_TYPE: %d\n", type);
+//     fflush(stdout);
+
+//     for (int i = 0;; i++) {
+//       const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+//       if (!config)
+//         break;
+//       if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+//           config->device_type == type) {
+//         hw_pix_fmt = config->pix_fmt;
+//         break;
+//       }
+//     }
+//     dec_ctx->get_format = get_hw_format;
+//     hw_decoder_init(dec_ctx, type);
+//   }
+//   // ----------------------------
+
+//   avcodec_open2(dec_ctx, codec, NULL);
+
+//   // Prepare RGB frame for OpenGL
+//   frame = av_frame_alloc();
+//   frame_yuv_clean = av_frame_alloc();
+//   int size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, dec_ctx->width,
+//                                       dec_ctx->height, 1);
+//   uint8_t *internal_buffer = av_malloc(size);
+//   av_image_fill_arrays(frame_yuv_clean->data, frame_yuv_clean->linesize,
+//                        internal_buffer, AV_PIX_FMT_YUV420P, dec_ctx->width,
+//                        dec_ctx->height, 1);
+
+//   sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+//                            dec_ctx->width, dec_ctx->height,
+//                            AV_PIX_FMT_YUV420P, SWS_POINT, NULL, NULL, NULL);
+//   pkt = av_packet_alloc();
+//   return 0;
+// }
 
 void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
   while (1) {
@@ -426,11 +656,13 @@ void upload_yuv_textures(AVFrame *frame, GLuint texY, GLuint texU,
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                         const enum AVPixelFormat *pix_fmts) {
-  for (const enum AVPixelFormat *p = pix_fmts; *p != -1; p++) {
-    if (*p == hw_pix_fmt)
+  for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+    if (*p == AV_PIX_FMT_VAAPI) {
       return *p;
+    }
   }
-  fprintf(stderr, "Failed to get HW surface format.\n");
+
+  fprintf(stderr, "VAAPI not supported by decoder\n");
   return AV_PIX_FMT_NONE;
 }
 

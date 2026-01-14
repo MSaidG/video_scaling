@@ -1,8 +1,8 @@
-attribute vec2 aPos;
+attribute vec4 aPos;
 attribute vec2 aTex;
-varying vec2 vTex;
+varying vec2 vTexCoord;
 
 void main() {
-    vTex = aTex;
-    gl_Position = vec4(aPos, 0.0, 1.0);
+    gl_Position = aPos;
+    vTexCoord = aTex;
 }
