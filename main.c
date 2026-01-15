@@ -1,14 +1,8 @@
 #include "main.h"
-#include "libavcodec/packet.h"
+#include "gl.h"
+#include "utils.h"
 #include <time.h>
 
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h> // Required for GL_TEXTURE_EXTERNAL_OES
-#include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_drm.h>
-#include <libavutil/pixfmt.h>
 // FFmpeg Global State
 AVFormatContext *fmt_ctx = NULL;
 AVCodecContext *dec_ctx = NULL;
@@ -34,42 +28,79 @@ GLfloat quad[] = {
 AVBufferRef *hw_device_ctx = NULL;
 enum AVPixelFormat hw_pix_fmt;
 
+// EGL ZERO-COPY
 PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
 
-static inline double pts_to_seconds(int64_t pts) {
-  return pts * av_q2d(video_time_base);
+typedef struct {
+  EGLImageKHR image_y;
+  EGLImageKHR image_uv;
+} NV12_EGLImages;
+
+NV12_EGLImages create_split_egl_images(EGLDisplay display,
+                                       const AVFrame *frame) {
+  NV12_EGLImages result = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+
+  if (frame->format != AV_PIX_FMT_DRM_PRIME)
+    return result;
+
+  const AVDRMFrameDescriptor *desc =
+      (const AVDRMFrameDescriptor *)frame->data[0];
+
+  // --- Y PLANE SETUP ---
+  int layer_y = 0;
+  int plane_y = 0;
+  int obj_y_idx = desc->layers[layer_y].planes[plane_y].object_index;
+  int fd_y = desc->objects[obj_y_idx].fd;
+  int offset_y = desc->layers[layer_y].planes[plane_y].offset;
+  int stride_y = desc->layers[layer_y].planes[plane_y].pitch;
+  uint64_t modifier_y = desc->objects[obj_y_idx].format_modifier;
+
+  EGLint attribs_y[] = {
+      EGL_WIDTH, frame->width, EGL_HEIGHT, frame->height,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8, EGL_DMA_BUF_PLANE0_FD_EXT, fd_y,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_y, EGL_DMA_BUF_PLANE0_PITCH_EXT,
+      stride_y,
+      // PASS MODIFIERS!
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_y & 0xFFFFFFFF),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_y >> 32), EGL_NONE};
+
+  result.image_y = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs_y);
+
+  // --- UV PLANE SETUP ---
+  // Handle case where UV is in same layer (NV12 standard) or different layer
+  int layer_uv = (desc->nb_layers > 1) ? 1 : 0;
+  int plane_uv = (desc->nb_layers > 1) ? 0 : 1;
+  int obj_uv_idx = desc->layers[layer_uv].planes[plane_uv].object_index;
+
+  int fd_uv = desc->objects[obj_uv_idx].fd;
+  int offset_uv = desc->layers[layer_uv].planes[plane_uv].offset;
+  int stride_uv = desc->layers[layer_uv].planes[plane_uv].pitch;
+  uint64_t modifier_uv = desc->objects[obj_uv_idx].format_modifier;
+
+  EGLint attribs_uv[] = {
+      EGL_WIDTH, frame->width / 2, EGL_HEIGHT, frame->height / 2,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_GR88, EGL_DMA_BUF_PLANE0_FD_EXT,
+      fd_uv, EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_uv,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, stride_uv,
+      // PASS MODIFIERS!
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_uv & 0xFFFFFFFF),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_uv >> 32),
+      EGL_NONE};
+
+  result.image_uv = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT, NULL, attribs_uv);
+
+  return result;
 }
-
-static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
-  return (AVDRMFrameDescriptor *)frame->data[0];
-}
-
-
-
-// Maps a DRM frame to an EGLImage for zero-copy access
-EGLImageKHR create_eglimage_from_frame(EGLDisplay egl_display, AVFrame *frame);
-void update_video_frame_egl(GLuint texID);
 
 int main(int argc, char **argv) {
 
-  glfwInit();
-  glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-
-  GLFWwindow *window = glfwCreateWindow(800, 600, "SCALING", NULL, NULL);
-  if (window == NULL) {
-    printf("Failed to create GLFW window\n");
-    glfwTerminate();
+  GLFWwindow *window = initGLFW(VIDEO_W, VIDEO_H);
+  if (window == NULL)
     return -1;
-  }
-
-  glfwMakeContextCurrent(window);
-
-  glViewport(0, 0, 800, 600);
-  glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
   // Initialize EGL Extension functions
   eglCreateImageKHR =
@@ -86,19 +117,10 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  GLuint texVideo;
-  glGenTextures(1, &texVideo);
-  glBindTexture(GL_TEXTURE_EXTERNAL_OES, texVideo);
-  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-  if (open_video("videos/zoo.mp4") < 0) {
+  if (open_video("videos/1080p_.mp4") < 0) {
     fprintf(stderr, "Error: Exiting because video couldnt be opened.\n");
     return -1;
   }
-
   char *vs_code = read_file("shader.vs");
   char *fs_code = read_file("shader.fs");
 
@@ -116,17 +138,35 @@ int main(int argc, char **argv) {
   GLint aTex = glGetAttribLocation(program, "aTex");
   GLint locTex = glGetUniformLocation(program, "uTexture");
 
+  GLuint texY, texUV;
+  glGenTextures(1, &texY);
+  glBindTexture(GL_TEXTURE_2D, texY);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glGenTextures(1, &texUV);
+  glBindTexture(GL_TEXTURE_2D, texUV);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
   while (!glfwWindowShouldClose(window)) {
 
-    update_video_frame_egl(texVideo);
+    update_video_frame_egl(texY, texUV);
 
-    glClearColor(0.0f, 0.0f, 1.0f, 1.0f); // Bright Blue
     glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(program);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texVideo);
-    glUniform1i(locTex, 0);
+    glBindTexture(GL_TEXTURE_2D, texY);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, texUV);
+
+    glUniform1i(glGetUniformLocation(program, "uTextureY"), 0);  // Tex Unit 0
+    glUniform1i(glGetUniformLocation(program, "uTextureUV"), 1); // Tex Unit 1
 
     glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
     glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
@@ -144,36 +184,24 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-void debug_drm_frame(AVFrame *f) {
-  if (f->format != AV_PIX_FMT_DRM_PRIME) {
-    fprintf(stderr, "[DEBUG] Not a DRM frame! Format: %d\n", f->format);
-    return;
-  }
-  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)f->data[0];
-  fprintf(stderr, "[DEBUG] Frame: %dx%d | Objects: %d | Layers: %d\n", f->width,
-          f->height, desc->nb_objects, desc->nb_layers);
+void update_video_frame_egl(GLuint texY, GLuint texUV) {
 
-  for (int i = 0; i < desc->nb_layers; i++) {
-    AVDRMLayerDescriptor *layer = &desc->layers[i];
-    // Convert FourCC to string
-    uint32_t fmt = layer->format;
-    fprintf(stderr, "  Layer %d: Format %.4s (0x%x) | Planes: %d\n", i,
-            (char *)&fmt, fmt, layer->nb_planes);
+  static AVFrame *current_drm_frame = NULL;
 
-    for (int j = 0; j < layer->nb_planes; j++) {
-      fprintf(stderr, "    Plane %d: ObjIdx %d | Offset %ld | Pitch %ld\n", j,
-              layer->planes[j].object_index, (long)layer->planes[j].offset,
-              (long)layer->planes[j].pitch);
-    }
-  }
-}
-
-void update_video_frame_egl(GLuint texID) {
   while (1) {
-    if (av_read_frame(fmt_ctx, pkt) < 0) {
+    int ret = av_read_frame(fmt_ctx, pkt);
+
+    // Handle End of File (Loop video)
+    if (ret == AVERROR_EOF) {
       av_seek_frame(fmt_ctx, video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-      continue;
+      avcodec_flush_buffers(dec_ctx);
+      first_pts = AV_NOPTS_VALUE;
+      video_start_time = glfwGetTime();
+      continue; // Try reading again from start
     }
+
+    if (ret < 0)
+      break; // Error or other issue
 
     if (pkt->stream_index != video_stream_idx) {
       av_packet_unref(pkt);
@@ -207,7 +235,7 @@ void update_video_frame_egl(GLuint texID) {
         return;
       }
 
-      printf("Mapped format: %s\n", av_get_pix_fmt_name(drm_frame->format));
+      // printf("Mapped format: %s\n", av_get_pix_fmt_name(drm_frame->format));
 
       if (drm_frame->format != AV_PIX_FMT_DRM_PRIME) {
         fprintf(stderr, "Mapped frame is not DRM_PRIME\n");
@@ -217,23 +245,58 @@ void update_video_frame_egl(GLuint texID) {
         return;
       }
 
-      EGLDisplay disp = eglGetCurrentDisplay();
-      EGLImageKHR img = create_eglimage_from_frame(disp, drm_frame);
-
-      if (img != EGL_NO_IMAGE_KHR) {
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, texID);
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, img);
-
-        /* Destroy previous image AFTER next frame */
-        static EGLImageKHR last_img = EGL_NO_IMAGE_KHR;
-        if (last_img != EGL_NO_IMAGE_KHR)
-          eglDestroyImageKHR(disp, last_img);
-        last_img = img;
-      } else {
-        fprintf(stderr, "Failed to create EGLImage\n");
+      // -------- Frame timing --------
+      if (first_pts == AV_NOPTS_VALUE) {
+        first_pts = frame->pts;
+        video_start_time = glfwGetTime();
       }
 
-      av_frame_free(&drm_frame);
+      double frame_time = pts_to_seconds(frame->pts - first_pts);
+      double now = glfwGetTime() - video_start_time;
+      double delay = frame_time - now;
+
+      if (delay > 0.0) {
+        struct timespec ts;
+        ts.tv_sec = (time_t)delay;
+        ts.tv_nsec = (long)((delay - ts.tv_sec) * 1e9);
+        nanosleep(&ts, NULL);
+      }
+      // -----------------------------
+
+      EGLDisplay disp = eglGetCurrentDisplay();
+      NV12_EGLImages images = create_split_egl_images(disp, drm_frame);
+      // 1. Destroy OLD EGL Images
+      static EGLImageKHR last_imgY = EGL_NO_IMAGE_KHR;
+      static EGLImageKHR last_imgUV = EGL_NO_IMAGE_KHR;
+      if (last_imgY != EGL_NO_IMAGE_KHR)
+        eglDestroyImageKHR(disp, last_imgY);
+      if (last_imgUV != EGL_NO_IMAGE_KHR)
+        eglDestroyImageKHR(disp, last_imgUV);
+
+      // 2. Free the OLD frame (now that we are done displaying it)
+      if (current_drm_frame) {
+        av_frame_free(&current_drm_frame);
+      }
+
+      // 3. Update Textures with NEW images
+      if (images.image_y != EGL_NO_IMAGE_KHR) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texY);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, images.image_y);
+        last_imgY = images.image_y;
+      }
+
+      if (images.image_uv != EGL_NO_IMAGE_KHR) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, texUV);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, images.image_uv);
+        last_imgUV = images.image_uv;
+      }
+
+      // 4. Save the NEW frame so we don't free it yet!
+      current_drm_frame = drm_frame;
+
+      // Clean up the CPU-side reference, but KEEP current_drm_frame alive
       av_frame_unref(frame);
       av_packet_unref(pkt);
       return;
@@ -241,62 +304,6 @@ void update_video_frame_egl(GLuint texID) {
 
     av_packet_unref(pkt);
   }
-}
-
-void framebuffer_size_callback(GLFWwindow *window, int width, int height) {
-  glViewport(0, 0, width, height);
-}
-
-GLuint compile_shader(GLenum type, const char *src) {
-  GLuint shader = glCreateShader(type);
-  glShaderSource(shader, 1, &src, NULL);
-  glCompileShader(shader);
-
-  GLint ok;
-  glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-  if (!ok) {
-    char log[512];
-    glGetShaderInfoLog(shader, 512, NULL, log);
-    printf("Shader compile error: %s\n", log);
-  }
-  return shader;
-}
-
-GLuint create_program(const char *vs, const char *fs) {
-  GLuint v = compile_shader(GL_VERTEX_SHADER, vs);
-  GLuint f = compile_shader(GL_FRAGMENT_SHADER, fs);
-
-  GLuint program = glCreateProgram();
-  glAttachShader(program, v);
-  glAttachShader(program, f);
-  glLinkProgram(program);
-
-  GLint ok;
-  glGetProgramiv(program, GL_LINK_STATUS, &ok);
-  if (!ok) {
-    char log[512];
-    glGetProgramInfoLog(program, 512, NULL, log);
-    printf("Program link error: %s\n", log);
-  }
-
-  glDeleteShader(v);
-  glDeleteShader(f);
-  return program;
-}
-
-unsigned char *create_test_frame_data() {
-  unsigned char *frame_data = malloc(VIDEO_W * VIDEO_H * 3);
-
-  for (int y = 0; y < VIDEO_H; y++) {
-    for (int x = 0; x < VIDEO_W; x++) {
-      int i = (y * VIDEO_W + x) * 3;
-      frame_data[i + 0] = x % 256;       // R
-      frame_data[i + 1] = y % 256;       // G
-      frame_data[i + 2] = (x + y) % 256; // B
-    }
-  }
-
-  return frame_data;
 }
 
 int open_video(const char *filename) {
@@ -309,6 +316,8 @@ int open_video(const char *filename) {
       break;
     }
   }
+
+  video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
 
   const AVCodec *codec = avcodec_find_decoder(
       fmt_ctx->streams[video_stream_idx]->codecpar->codec_id);
@@ -327,56 +336,6 @@ int open_video(const char *filename) {
   frame = av_frame_alloc();
   pkt = av_packet_alloc();
   return 0;
-}
-
-EGLImageKHR create_eglimage_from_frame(EGLDisplay egl_display, AVFrame *frame) {
-  // In a DRM_PRIME frame, data[0] contains the descriptor
-  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)frame->data[0];
-  if (!desc)
-    return EGL_NO_IMAGE_KHR;
-
-  if (desc->nb_layers < 1)
-    return EGL_NO_IMAGE_KHR;
-
-  // We assume the first layer contains the image data (typical for NV12/VAAPI)
-  AVDRMLayerDescriptor *layer = &desc->layers[0];
-
-  EGLint attribs[32];
-  int k = 0;
-
-  attribs[k++] = EGL_WIDTH;
-  attribs[k++] = frame->width;
-  attribs[k++] = EGL_HEIGHT;
-  attribs[k++] = frame->height;
-  attribs[k++] = EGL_LINUX_DRM_FOURCC_EXT;
-  attribs[k++] = layer->format;
-
-  // Map each plane (Plane 0 is Y, Plane 1 is UV for NV12)
-  for (int i = 0; i < layer->nb_planes; i++) {
-    int obj_idx = layer->planes[i].object_index;
-    int fd = desc->objects[obj_idx].fd;
-
-    if (i == 0) {
-      attribs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT;
-      attribs[k++] = fd;
-      attribs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
-      attribs[k++] = layer->planes[i].offset;
-      attribs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
-      attribs[k++] = layer->planes[i].pitch;
-    } else if (i == 1) {
-      attribs[k++] = EGL_DMA_BUF_PLANE1_FD_EXT;
-      attribs[k++] = fd;
-      attribs[k++] = EGL_DMA_BUF_PLANE1_OFFSET_EXT;
-      attribs[k++] = layer->planes[i].offset;
-      attribs[k++] = EGL_DMA_BUF_PLANE1_PITCH_EXT;
-      attribs[k++] = layer->planes[i].pitch;
-    }
-  }
-  attribs[k++] = EGL_NONE;
-
-  // Create the image from the DMA-BUF file descriptors
-  return eglCreateImageKHR(egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
-                           NULL, attribs);
 }
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
@@ -401,18 +360,59 @@ int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
   return 0;
 }
 
-char *read_file(const char *filename) {
-  FILE *f = fopen(filename, "rb");
-  if (!f) {
-    fprintf(stderr, "Could not open shader file: %s\n", filename);
-    return NULL;
+double pts_to_seconds(int64_t pts) { return pts * av_q2d(video_time_base); }
+
+static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
+  return (AVDRMFrameDescriptor *)frame->data[0];
+}
+
+EGLImageKHR create_eglimage_plane(EGLDisplay disp, AVFrame *frame,
+                                  int plane_index, int format) {
+  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)frame->data[0];
+  AVDRMLayerDescriptor *layer = &desc->layers[0];
+
+  EGLint attribs[64]; // Increased size to be safe
+  int k = 0;
+
+  // 1. Calculate Dimensions
+  int width =
+      frame->width; // (plane_index == 0) ? frame->width : frame->width / 2;
+  int height =
+      frame->height; // (plane_index == 0) ? frame->height : frame->height / 2;
+
+  attribs[k++] = EGL_WIDTH;
+  attribs[k++] = width;
+  attribs[k++] = EGL_HEIGHT;
+  attribs[k++] = height;
+  attribs[k++] = EGL_LINUX_DRM_FOURCC_EXT;
+  attribs[k++] = format;
+
+  // 2. Get Object Info (FD and Modifier)
+  int obj_idx = layer->planes[0].object_index;
+  int fd = desc->objects[obj_idx].fd;
+  uint64_t modifier = desc->objects[obj_idx].format_modifier; // <--- CRITICAL
+
+  attribs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+  attribs[k++] = fd;
+  attribs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+  attribs[k++] = layer->planes[0].offset;
+  attribs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+  attribs[k++] = layer->planes[0].pitch;
+
+  // 3. APPLY MODIFIER (Fixes "Failed to create EGLImage")
+  // If the driver provided a modifier (e.g. I915_Y_TILED), we MUST pass it.
+  if (modifier != DRM_FORMAT_MOD_INVALID) {
+    attribs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+    attribs[k++] = modifier & 0xFFFFFFFF;
+    attribs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+    attribs[k++] = modifier >> 32;
   }
-  fseek(f, 0, SEEK_END);
-  long length = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buffer = malloc(length + 1);
-  fread(buffer, 1, length, f);
-  fclose(f);
-  buffer[length] = '\0';
-  return buffer;
+
+  attribs[k++] = EGL_NONE;
+
+  return eglCreateImageKHR(disp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,
+                           attribs);
+
+  if (plane_index == 0) {
+  }
 }

@@ -13,7 +13,7 @@ pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
 pkg_check_modules(SWSCALE REQUIRED IMPORTED_TARGET libswscale)
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
 
-add_executable(video_scaling main.c)
+add_executable(video_scaling main.c utils.c gl.c)
 
 target_link_libraries(video_scaling PRIVATE 
     glfw
