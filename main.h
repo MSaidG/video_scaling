@@ -8,43 +8,56 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 
-
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h> // Required for GL_TEXTURE_EXTERNAL_OES
+#include <drm/drm_fourcc.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
 #include <libavutil/pixfmt.h>
-#include <drm/drm_fourcc.h>
 
 #define VIDEO_W 800
 #define VIDEO_H 600
+
+typedef struct {
+  int id; // 0 to 3
+
+  // FFmpeg State
+  AVFormatContext *fmt_ctx;
+  AVCodecContext *dec_ctx;
+  AVBufferRef *hw_device_ctx;
+  int video_stream_idx;
+  AVRational video_time_base;
+
+  // Playback State
+  double start_time; // Wall clock time when video started
+  int64_t first_pts; // PTS of the first frame
+  AVFrame *frame;
+  AVPacket *pkt;
+  AVFrame *current_drm_frame; // Keep ref to currently displayed frame
+
+  // OpenGL/EGL State
+  GLuint texY;
+  GLuint texUV;
+  EGLImageKHR image_y;
+  EGLImageKHR image_uv;
+
+  // Position (2x2 Grid)
+  float transform[16];
+
+} VideoPlayer;
 
 typedef struct {
   EGLImageKHR image_y;
   EGLImageKHR image_uv;
 } NV12_EGLImages;
 
-void update_video_frame(GLuint tex_id);
-int open_video(const char *filename);
-// int open_video(const char *filename, AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx);
 
-void upload_yuv_textures(AVFrame *frame, GLuint texY, GLuint texU, GLuint texV);
-void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV);
-void upload_plane(GLuint texID, int width, int height, int linesize,
-                  uint8_t *data);
-int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type);
+
+int init_player(VideoPlayer *vp, const char *filename, int id);
+void update_player(VideoPlayer *vp);
+void render_player(VideoPlayer *vp, GLuint program);
+void calculate_transform(int id, float *m);
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                         const enum AVPixelFormat *pix_fmts);
-
-double pts_to_seconds(int64_t pts, AVRational time_base);
-static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame);
-
-
-// Maps a DRM frame to an EGLImage for zero-copy access
-// void update_video_frame_egl(GLuint texID);
-void update_video_frame_egl(GLuint texY, GLuint texUV);
-EGLImageKHR create_eglimage_plane(EGLDisplay disp, AVFrame *frame, int plane_index, int format);
-NV12_EGLImages create_split_egl_images(EGLDisplay display,
-                                       const AVFrame *frame);

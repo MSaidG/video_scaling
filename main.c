@@ -4,30 +4,11 @@
 #include <GLES2/gl2.h>
 #include <time.h>
 
-// FFmpeg Global State
-AVFormatContext *fmt_ctx = NULL;
-AVCodecContext *dec_ctx = NULL;
-struct SwsContext *sws_ctx = NULL;
-
-AVFrame *frame = NULL;
-AVFrame *frame_yuv_clean = NULL;
-AVPacket *pkt = NULL;
-
-AVRational video_time_base;
-double video_start_time = 0.0;
-int64_t first_pts = AV_NOPTS_VALUE;
-
-int video_stream_idx = -1;
-
 // Position (x,y)   Texcoord (u,v)
 GLfloat quad[] = {
     -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
     -1.0f, 1.0f,  0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 0.0f,
 };
-
-// HW_ACCEL
-AVBufferRef *hw_device_ctx = NULL;
-enum AVPixelFormat hw_pix_fmt;
 
 // EGL ZERO-COPY
 PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
@@ -35,34 +16,159 @@ PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
 
 
+int main(int argc, char **argv) {
 
-typedef struct {
-  int id; // 0 to 3
+  GLFWwindow *window = initGLFW(VIDEO_W, VIDEO_H);
+  if (window == NULL)
+    return -1;
 
-  // FFmpeg State
-  AVFormatContext *fmt_ctx;
-  AVCodecContext *dec_ctx;
-  AVBufferRef *hw_device_ctx;
-  int video_stream_idx;
-  AVRational video_time_base;
+  // Initialize EGL Extension functions
+  eglCreateImageKHR =
+      (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+  eglDestroyImageKHR =
+      (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
 
-  // Playback State
-  double start_time; // Wall clock time when video started
-  int64_t first_pts; // PTS of the first frame
-  AVFrame *frame;
-  AVPacket *pkt;
-  AVFrame *current_drm_frame; // Keep ref to currently displayed frame
+  glEGLImageTargetTexture2DOES =
+      (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
+          "glEGLImageTargetTexture2DOES");
+  if (!glEGLImageTargetTexture2DOES) {
+    fprintf(stderr,
+            "Error: Driver does not support glEGLImageTargetTexture2DOES\n");
+    return -1;
+  }
 
-  // OpenGL/EGL State
-  GLuint texY;
-  GLuint texUV;
-  EGLImageKHR image_y;
-  EGLImageKHR image_uv;
+  char *vs_code = read_file("shader.vs"); // MUST UPDATE THIS FILE
+  char *fs_code = read_file("shader.fs");
+  GLuint program = create_program(vs_code, fs_code);
+  free(vs_code);
+  free(fs_code);
 
-  // Position (2x2 Grid)
-  float transform[16];
+  GLint aPos = glGetAttribLocation(program, "aPos");
+  GLint aTex = glGetAttribLocation(program, "aTex");
 
-} VideoPlayer;
+  // 4. Initialize 4 Video Players
+  VideoPlayer players[4];
+  const char *files[] = {"videos/animals.mp4", "videos/earth.mp4", "videos/galaxy.mp4",
+                         "videos/ocean.mp4"};
+
+  for (int i = 0; i < 4; i++) {
+    // You can use the same file 4 times for testing if you want
+    if (init_player(&players[i], files[i], i) < 0) {
+      fprintf(stderr, "Failed to init player %d\n", i);
+    }
+  }
+
+  while (!glfwWindowShouldClose(window)) {
+
+    // Update Decode Logic (CPU/Decoder)
+    for (int i = 0; i < 4; i++) {
+      update_player(&players[i]);
+    }
+
+    // Render Logic (GPU)
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(program);
+
+    glUniform1i(glGetUniformLocation(program, "uTextureY"), 0);
+    glUniform1i(glGetUniformLocation(program, "uTextureUV"), 1);
+
+    glEnableVertexAttribArray(aPos);
+    glEnableVertexAttribArray(aTex);
+    glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
+    glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                          quad + 2);
+
+    for (int i = 0; i < 4; i++) {
+      render_player(&players[i], program);
+    }
+
+    glfwSwapBuffers(window);
+    glfwPollEvents();
+  }
+
+  glfwTerminate();
+  return 0;
+}
+
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
+                                        const enum AVPixelFormat *pix_fmts) {
+  for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+    if (*p == AV_PIX_FMT_VAAPI) {
+      return *p;
+    }
+  }
+
+  fprintf(stderr, "VAAPI not supported by decoder\n");
+  return AV_PIX_FMT_NONE;
+}
+
+double pts_to_seconds(int64_t pts, AVRational time_base) { 
+    return pts * av_q2d(time_base); 
+}
+
+static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
+  return (AVDRMFrameDescriptor *)frame->data[0];
+}
+
+NV12_EGLImages create_split_egl_images(EGLDisplay display,
+                                       const AVFrame *frame) {
+  NV12_EGLImages result = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+
+  if (frame->format != AV_PIX_FMT_DRM_PRIME)
+    return result;
+
+  const AVDRMFrameDescriptor *desc =
+      (const AVDRMFrameDescriptor *)frame->data[0];
+
+  // --- Y PLANE SETUP ---
+  int layer_y = 0;
+  int plane_y = 0;
+  int obj_y_idx = desc->layers[layer_y].planes[plane_y].object_index;
+  int fd_y = desc->objects[obj_y_idx].fd;
+  int offset_y = desc->layers[layer_y].planes[plane_y].offset;
+  int stride_y = desc->layers[layer_y].planes[plane_y].pitch;
+  uint64_t modifier_y = desc->objects[obj_y_idx].format_modifier;
+
+  EGLint attribs_y[] = {
+      EGL_WIDTH, frame->width, EGL_HEIGHT, frame->height,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8, EGL_DMA_BUF_PLANE0_FD_EXT, fd_y,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_y, EGL_DMA_BUF_PLANE0_PITCH_EXT,
+      stride_y,
+      // PASS MODIFIERS!
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_y & 0xFFFFFFFF),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_y >> 32), EGL_NONE};
+
+  result.image_y = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs_y);
+
+  // --- UV PLANE SETUP ---
+  // Handle case where UV is in same layer (NV12 standard) or different layer
+  int layer_uv = (desc->nb_layers > 1) ? 1 : 0;
+  int plane_uv = (desc->nb_layers > 1) ? 0 : 1;
+  int obj_uv_idx = desc->layers[layer_uv].planes[plane_uv].object_index;
+
+  int fd_uv = desc->objects[obj_uv_idx].fd;
+  int offset_uv = desc->layers[layer_uv].planes[plane_uv].offset;
+  int stride_uv = desc->layers[layer_uv].planes[plane_uv].pitch;
+  uint64_t modifier_uv = desc->objects[obj_uv_idx].format_modifier;
+
+  EGLint attribs_uv[] = {
+      EGL_WIDTH, frame->width / 2, EGL_HEIGHT, frame->height / 2,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_GR88, EGL_DMA_BUF_PLANE0_FD_EXT,
+      fd_uv, EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_uv,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, stride_uv,
+      // PASS MODIFIERS!
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_uv & 0xFFFFFFFF),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_uv >> 32),
+      EGL_NONE};
+
+  result.image_uv = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT, NULL, attribs_uv);
+
+  return result;
+}
+
 
 
 // Helper to create a basic 4x4 matrix for grid positioning
@@ -276,200 +382,4 @@ void render_player(VideoPlayer *vp, GLuint program) {
 
   // Draw
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-}
-
-
-
-int main(int argc, char **argv) {
-
-  GLFWwindow *window = initGLFW(VIDEO_W, VIDEO_H);
-  if (window == NULL)
-    return -1;
-
-  // Initialize EGL Extension functions
-  eglCreateImageKHR =
-      (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
-  eglDestroyImageKHR =
-      (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-
-  glEGLImageTargetTexture2DOES =
-      (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
-          "glEGLImageTargetTexture2DOES");
-  if (!glEGLImageTargetTexture2DOES) {
-    fprintf(stderr,
-            "Error: Driver does not support glEGLImageTargetTexture2DOES\n");
-    return -1;
-  }
-
-  char *vs_code = read_file("shader.vs"); // MUST UPDATE THIS FILE
-  char *fs_code = read_file("shader.fs");
-  GLuint program = create_program(vs_code, fs_code);
-  free(vs_code);
-  free(fs_code);
-
-  GLint aPos = glGetAttribLocation(program, "aPos");
-  GLint aTex = glGetAttribLocation(program, "aTex");
-
-  // 4. Initialize 4 Video Players
-  VideoPlayer players[4];
-  const char *files[] = {"videos/1080p_.mp4", "videos/zoo.mp4", "videos/zoo.mp4",
-                         "videos/zoo.mp4"};
-
-  for (int i = 0; i < 4; i++) {
-    // You can use the same file 4 times for testing if you want
-    if (init_player(&players[i], files[i], i) < 0) {
-      fprintf(stderr, "Failed to init player %d\n", i);
-    }
-  }
-
-  while (!glfwWindowShouldClose(window)) {
-
-    // Update Decode Logic (CPU/Decoder)
-    for (int i = 0; i < 4; i++) {
-      update_player(&players[i]);
-    }
-
-    // Render Logic (GPU)
-    glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(program);
-
-    glUniform1i(glGetUniformLocation(program, "uTextureY"), 0);
-    glUniform1i(glGetUniformLocation(program, "uTextureUV"), 1);
-
-    glEnableVertexAttribArray(aPos);
-    glEnableVertexAttribArray(aTex);
-    glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
-    glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
-                          quad + 2);
-
-    for (int i = 0; i < 4; i++) {
-      render_player(&players[i], program);
-    }
-
-    glfwSwapBuffers(window);
-    glfwPollEvents();
-  }
-
-  glfwTerminate();
-  return 0;
-}
-
-int open_video(const char *filename) {
-  avformat_open_input(&fmt_ctx, filename, NULL, NULL);
-  avformat_find_stream_info(fmt_ctx, NULL);
-
-  for (int i = 0; i < fmt_ctx->nb_streams; i++) {
-    if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-      video_stream_idx = i;
-      break;
-    }
-  }
-
-  video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
-
-  const AVCodec *codec = avcodec_find_decoder(
-      fmt_ctx->streams[video_stream_idx]->codecpar->codec_id);
-  dec_ctx = avcodec_alloc_context3(codec);
-  avcodec_parameters_to_context(dec_ctx,
-                                fmt_ctx->streams[video_stream_idx]->codecpar);
-
-  video_time_base = fmt_ctx->streams[video_stream_idx]->time_base;
-  dec_ctx->get_format = get_hw_format;
-
-  // Initialize VAAPI Device
-  av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
-  dec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-
-  avcodec_open2(dec_ctx, codec, NULL);
-  frame = av_frame_alloc();
-  pkt = av_packet_alloc();
-  return 0;
-}
-
-static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
-                                        const enum AVPixelFormat *pix_fmts) {
-  for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-    if (*p == AV_PIX_FMT_VAAPI) {
-      return *p;
-    }
-  }
-
-  fprintf(stderr, "VAAPI not supported by decoder\n");
-  return AV_PIX_FMT_NONE;
-}
-
-int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type) {
-  int err = 0;
-  // For Fedora, AV_HWDEVICE_TYPE_VAAPI. For Embedded, AV_HWDEVICE_TYPE_DRM.
-  if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0) {
-    return err;
-  }
-  ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-  return 0;
-}
-
-double pts_to_seconds(int64_t pts, AVRational time_base) { 
-    return pts * av_q2d(time_base); 
-}
-
-static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
-  return (AVDRMFrameDescriptor *)frame->data[0];
-}
-
-NV12_EGLImages create_split_egl_images(EGLDisplay display,
-                                       const AVFrame *frame) {
-  NV12_EGLImages result = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
-
-  if (frame->format != AV_PIX_FMT_DRM_PRIME)
-    return result;
-
-  const AVDRMFrameDescriptor *desc =
-      (const AVDRMFrameDescriptor *)frame->data[0];
-
-  // --- Y PLANE SETUP ---
-  int layer_y = 0;
-  int plane_y = 0;
-  int obj_y_idx = desc->layers[layer_y].planes[plane_y].object_index;
-  int fd_y = desc->objects[obj_y_idx].fd;
-  int offset_y = desc->layers[layer_y].planes[plane_y].offset;
-  int stride_y = desc->layers[layer_y].planes[plane_y].pitch;
-  uint64_t modifier_y = desc->objects[obj_y_idx].format_modifier;
-
-  EGLint attribs_y[] = {
-      EGL_WIDTH, frame->width, EGL_HEIGHT, frame->height,
-      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8, EGL_DMA_BUF_PLANE0_FD_EXT, fd_y,
-      EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_y, EGL_DMA_BUF_PLANE0_PITCH_EXT,
-      stride_y,
-      // PASS MODIFIERS!
-      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_y & 0xFFFFFFFF),
-      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_y >> 32), EGL_NONE};
-
-  result.image_y = eglCreateImageKHR(display, EGL_NO_CONTEXT,
-                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs_y);
-
-  // --- UV PLANE SETUP ---
-  // Handle case where UV is in same layer (NV12 standard) or different layer
-  int layer_uv = (desc->nb_layers > 1) ? 1 : 0;
-  int plane_uv = (desc->nb_layers > 1) ? 0 : 1;
-  int obj_uv_idx = desc->layers[layer_uv].planes[plane_uv].object_index;
-
-  int fd_uv = desc->objects[obj_uv_idx].fd;
-  int offset_uv = desc->layers[layer_uv].planes[plane_uv].offset;
-  int stride_uv = desc->layers[layer_uv].planes[plane_uv].pitch;
-  uint64_t modifier_uv = desc->objects[obj_uv_idx].format_modifier;
-
-  EGLint attribs_uv[] = {
-      EGL_WIDTH, frame->width / 2, EGL_HEIGHT, frame->height / 2,
-      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_GR88, EGL_DMA_BUF_PLANE0_FD_EXT,
-      fd_uv, EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_uv,
-      EGL_DMA_BUF_PLANE0_PITCH_EXT, stride_uv,
-      // PASS MODIFIERS!
-      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_uv & 0xFFFFFFFF),
-      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_uv >> 32),
-      EGL_NONE};
-
-  result.image_uv = eglCreateImageKHR(display, EGL_NO_CONTEXT,
-                                      EGL_LINUX_DMA_BUF_EXT, NULL, attribs_uv);
-
-  return result;
 }
