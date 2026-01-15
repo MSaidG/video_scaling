@@ -24,6 +24,8 @@
 
 void update_video_frame(GLuint tex_id);
 int open_video(const char *filename);
+// int open_video(const char *filename, AVFormatContext *fmt_ctx, AVCodecContext *dec_ctx);
+
 void upload_yuv_textures(AVFrame *frame, GLuint texY, GLuint texU, GLuint texV);
 void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV);
 void upload_plane(GLuint texID, int width, int height, int linesize,

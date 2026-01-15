@@ -39,62 +39,7 @@ typedef struct {
 } NV12_EGLImages;
 
 NV12_EGLImages create_split_egl_images(EGLDisplay display,
-                                       const AVFrame *frame) {
-  NV12_EGLImages result = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
-
-  if (frame->format != AV_PIX_FMT_DRM_PRIME)
-    return result;
-
-  const AVDRMFrameDescriptor *desc =
-      (const AVDRMFrameDescriptor *)frame->data[0];
-
-  // --- Y PLANE SETUP ---
-  int layer_y = 0;
-  int plane_y = 0;
-  int obj_y_idx = desc->layers[layer_y].planes[plane_y].object_index;
-  int fd_y = desc->objects[obj_y_idx].fd;
-  int offset_y = desc->layers[layer_y].planes[plane_y].offset;
-  int stride_y = desc->layers[layer_y].planes[plane_y].pitch;
-  uint64_t modifier_y = desc->objects[obj_y_idx].format_modifier;
-
-  EGLint attribs_y[] = {
-      EGL_WIDTH, frame->width, EGL_HEIGHT, frame->height,
-      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8, EGL_DMA_BUF_PLANE0_FD_EXT, fd_y,
-      EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_y, EGL_DMA_BUF_PLANE0_PITCH_EXT,
-      stride_y,
-      // PASS MODIFIERS!
-      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_y & 0xFFFFFFFF),
-      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_y >> 32), EGL_NONE};
-
-  result.image_y = eglCreateImageKHR(display, EGL_NO_CONTEXT,
-                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs_y);
-
-  // --- UV PLANE SETUP ---
-  // Handle case where UV is in same layer (NV12 standard) or different layer
-  int layer_uv = (desc->nb_layers > 1) ? 1 : 0;
-  int plane_uv = (desc->nb_layers > 1) ? 0 : 1;
-  int obj_uv_idx = desc->layers[layer_uv].planes[plane_uv].object_index;
-
-  int fd_uv = desc->objects[obj_uv_idx].fd;
-  int offset_uv = desc->layers[layer_uv].planes[plane_uv].offset;
-  int stride_uv = desc->layers[layer_uv].planes[plane_uv].pitch;
-  uint64_t modifier_uv = desc->objects[obj_uv_idx].format_modifier;
-
-  EGLint attribs_uv[] = {
-      EGL_WIDTH, frame->width / 2, EGL_HEIGHT, frame->height / 2,
-      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_GR88, EGL_DMA_BUF_PLANE0_FD_EXT,
-      fd_uv, EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_uv,
-      EGL_DMA_BUF_PLANE0_PITCH_EXT, stride_uv,
-      // PASS MODIFIERS!
-      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_uv & 0xFFFFFFFF),
-      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_uv >> 32),
-      EGL_NONE};
-
-  result.image_uv = eglCreateImageKHR(display, EGL_NO_CONTEXT,
-                                      EGL_LINUX_DMA_BUF_EXT, NULL, attribs_uv);
-
-  return result;
-}
+                                       const AVFrame *frame);
 
 int main(int argc, char **argv) {
 
@@ -366,53 +311,60 @@ static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
   return (AVDRMFrameDescriptor *)frame->data[0];
 }
 
-EGLImageKHR create_eglimage_plane(EGLDisplay disp, AVFrame *frame,
-                                  int plane_index, int format) {
-  AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)frame->data[0];
-  AVDRMLayerDescriptor *layer = &desc->layers[0];
+NV12_EGLImages create_split_egl_images(EGLDisplay display,
+                                       const AVFrame *frame) {
+  NV12_EGLImages result = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
 
-  EGLint attribs[64]; // Increased size to be safe
-  int k = 0;
+  if (frame->format != AV_PIX_FMT_DRM_PRIME)
+    return result;
 
-  // 1. Calculate Dimensions
-  int width =
-      frame->width; // (plane_index == 0) ? frame->width : frame->width / 2;
-  int height =
-      frame->height; // (plane_index == 0) ? frame->height : frame->height / 2;
+  const AVDRMFrameDescriptor *desc =
+      (const AVDRMFrameDescriptor *)frame->data[0];
 
-  attribs[k++] = EGL_WIDTH;
-  attribs[k++] = width;
-  attribs[k++] = EGL_HEIGHT;
-  attribs[k++] = height;
-  attribs[k++] = EGL_LINUX_DRM_FOURCC_EXT;
-  attribs[k++] = format;
+  // --- Y PLANE SETUP ---
+  int layer_y = 0;
+  int plane_y = 0;
+  int obj_y_idx = desc->layers[layer_y].planes[plane_y].object_index;
+  int fd_y = desc->objects[obj_y_idx].fd;
+  int offset_y = desc->layers[layer_y].planes[plane_y].offset;
+  int stride_y = desc->layers[layer_y].planes[plane_y].pitch;
+  uint64_t modifier_y = desc->objects[obj_y_idx].format_modifier;
 
-  // 2. Get Object Info (FD and Modifier)
-  int obj_idx = layer->planes[0].object_index;
-  int fd = desc->objects[obj_idx].fd;
-  uint64_t modifier = desc->objects[obj_idx].format_modifier; // <--- CRITICAL
+  EGLint attribs_y[] = {
+      EGL_WIDTH, frame->width, EGL_HEIGHT, frame->height,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8, EGL_DMA_BUF_PLANE0_FD_EXT, fd_y,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_y, EGL_DMA_BUF_PLANE0_PITCH_EXT,
+      stride_y,
+      // PASS MODIFIERS!
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_y & 0xFFFFFFFF),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_y >> 32), EGL_NONE};
 
-  attribs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT;
-  attribs[k++] = fd;
-  attribs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
-  attribs[k++] = layer->planes[0].offset;
-  attribs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
-  attribs[k++] = layer->planes[0].pitch;
+  result.image_y = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs_y);
 
-  // 3. APPLY MODIFIER (Fixes "Failed to create EGLImage")
-  // If the driver provided a modifier (e.g. I915_Y_TILED), we MUST pass it.
-  if (modifier != DRM_FORMAT_MOD_INVALID) {
-    attribs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
-    attribs[k++] = modifier & 0xFFFFFFFF;
-    attribs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
-    attribs[k++] = modifier >> 32;
-  }
+  // --- UV PLANE SETUP ---
+  // Handle case where UV is in same layer (NV12 standard) or different layer
+  int layer_uv = (desc->nb_layers > 1) ? 1 : 0;
+  int plane_uv = (desc->nb_layers > 1) ? 0 : 1;
+  int obj_uv_idx = desc->layers[layer_uv].planes[plane_uv].object_index;
 
-  attribs[k++] = EGL_NONE;
+  int fd_uv = desc->objects[obj_uv_idx].fd;
+  int offset_uv = desc->layers[layer_uv].planes[plane_uv].offset;
+  int stride_uv = desc->layers[layer_uv].planes[plane_uv].pitch;
+  uint64_t modifier_uv = desc->objects[obj_uv_idx].format_modifier;
 
-  return eglCreateImageKHR(disp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,
-                           attribs);
+  EGLint attribs_uv[] = {
+      EGL_WIDTH, frame->width / 2, EGL_HEIGHT, frame->height / 2,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_GR88, EGL_DMA_BUF_PLANE0_FD_EXT,
+      fd_uv, EGL_DMA_BUF_PLANE0_OFFSET_EXT, offset_uv,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, stride_uv,
+      // PASS MODIFIERS!
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier_uv & 0xFFFFFFFF),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier_uv >> 32),
+      EGL_NONE};
 
-  if (plane_index == 0) {
-  }
+  result.image_uv = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT, NULL, attribs_uv);
+
+  return result;
 }
