@@ -21,6 +21,10 @@
 #define VIDEO_W 800
 #define VIDEO_H 600
 
+typedef struct {
+  EGLImageKHR image_y;
+  EGLImageKHR image_uv;
+} NV12_EGLImages;
 
 void update_video_frame(GLuint tex_id);
 int open_video(const char *filename);
@@ -34,7 +38,7 @@ int hw_decoder_init(AVCodecContext *ctx, const enum AVHWDeviceType type);
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                         const enum AVPixelFormat *pix_fmts);
 
-double pts_to_seconds(int64_t pts);
+double pts_to_seconds(int64_t pts, AVRational time_base);
 static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame);
 
 
@@ -42,3 +46,5 @@ static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame);
 // void update_video_frame_egl(GLuint texID);
 void update_video_frame_egl(GLuint texY, GLuint texUV);
 EGLImageKHR create_eglimage_plane(EGLDisplay disp, AVFrame *frame, int plane_index, int format);
+NV12_EGLImages create_split_egl_images(EGLDisplay display,
+                                       const AVFrame *frame);
