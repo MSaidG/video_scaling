@@ -15,12 +15,35 @@ PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
 
+int is_paused = 0;               // 0 = Playing, 1 = Paused
+double total_pause_offset = 0.0; // Total time spent paused
+double last_pause_start = 0.0;   // Timestamp when the current pause started
+
+void key_callback(GLFWwindow *window, int key, int scancode, int action,
+                  int mods) {
+  if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
+    is_paused = !is_paused; // Toggle state
+
+    if (is_paused) {
+      // Just paused: record the time
+      last_pause_start = glfwGetTime();
+      printf("Paused\n");
+    } else {
+      // Just resumed: calculate how long we were paused and add to offset
+      double paused_duration = glfwGetTime() - last_pause_start;
+      total_pause_offset += paused_duration;
+      printf("Resumed (Offset: %.2f sec)\n", total_pause_offset);
+    }
+  }
+}
 
 int main(int argc, char **argv) {
 
   GLFWwindow *window = initGLFW(VIDEO_W, VIDEO_H);
   if (window == NULL)
     return -1;
+
+  glfwSetKeyCallback(window, key_callback);
 
   // Initialize EGL Extension functions
   eglCreateImageKHR =
@@ -48,8 +71,8 @@ int main(int argc, char **argv) {
 
   // 4. Initialize 4 Video Players
   VideoPlayer players[4];
-  const char *files[] = {"videos/animals.mp4", "videos/earth.mp4", "videos/galaxy.mp4",
-                         "videos/ocean.mp4"};
+  const char *files[] = {"videos/animals.mp4", "videos/earth.mp4",
+                         "videos/galaxy.mp4", "videos/ocean.mp4"};
 
   for (int i = 0; i < 4; i++) {
     // You can use the same file 4 times for testing if you want
@@ -90,7 +113,6 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
                                         const enum AVPixelFormat *pix_fmts) {
   for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
@@ -103,8 +125,8 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
   return AV_PIX_FMT_NONE;
 }
 
-double pts_to_seconds(int64_t pts, AVRational time_base) { 
-    return pts * av_q2d(time_base); 
+double pts_to_seconds(int64_t pts, AVRational time_base) {
+  return pts * av_q2d(time_base);
 }
 
 static AVDRMFrameDescriptor *get_drm_desc(AVFrame *frame) {
@@ -169,29 +191,31 @@ NV12_EGLImages create_split_egl_images(EGLDisplay display,
   return result;
 }
 
-
-
 // Helper to create a basic 4x4 matrix for grid positioning
 void calculate_transform(int id, float *m) {
-    // Identity
-    for(int i=0; i<16; i++) m[i] = 0.0f;
-    m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
+  // Identity
+  for (int i = 0; i < 16; i++)
+    m[i] = 0.0f;
+  m[0] = 1.0f;
+  m[5] = 1.0f;
+  m[10] = 1.0f;
+  m[15] = 1.0f;
 
-    // Scale by 0.5 (since we are squeezing 4 into 1 screen)
-    m[0] = 0.5f;
-    m[5] = 0.5f;
+  // Scale by 0.5 (since we are squeezing 4 into 1 screen)
+  m[0] = 0.5f;
+  m[5] = 0.5f;
 
-    // Translate based on ID
-    // 0: Top-Left (-0.5, 0.5)
-    // 1: Top-Right (0.5, 0.5)
-    // 2: Bot-Left (-0.5, -0.5)
-    // 3: Bot-Right (0.5, -0.5)
-    float tx = (id % 2 == 0) ? -0.5f : 0.5f;
-    float ty = (id < 2)      ?  0.5f : -0.5f;
+  // Translate based on ID
+  // 0: Top-Left (-0.5, 0.5)
+  // 1: Top-Right (0.5, 0.5)
+  // 2: Bot-Left (-0.5, -0.5)
+  // 3: Bot-Right (0.5, -0.5)
+  float tx = (id % 2 == 0) ? -0.5f : 0.5f;
+  float ty = (id < 2) ? 0.5f : -0.5f;
 
-    // In Column-Major 4x4, translation is indices 12, 13
-    m[12] = tx;
-    m[13] = ty;
+  // In Column-Major 4x4, translation is indices 12, 13
+  m[12] = tx;
+  m[13] = ty;
 }
 
 int init_player(VideoPlayer *vp, const char *filename, int id) {
@@ -258,111 +282,120 @@ int init_player(VideoPlayer *vp, const char *filename, int id) {
 }
 
 void update_player(VideoPlayer *vp) {
-    // ---------------------------------------------------------
-    // 1. DECODE / FILL BUFFER
-    // Only try to decode a new frame if the current buffer (vp->frame) 
-    // is empty. We use width==0 to check if the frame is unreferenced.
-    // ---------------------------------------------------------
-    if (vp->frame->width == 0) {
-        int got_frame = 0;
-        
-        // Loop until we get one frame or error/EOF
-        while (!got_frame) {
-            int ret = av_read_frame(vp->fmt_ctx, vp->pkt);
 
-            if (ret == AVERROR_EOF) {
-                // Handle Loop: Seek to start and reset timing
-                av_seek_frame(vp->fmt_ctx, vp->video_stream_idx, 0, AVSEEK_FLAG_BACKWARD);
-                avcodec_flush_buffers(vp->dec_ctx);
-                vp->first_pts = AV_NOPTS_VALUE; // Reset clock trigger
-                continue;
-            }
-            if (ret < 0) return; // Error
+  if (is_paused)
+    return;
+  // ---------------------------------------------------------
+  // 1. DECODE / FILL BUFFER
+  // Only try to decode a new frame if the current buffer (vp->frame)
+  // is empty. We use width==0 to check if the frame is unreferenced.
+  // ---------------------------------------------------------
+  if (vp->frame->width == 0) {
+    int got_frame = 0;
 
-            if (vp->pkt->stream_index == vp->video_stream_idx) {
-                if (avcodec_send_packet(vp->dec_ctx, vp->pkt) == 0) {
-                    if (avcodec_receive_frame(vp->dec_ctx, vp->frame) == 0) {
-                        got_frame = 1; // Success: vp->frame is now full
-                    }
-                }
-            }
-            av_packet_unref(vp->pkt);
-            
-            // If we processed a packet but didn't get a frame (e.g. B-frames needed more data),
-            // we loop again. But if we got a frame, we stop.
+    // Loop until we get one frame or error/EOF
+    while (!got_frame) {
+      int ret = av_read_frame(vp->fmt_ctx, vp->pkt);
+
+      if (ret == AVERROR_EOF) {
+        // Handle Loop: Seek to start and reset timing
+        av_seek_frame(vp->fmt_ctx, vp->video_stream_idx, 0,
+                      AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(vp->dec_ctx);
+        vp->first_pts = AV_NOPTS_VALUE; // Reset clock trigger
+        continue;
+      }
+      if (ret < 0)
+        return; // Error
+
+      if (vp->pkt->stream_index == vp->video_stream_idx) {
+        if (avcodec_send_packet(vp->dec_ctx, vp->pkt) == 0) {
+          if (avcodec_receive_frame(vp->dec_ctx, vp->frame) == 0) {
+            got_frame = 1; // Success: vp->frame is now full
+          }
         }
+      }
+      av_packet_unref(vp->pkt);
+
+      // If we processed a packet but didn't get a frame (e.g. B-frames needed
+      // more data), we loop again. But if we got a frame, we stop.
     }
+  }
 
-    // If after trying to decode, we still have no frame, return.
-    if (vp->frame->width == 0) return;
+  // If after trying to decode, we still have no frame, return.
+  if (vp->frame->width == 0)
+    return;
 
+  // ---------------------------------------------------------
+  // 2. PACING / SYNC CHECK (UPDATED)
+  // ---------------------------------------------------------
 
-    // ---------------------------------------------------------
-    // 2. PACING / SYNC CHECK
-    // ---------------------------------------------------------
-    
-    // Initialize timing on the very first frame (or after loop)
-    if (vp->first_pts == AV_NOPTS_VALUE) {
-        vp->first_pts = vp->frame->pts;
-        vp->start_time = glfwGetTime();
-    }
+  if (vp->first_pts == AV_NOPTS_VALUE) {
+    vp->first_pts = vp->frame->pts;
+    // IMPORTANT: We must subtract existing pause offset here too
+    // so new videos start in sync with currently playing ones if needed.
+    vp->start_time = glfwGetTime() - total_pause_offset;
+  }
 
-    double current_time = glfwGetTime();
-    double master_clock = current_time - vp->start_time;
-    double pts_sec = pts_to_seconds(vp->frame->pts - vp->first_pts, vp->video_time_base);
+  double current_time = glfwGetTime();
 
-    // PACING LOGIC:
-    // If the frame's PTS is in the future (plus a tiny tolerance of 0ms),
-    // we return immediately. We DO NOT clear vp->frame.
-    // The next time update_player is called (next monitor refresh), 
-    // we will skip Step 1 and come straight here to check time again.
-    if (pts_sec > master_clock) {
-        return; 
-    }
+  // ADJUST CLOCK: Subtract the total time we spent paused
+  // If we slept for 10s, we subtract 10s so the video thinks no time passed.
+  double master_clock = (current_time - vp->start_time) - total_pause_offset;
 
-    // ---------------------------------------------------------
-    // 3. DISPLAY / HW MAPPING
-    // If we reach here, it is time (or past time) to display.
-    // ---------------------------------------------------------
-    
-    AVFrame *drm_frame = av_frame_alloc();
-    drm_frame->format = AV_PIX_FMT_DRM_PRIME;
-    
-    if (av_hwframe_map(drm_frame, vp->frame, AV_HWFRAME_MAP_READ) == 0) {
-        
-        // --- [Standard EGL Setup from your code] ---
-        EGLDisplay disp = eglGetCurrentDisplay();
-        NV12_EGLImages images = create_split_egl_images(disp, drm_frame);
+  double pts_sec =
+      pts_to_seconds(vp->frame->pts - vp->first_pts, vp->video_time_base);
 
-        // Cleanup Old
-        if (vp->image_y != EGL_NO_IMAGE_KHR) eglDestroyImageKHR(disp, vp->image_y);
-        if (vp->image_uv != EGL_NO_IMAGE_KHR) eglDestroyImageKHR(disp, vp->image_uv);
-        if (vp->current_drm_frame) av_frame_free(&vp->current_drm_frame);
+  if (pts_sec > master_clock) {
+    return;
+  }
 
-        // Assign New
-        vp->image_y = images.image_y;
-        vp->image_uv = images.image_uv;
-        vp->current_drm_frame = drm_frame; 
+  // ---------------------------------------------------------
+  // 3. DISPLAY / HW MAPPING
+  // If we reach here, it is time (or past time) to display.
+  // ---------------------------------------------------------
 
-        // Update OpenGL Textures
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, vp->texY);
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, vp->image_y);
+  AVFrame *drm_frame = av_frame_alloc();
+  drm_frame->format = AV_PIX_FMT_DRM_PRIME;
 
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, vp->texUV);
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, vp->image_uv);
-    } else {
-        // Map failed, cleanup the temp frame
-        av_frame_free(&drm_frame);
-    }
+  if (av_hwframe_map(drm_frame, vp->frame, AV_HWFRAME_MAP_READ) == 0) {
 
-    // ---------------------------------------------------------
-    // 4. CLEANUP BUFFER
-    // We have consumed this frame (sent to GPU). 
-    // Clear it so Step 1 can decode the *next* frame on the next call.
-    // ---------------------------------------------------------
-    av_frame_unref(vp->frame);
+    // --- [Standard EGL Setup from your code] ---
+    EGLDisplay disp = eglGetCurrentDisplay();
+    NV12_EGLImages images = create_split_egl_images(disp, drm_frame);
+
+    // Cleanup Old
+    if (vp->image_y != EGL_NO_IMAGE_KHR)
+      eglDestroyImageKHR(disp, vp->image_y);
+    if (vp->image_uv != EGL_NO_IMAGE_KHR)
+      eglDestroyImageKHR(disp, vp->image_uv);
+    if (vp->current_drm_frame)
+      av_frame_free(&vp->current_drm_frame);
+
+    // Assign New
+    vp->image_y = images.image_y;
+    vp->image_uv = images.image_uv;
+    vp->current_drm_frame = drm_frame;
+
+    // Update OpenGL Textures
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, vp->texY);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, vp->image_y);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, vp->texUV);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, vp->image_uv);
+  } else {
+    // Map failed, cleanup the temp frame
+    av_frame_free(&drm_frame);
+  }
+
+  // ---------------------------------------------------------
+  // 4. CLEANUP BUFFER
+  // We have consumed this frame (sent to GPU).
+  // Clear it so Step 1 can decode the *next* frame on the next call.
+  // ---------------------------------------------------------
+  av_frame_unref(vp->frame);
 }
 
 void render_player(VideoPlayer *vp, GLuint program) {
