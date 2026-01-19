@@ -81,25 +81,21 @@ int main(int argc, char **argv) {
     }
   }
 
+  glEnableVertexAttribArray(aPos);
+  glEnableVertexAttribArray(aTex);
+  glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
+  glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                        quad + 2);
+  glUseProgram(program);
+  glUniform1i(glGetUniformLocation(program, "uTextureY"), 0);
+  glUniform1i(glGetUniformLocation(program, "uTextureUV"), 1);
+
   while (!glfwWindowShouldClose(window)) {
 
     // Update Decode Logic (CPU/Decoder)
     for (int i = 0; i < 4; i++) {
       update_player(&players[i]);
     }
-
-    // Render Logic (GPU)
-    glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(program);
-
-    glUniform1i(glGetUniformLocation(program, "uTextureY"), 0);
-    glUniform1i(glGetUniformLocation(program, "uTextureUV"), 1);
-
-    glEnableVertexAttribArray(aPos);
-    glEnableVertexAttribArray(aTex);
-    glVertexAttribPointer(aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), quad);
-    glVertexAttribPointer(aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
-                          quad + 2);
 
     for (int i = 0; i < 4; i++) {
       render_player(&players[i], program);
