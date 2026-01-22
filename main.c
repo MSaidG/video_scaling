@@ -1,5 +1,6 @@
 #include "main.h"
 #include "libavcodec/packet.h"
+#include <libswscale/swscale.h> // Required for scaling
 #include <time.h>
 
 // FFmpeg Global State
@@ -31,6 +32,77 @@ static inline double pts_to_seconds(int64_t pts) {
   return pts * av_q2d(video_time_base);
 }
 
+
+// Default startup size
+int target_w = 800;
+int target_h = 600;
+
+// Flag to tell the video loop to resize buffers
+int resize_pending = 1;
+
+// Scaling State
+struct SwsContext *scaler_ctx = NULL;
+AVFrame *frame_scaled = NULL;
+
+int init_converted_frame() {
+    frame_scaled = av_frame_alloc();
+    if (!frame_scaled) return -1;
+
+    frame_scaled->format = AV_PIX_FMT_YUV420P;
+    frame_scaled->width  = target_w;
+    frame_scaled->height = target_h;
+
+    // Allocate the buffer for the scaled frame
+    if (av_frame_get_buffer(frame_scaled, 32) < 0) {
+        fprintf(stderr, "Could not allocate buffer for scaled frame\n");
+        return -1;
+    }
+    return 0;
+}
+
+// Helper to reset textures and buffers when window size changes
+// Returns 0 on success, -1 on error
+int reconfigure_scaler_and_textures(GLuint texY, GLuint texU, GLuint texV) {
+    
+    // 1. Free existing CPU scaler frame
+    if (frame_scaled) {
+        av_frame_free(&frame_scaled);
+    }
+    
+    // 2. Free existing SwsContext (it locks in the old resolution)
+    if (scaler_ctx) {
+        sws_freeContext(scaler_ctx);
+        scaler_ctx = NULL; // Force re-creation next frame
+    }
+
+    // 3. Allocate new CPU frame
+    frame_scaled = av_frame_alloc();
+    frame_scaled->format = AV_PIX_FMT_YUV420P;
+    frame_scaled->width = target_w;
+    frame_scaled->height = target_h;
+    
+    if (av_frame_get_buffer(frame_scaled, 32) < 0) {
+        return -1;
+    }
+
+    // 4. Resize OpenGL Textures (Re-allocate storage with glTexImage2D)
+    // We pass NULL pixels because we just want to resize the GPU memory
+    
+    // Y Plane (Full res)
+    glBindTexture(GL_TEXTURE_2D, texY);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w, target_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+
+    // U Plane (Half res)
+    glBindTexture(GL_TEXTURE_2D, texU);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w/2, target_h/2, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+
+    // V Plane (Half res)
+    glBindTexture(GL_TEXTURE_2D, texV);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w/2, target_h/2, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+    
+    return 0;
+}
+
 int main(int argc, char **argv) {
 
   glfwInit();
@@ -59,6 +131,8 @@ int main(int argc, char **argv) {
     return -1;
   }
 
+  if (init_converted_frame() < 0) return -1;
+
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   GLuint texY, texU, texV;
   glGenTextures(1, &texY);
@@ -67,9 +141,9 @@ int main(int argc, char **argv) {
 
   // Helper to init YUV textures
   GLuint texs[3] = {texY, texU, texV};
-  int dims[3][2] = {{dec_ctx->width, dec_ctx->height},
-                    {dec_ctx->width / 2, dec_ctx->height / 2},
-                    {dec_ctx->width / 2, dec_ctx->height / 2}};
+  int dims[3][2] = {{target_w, target_h},
+                    {target_w / 2, target_h / 2},
+                    {target_w / 2, target_h / 2}};
 
   for (int i = 0; i < 3; i++) {
     glBindTexture(GL_TEXTURE_2D, texs[i]);
@@ -146,6 +220,13 @@ int main(int argc, char **argv) {
 
 void framebuffer_size_callback(GLFWwindow *window, int width, int height) {
   glViewport(0, 0, width, height);
+
+  // Prevent 0 divide if minimized
+    if (width > 0 && height > 0) {
+        target_w = width;
+        target_h = height;
+        resize_pending = 1; // Signal the loop to rebuild buffers
+    }
 }
 
 GLuint compile_shader(GLenum type, const char *src) {
