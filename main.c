@@ -1,5 +1,6 @@
 #include "main.h"
 #include "libavcodec/packet.h"
+#include <libavutil/frame.h>
 #include <libswscale/swscale.h> // Required for scaling
 #include <time.h>
 
@@ -32,7 +33,6 @@ static inline double pts_to_seconds(int64_t pts) {
   return pts * av_q2d(video_time_base);
 }
 
-
 // Default startup size
 int target_w = 800;
 int target_h = 600;
@@ -45,62 +45,66 @@ struct SwsContext *scaler_ctx = NULL;
 AVFrame *frame_scaled = NULL;
 
 int init_converted_frame() {
-    frame_scaled = av_frame_alloc();
-    if (!frame_scaled) return -1;
+  frame_scaled = av_frame_alloc();
+  if (!frame_scaled)
+    return -1;
 
-    frame_scaled->format = AV_PIX_FMT_YUV420P;
-    frame_scaled->width  = target_w;
-    frame_scaled->height = target_h;
+  frame_scaled->format = AV_PIX_FMT_YUV420P;
+  frame_scaled->width = target_w;
+  frame_scaled->height = target_h;
 
-    // Allocate the buffer for the scaled frame
-    if (av_frame_get_buffer(frame_scaled, 32) < 0) {
-        fprintf(stderr, "Could not allocate buffer for scaled frame\n");
-        return -1;
-    }
-    return 0;
+  // Allocate the buffer for the scaled frame
+  if (av_frame_get_buffer(frame_scaled, 32) < 0) {
+    fprintf(stderr, "Could not allocate buffer for scaled frame\n");
+    return -1;
+  }
+  return 0;
 }
 
 // Helper to reset textures and buffers when window size changes
 // Returns 0 on success, -1 on error
 int reconfigure_scaler_and_textures(GLuint texY, GLuint texU, GLuint texV) {
-    
-    // 1. Free existing CPU scaler frame
-    if (frame_scaled) {
-        av_frame_free(&frame_scaled);
-    }
-    
-    // 2. Free existing SwsContext (it locks in the old resolution)
-    if (scaler_ctx) {
-        sws_freeContext(scaler_ctx);
-        scaler_ctx = NULL; // Force re-creation next frame
-    }
 
-    // 3. Allocate new CPU frame
-    frame_scaled = av_frame_alloc();
-    frame_scaled->format = AV_PIX_FMT_YUV420P;
-    frame_scaled->width = target_w;
-    frame_scaled->height = target_h;
-    
-    if (av_frame_get_buffer(frame_scaled, 32) < 0) {
-        return -1;
-    }
+  // 1. Free existing CPU scaler frame
+  if (frame_scaled) {
+    av_frame_free(&frame_scaled);
+  }
 
-    // 4. Resize OpenGL Textures (Re-allocate storage with glTexImage2D)
-    // We pass NULL pixels because we just want to resize the GPU memory
-    
-    // Y Plane (Full res)
-    glBindTexture(GL_TEXTURE_2D, texY);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w, target_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+  // 2. Free existing SwsContext (it locks in the old resolution)
+  if (scaler_ctx) {
+    sws_freeContext(scaler_ctx);
+    scaler_ctx = NULL; // Force re-creation next frame
+  }
 
-    // U Plane (Half res)
-    glBindTexture(GL_TEXTURE_2D, texU);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w/2, target_h/2, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+  // 3. Allocate new CPU frame
+  frame_scaled = av_frame_alloc();
+  frame_scaled->format = AV_PIX_FMT_YUV420P;
+  frame_scaled->width = target_w;
+  frame_scaled->height = target_h;
 
-    // V Plane (Half res)
-    glBindTexture(GL_TEXTURE_2D, texV);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w/2, target_h/2, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
-    
-    return 0;
+  if (av_frame_get_buffer(frame_scaled, 32) < 0) {
+    return -1;
+  }
+
+  // 4. Resize OpenGL Textures (Re-allocate storage with glTexImage2D)
+  // We pass NULL pixels because we just want to resize the GPU memory
+
+  // Y Plane (Full res)
+  glBindTexture(GL_TEXTURE_2D, texY);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w, target_h, 0,
+               GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+
+  // U Plane (Half res)
+  glBindTexture(GL_TEXTURE_2D, texU);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w / 2, target_h / 2, 0,
+               GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+
+  // V Plane (Half res)
+  glBindTexture(GL_TEXTURE_2D, texV);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, target_w / 2, target_h / 2, 0,
+               GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -131,7 +135,8 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  if (init_converted_frame() < 0) return -1;
+  if (init_converted_frame() < 0)
+    return -1;
 
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   GLuint texY, texU, texV;
@@ -214,6 +219,9 @@ int main(int argc, char **argv) {
     glfwPollEvents();
   }
 
+  if (scaler_ctx) sws_freeContext(scaler_ctx);
+  if (frame_scaled) av_frame_free(&frame_scaled);
+
   glfwTerminate();
   return 0;
 }
@@ -222,11 +230,11 @@ void framebuffer_size_callback(GLFWwindow *window, int width, int height) {
   glViewport(0, 0, width, height);
 
   // Prevent 0 divide if minimized
-    if (width > 0 && height > 0) {
-        target_w = width;
-        target_h = height;
-        resize_pending = 1; // Signal the loop to rebuild buffers
-    }
+  if (width > 0 && height > 0) {
+    target_w = width;
+    target_h = height;
+    resize_pending = 1; // Signal the loop to rebuild buffers
+  }
 }
 
 GLuint compile_shader(GLenum type, const char *src) {
@@ -376,38 +384,18 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
       break; // Error or other issue
 
     if (pkt->stream_index == video_stream_idx) {
-      // Send packet to decoder
       if (avcodec_send_packet(dec_ctx, pkt) == 0) {
-
-        // Try to retrieve a frame
-
-        // if (avcodec_receive_frame(dec_ctx, frame) == 0) {
-        //   // SUCCESS: We got a video frame! Upload and stop looking.
-        //   upload_yuv_textures(frame, texY, texU, texV);
-        //   av_packet_unref(pkt);
-        //   return; // Exit function, we are done for this frame
-        // }
-
-        // --- FOR HWACCEL ---
         if (avcodec_receive_frame(dec_ctx, frame) == 0) {
 
-          // --- Handle HW frames ---
           AVFrame *use_frame = frame;
+          AVFrame *sw_frame = NULL;
 
-          // Check if the frame is a hardware surface
           if (frame->format == hw_pix_fmt) {
-            AVFrame *sw_frame = av_frame_alloc();
-            sw_frame->format = AV_PIX_FMT_YUV420P;
-
-            // Transfer GPU memory to System RAM
+            sw_frame = av_frame_alloc();
             if (av_hwframe_transfer_data(sw_frame, frame, 0) >= 0) {
-              // Copy metadata needed for upload_yuv_textures
-              sw_frame->width = frame->width;
-              sw_frame->height = frame->height;
-              use_frame = sw_frame;
-
-              // CRITICAL: Upload the CPU-side data
-              // upload_yuv_textures(sw_frame, texY, texU, texV);
+              // Copy metadata
+              sw_frame->pts = frame->pts;
+              use_frame = sw_frame; // Now use_frame is the CPU data
             } else {
               av_frame_free(&sw_frame);
               av_packet_unref(pkt);
@@ -415,13 +403,37 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
             }
           }
 
-          // -------- Frame timing --------
+          // --- DYNAMIC RESIZING CHECK ---
+          if (resize_pending) {
+              reconfigure_scaler_and_textures(texY, texU, texV);
+              resize_pending = 0;
+          }
+          // ------------------------------
+
+          // 2. Initialize Scaler (Lazy initialization)
+          // We do this here because we need the EXACT source format/dimensions
+          if (!scaler_ctx) {
+            scaler_ctx =
+                sws_getContext(use_frame->width, use_frame->height,
+                               use_frame->format,                      // Source
+                               target_w, target_h, AV_PIX_FMT_YUV420P, // Target
+                               SWS_BILINEAR, NULL, NULL, NULL // Algorithm
+                );
+          }
+
+          // 3. Perform CPU Scaling
+          // Converts 'use_frame' -> 'frame_scaled'
+          sws_scale(scaler_ctx, (const uint8_t *const *)use_frame->data,
+                    use_frame->linesize, 0, use_frame->height,
+                    frame_scaled->data, frame_scaled->linesize);
+
+          // 4. Time Sync (Logic unchanged)
           if (first_pts == AV_NOPTS_VALUE) {
-            first_pts = frame->pts;
+            first_pts = use_frame->pts;
             video_start_time = glfwGetTime();
           }
 
-          double frame_time = pts_to_seconds(frame->pts - first_pts);
+          double frame_time = pts_to_seconds(use_frame->pts - first_pts);
           double now = glfwGetTime() - video_start_time;
           double delay = frame_time - now;
 
@@ -433,10 +445,10 @@ void update_yuv_video_frame(GLuint texY, GLuint texU, GLuint texV) {
           }
 
           // -------- Upload --------
-          upload_yuv_textures(use_frame, texY, texU, texV);
+          upload_yuv_textures(frame_scaled, texY, texU, texV);
 
-          if (use_frame != frame)
-            av_frame_free(&use_frame);
+          if (sw_frame)
+            av_frame_free(&sw_frame);
 
           av_packet_unref(pkt);
           return;
