@@ -285,7 +285,7 @@ int main(int argc, char **argv) {
   GLint aTex = glGetAttribLocation(program, "aTex");
 
   VideoPlayer players[4];
-  const char *files[] = {"videos/animals.mp4", "videos/earth.mp4",
+  const char *files[] = {"videos/animals.mp4", "videos/earth1.mp4",
                          "videos/galaxy.mp4", "videos/ocean.mp4"};
 
   for (int i = 0; i < 4; i++) {
@@ -312,6 +312,21 @@ int main(int argc, char **argv) {
   // Setup file descriptor set for select()
   fd_set fds;
 
+  // --- PERFORMANCE METRICS INIT ---
+  double app_start_time = get_time_sec();
+  double last_log_time = app_start_time;
+  double last_frame_time = app_start_time;
+
+  long frame_count_interval = 0;     // Frames in the last 1 second
+  long total_frame_count = 0;        // Total frames since start
+  long total_drops = 0;              // Total missed VSyncs
+  double sum_latency_interval = 0.0; // Accumulated latency for averaging
+
+  // Calculate target frame time (e.g., 60Hz -> ~0.0166s)
+  // We use this to detect drops.
+  double target_dt =
+      1.0 / (double)(kms.mode.vrefresh > 0 ? kms.mode.vrefresh : 30);
+
   while (running) {
 
     // --- VSYNC WAIT LOGIC ---
@@ -337,6 +352,9 @@ int main(int argc, char **argv) {
     }
     // ------------------------
 
+    // --- MEASURE LATENCY START ---
+    double loop_process_start = get_time_sec();
+
     for (int i = 0; i < 4; i++) {
       update_player(&players[i]);
     }
@@ -345,7 +363,47 @@ int main(int argc, char **argv) {
       render_player(&players[i], program);
     }
 
+    // Calculate Processing Latency (Update + Render time)
+    // We capture this BEFORE swap/wait, as that includes VSync idle time.
+    double loop_process_end = get_time_sec();
+    double current_latency_ms =
+        (loop_process_end - loop_process_start) * 1000.0;
+    sum_latency_interval += current_latency_ms;
+
     swap_buffers_kms();
+
+    // --- METRICS CALCULATION ---
+    double now = get_time_sec();
+    double frame_dt = now - last_frame_time;
+    last_frame_time = now;
+
+    frame_count_interval++;
+    total_frame_count++;
+
+    // Drop Detection:
+    // If the time between frames is > 1.5x the monitor refresh rate,
+    // we likely missed a VSync deadline.
+    if (frame_dt > target_dt * 1.5) {
+      total_drops++;
+    }
+
+    // Logging (Every 1.0 seconds)
+    if (now - last_log_time >= 1.0) {
+      double fps = frame_count_interval / (now - last_log_time);
+      double avg_fps = total_frame_count / (now - app_start_time);
+      double drop_rate = (double)total_drops / total_frame_count * 100.0;
+      double avg_latency = sum_latency_interval / frame_count_interval;
+
+      // Use \r\n because raw terminal mode is enabled
+      printf("FPS: %.2f | AVG: %.2f | DROPS: %ld (%.2f%%)\r\n", fps, avg_fps,
+             total_drops, drop_rate);
+      printf("Latency: %.2f ms\r\n", avg_latency);
+
+      // Reset interval counters
+      last_log_time = now;
+      frame_count_interval = 0;
+      sum_latency_interval = 0.0;
+    }
   }
 
   return 0;
