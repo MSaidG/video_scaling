@@ -1,28 +1,6 @@
 #include "gl.h"
 #include <stdio.h>
 
-GLFWwindow* initGLFW(int width, int height) {
-  glfwInit();
-  glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-
-  GLFWwindow *window = glfwCreateWindow(800, 600, "SCALING", NULL, NULL);
-  if (window == NULL) {
-    printf("Failed to create GLFW window\n");
-    glfwTerminate();
-    return window;
-  }
-
-  glfwMakeContextCurrent(window);
-  // glfwSwapInterval( 0 ); // disable vsync for fun
-
-  glViewport(0, 0, 800, 600);
-  glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-
-  return window;
-}
-
 
 GLuint compile_shader(GLenum type, const char *src) {
   GLuint shader = glCreateShader(type);
@@ -59,8 +37,4 @@ GLuint create_program(const char *vs, const char *fs) {
   glDeleteShader(v);
   glDeleteShader(f);
   return program;
-}
-
-void framebuffer_size_callback(GLFWwindow *window, int width, int height) {
-  glViewport(0, 0, width, height);
 }
