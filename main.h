@@ -1,8 +1,5 @@
 #pragma once
 
-#define GLFW_INCLUDE_ES2
-#include <GLFW/glfw3.h>
-
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>

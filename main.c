@@ -62,64 +62,6 @@ double get_time_sec() {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-// int init_kms_zero_copy() {
-//   // 1. Open DRM Device
-//   kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-
-//   // 2. Find a connected Connector (HDMI/DP)
-//   drmModeRes *resources = drmModeGetResources(kms.fd);
-//   for (int i = 0; i < resources->count_connectors; i++) {
-//     drmModeConnector *conn =
-//         drmModeGetConnector(kms.fd, resources->connectors[i]);
-//     if (conn->connection == DRM_MODE_CONNECTED) {
-//       kms.connector = conn;
-//       break;
-//     }
-//     drmModeFreeConnector(conn);
-//   }
-//   // Pick the preferred resolution (mode)
-//   kms.mode = kms.connector->modes[0];
-
-//   // 3. Find a CRTC (The hardware scanner that reads the buffer)
-//   // (Simplified: assuming the first encoder maps to a valid CRTC)
-//   drmModeEncoder *enc = drmModeGetEncoder(kms.fd, kms.connector->encoder_id);
-//   kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-
-//   // 4. Initialize GBM (The buffer manager)
-//   kms.gbm_dev = gbm_create_device(kms.fd);
-
-//   // Create a surface OpenGL can draw to.
-//   // GBM_FORMAT_XRGB8888 is the standard "Screen" format.
-//   // GBM_BO_USE_SCANOUT means "The display controller can read this directly"
-//   // GBM_BO_USE_RENDERING means "OpenGL can write to this"
-//   kms.gbm_surf = gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay,
-//                                     kms.mode.vdisplay, GBM_FORMAT_XRGB8888,
-//                                     GBM_BO_USE_SCANOUT |
-//                                     GBM_BO_USE_RENDERING);
-
-//   // 5. Initialize EGL on top of GBM
-//   kms.egl_disp =
-//       eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, kms.gbm_dev, NULL);
-//   eglInitialize(kms.egl_disp, NULL, NULL);
-
-//   eglBindAPI(EGL_OPENGL_ES_API);
-//   EGLint attribs[] = {EGL_RED_SIZE,  8, EGL_GREEN_SIZE, 8,
-//                       EGL_BLUE_SIZE, 8, EGL_NONE};
-//   EGLConfig config;
-//   EGLint num_config;
-//   eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num_config);
-
-//   kms.egl_ctx =
-//       eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
-//                        (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
-//   kms.egl_surf = eglCreateWindowSurface(
-//       kms.egl_disp, config, (EGLNativeWindowType)kms.gbm_surf, NULL);
-
-//   eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
-
-//   return 0;
-// }
-
 int init_kms_zero_copy() {
   // 1. Open DRM Device (Try card0, then card1)
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -263,33 +205,6 @@ uint32_t get_fb_for_bo(struct gbm_bo *bo) {
   drmModeAddFB(kms.fd, width, height, 24, 32, stride, handle, &fb_id);
   return fb_id;
 }
-
-// void swap_buffers_kms() {
-//   // 1. Tell OpenGL to finish rendering
-//   eglSwapBuffers(kms.egl_disp, kms.egl_surf);
-
-//   // 2. Lock the front buffer (the one GL just finished)
-//   struct gbm_bo *next_bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
-//   uint32_t next_fb_id = get_fb_for_bo(next_bo);
-
-//   // 3. Schedule the Page Flip (Show this frame on VSYNC)
-//   drmModePageFlip(kms.fd, kms.crtc->crtc_id, next_fb_id,
-//                   DRM_MODE_PAGE_FLIP_EVENT, NULL);
-
-//   // 4. Cleanup old buffer (The previous frame)
-//   if (kms.current_bo) {
-//     gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
-//     // Note: In real code, you should also remove the old FB_ID using
-//     // drmModeRmFB
-//   }
-
-//   kms.current_bo = next_bo;
-//   kms.current_fb_id = next_fb_id;
-
-//   // Note: To make this robust, you actually need to wait for the PageFlip
-//   Event
-//   // here or else you will run too fast and tear.
-// }
 
 void swap_buffers_kms() {
   // 1. Finish GL Rendering

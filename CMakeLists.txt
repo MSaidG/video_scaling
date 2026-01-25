@@ -24,7 +24,6 @@ target_link_libraries(video_scaling PRIVATE
     PkgConfig::AVCODEC
     PkgConfig::AVFORMAT
     PkgConfig::AVUTIL
-    PkgConfig::SWSCALE
     PkgConfig::EGL
     PkgConfig::DRM
     PkgConfig::GBM
