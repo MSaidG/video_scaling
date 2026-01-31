@@ -3,3 +3,5 @@ build
 docs.md
 videos
 .cache
+err*
+vgcore*
