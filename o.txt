@@ -1,5 +1,0 @@
-❯ ./build/video_scaling
-Failed to open card0, trying card1...
-Selected Mode: 2560x1440 @ 60Hz
-Error: Failed to create EGL Surface.
-Critical Error during KMS init. Exiting.
