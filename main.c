@@ -13,6 +13,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
+#include <drm/drm_fourcc.h>
 
 struct {
     int fd;
@@ -84,13 +85,16 @@ int init_kms() {
     if (enc && enc->crtc_id) {
         kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
     } else {
-        kms.crtc = drmModeGetCrtc(kms.fd, resources->crtcs[0]);
+        kms.crtc = drmModeGetCrtc(kms.fd, resources->crtcs[0]); 
     }
     if (enc) drmModeFreeEncoder(enc);
 
     // 3. Setup GBM
     kms.gbm_dev = gbm_create_device(kms.fd);
-    uint32_t gbm_format = GBM_FORMAT_ARGB8888; 
+    // GBM_FORMAT_XRGB8888 >-< XR24 (/sys/kernel/debug/dri/1/state) 
+    // GBM_FORMAT_RGB888 >-< BG24 
+    // GBM_FORMAT_ARGB8888
+    uint32_t gbm_format = GBM_FORMAT_XRGB8888; 
 
     kms.gbm_surf = gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay, kms.mode.vdisplay,
                                       gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
