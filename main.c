@@ -71,6 +71,9 @@ int init_kms() {
         }
         drmModeFreeConnector(conn);
     }
+    // Clean up resources immediately as we only need the connector now
+    drmModeFreeResources(resources);
+
     if (!kms.connector) {
         fprintf(stderr, "Error: No connected monitor found.\n");
         return -1;
@@ -81,19 +84,30 @@ int init_kms() {
     printf("Selected Mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay, kms.mode.vrefresh);
 
     // Find encoder/CRTC
-    drmModeEncoder *enc = drmModeGetEncoder(kms.fd, kms.connector->encoders[0]);
+    drmModeEncoder *enc = NULL;
+    if (kms.connector->encoder_id) {
+        enc = drmModeGetEncoder(kms.fd, kms.connector->encoder_id);
+    }
+
     if (enc && enc->crtc_id) {
         kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
     } else {
-        kms.crtc = drmModeGetCrtc(kms.fd, resources->crtcs[0]); 
+        // Re-fetch resources just to find a CRTC if the encoder method failed
+        resources = drmModeGetResources(kms.fd);
+        if (resources && resources->count_crtcs > 0) {
+             kms.crtc = drmModeGetCrtc(kms.fd, resources->crtcs[0]);
+        }
+        if (resources) drmModeFreeResources(resources);
     }
     if (enc) drmModeFreeEncoder(enc);
 
+    if (!kms.crtc) {
+        fprintf(stderr, "Error: Could not find a valid CRTC.\n");
+        return -1;
+    }
+
     // 3. Setup GBM
     kms.gbm_dev = gbm_create_device(kms.fd);
-    // GBM_FORMAT_XRGB8888 >-< XR24 (/sys/kernel/debug/dri/1/state) 
-    // GBM_FORMAT_RGB888 >-< BG24 
-    // GBM_FORMAT_ARGB8888
     uint32_t gbm_format = GBM_FORMAT_XRGB8888; 
 
     kms.gbm_surf = gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay, kms.mode.vdisplay,
@@ -102,7 +116,10 @@ int init_kms() {
 
     // 4. Setup EGL
     kms.egl_disp = eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, kms.gbm_dev, NULL);
-    eglInitialize(kms.egl_disp, NULL, NULL);
+    if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
+         fprintf(stderr, "Error: EGL Initialize failed.\n");
+         return -1;
+    }
     eglBindAPI(EGL_OPENGL_ES_API);
 
     // --- FIND MATCHING CONFIG ---
@@ -135,6 +152,11 @@ int init_kms() {
     kms.egl_ctx = eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, ctx_attribs);
     kms.egl_surf = eglCreateWindowSurface(kms.egl_disp, config, (EGLNativeWindowType)kms.gbm_surf, NULL);
 
+    if (kms.egl_surf == EGL_NO_SURFACE) {
+         fprintf(stderr, "Error: Failed to create EGL Surface.\n");
+         return -1;
+    }
+
     eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
 
     printf("KMS/GBM/EGL Initialized successfully.\n");
@@ -165,6 +187,10 @@ void swap_buffers_kms() {
 
     // 2. Lock the newly rendered buffer
     struct gbm_bo *next_bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
+    if (!next_bo) {
+        fprintf(stderr, "Error: Failed to lock front buffer.\n");
+        return;
+    }
     uint32_t next_fb_id = get_fb_for_bo(next_bo);
 
     // 3. Flip to screen
@@ -174,6 +200,8 @@ void swap_buffers_kms() {
     if (ret) {
         fprintf(stderr, "Page Flip failed: %d\n", ret);
         gbm_surface_release_buffer(kms.gbm_surf, next_bo);
+        // If flip failed, we also need to clean up the FB we just created
+        drmModeRmFB(kms.fd, next_fb_id);
         return;
     }
 
@@ -182,10 +210,41 @@ void swap_buffers_kms() {
     // 4. Cleanup previous buffer
     if (kms.current_bo) {
         gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
+        drmModeRmFB(kms.fd, kms.current_fb_id);
     }
 
     kms.current_bo = next_bo;
     kms.current_fb_id = next_fb_id;
+}
+
+void cleanup() {
+    printf("Cleaning up resources...\n");
+
+    // 1. Release the current GBM buffer if it exists
+    if (kms.current_bo) {
+        gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
+        drmModeRmFB(kms.fd, kms.current_fb_id);
+        kms.current_bo = NULL;
+    }
+
+    // 2. Destroy EGL (Reverse Order)
+    if (kms.egl_disp != EGL_NO_DISPLAY) {
+        eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (kms.egl_surf != EGL_NO_SURFACE) eglDestroySurface(kms.egl_disp, kms.egl_surf);
+        if (kms.egl_ctx != EGL_NO_CONTEXT) eglDestroyContext(kms.egl_disp, kms.egl_ctx);
+        eglTerminate(kms.egl_disp);
+    }
+
+    // 3. Destroy GBM
+    if (kms.gbm_surf) gbm_surface_destroy(kms.gbm_surf);
+    if (kms.gbm_dev) gbm_device_destroy(kms.gbm_dev);
+
+    // 4. Destroy DRM/KMS
+    if (kms.crtc) drmModeFreeCrtc(kms.crtc);
+    if (kms.connector) drmModeFreeConnector(kms.connector);
+    if (kms.fd >= 0) close(kms.fd);
+
+    printf("Cleanup Done.\n");
 }
 
 int main(int argc, char **argv) {
@@ -228,5 +287,6 @@ int main(int argc, char **argv) {
     }
 
     printf("\nExiting...\n");
+    cleanup();
     return 0;
 }
