@@ -1,232 +1,262 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <time.h>
-#include <math.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h" // Requires stb_image.h in the same folder
 
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-#include <gbm.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
-#include <drm/drm_fourcc.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <gbm.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 
 struct {
-    int fd;
-    uint32_t current_fb_id;
-    
-    drmModeConnector *connector;
-    drmModeModeInfo mode;
-    drmModeCrtc *crtc;
-
-    struct gbm_device *gbm_dev;
-    struct gbm_surface *gbm_surf;
-    struct gbm_bo *current_bo;
-
-    EGLDisplay egl_disp;
-    EGLContext egl_ctx;
-    EGLSurface egl_surf;
-
+  int fd;
+  drmModeConnector *connector;
+  drmModeModeInfo mode;
+  drmModeCrtc *crtc;
+  struct gbm_device *gbm_dev;
+  struct gbm_surface *gbm_surf;
+  EGLDisplay egl_disp;
+  EGLContext egl_ctx;
+  EGLSurface egl_surf;
+  uint32_t current_fb_id;
+  struct gbm_bo *current_bo;
 } kms;
 
-volatile sig_atomic_t running = 1;
 int waiting_for_flip = 0;
+volatile sig_atomic_t running = 1;
 
-// Standard Linux clock for timing animations
-double get_time_sec() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
-void handle_sigint(int sig) { 
-    running = 0; 
-}
-
-int init_kms() {
-    // 1. Open DRM Device
-    kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    if (kms.fd < 0) {
-        kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-        if (kms.fd < 0) {
-            fprintf(stderr, "Error: Could not open /dev/dri/card0 or card1\n");
-            return -1;
-        }
-    }
-
-    // 2. Setup KMS (Connector, CRTC, Mode)
-    drmModeRes *resources = drmModeGetResources(kms.fd);
-    if (!resources) return -1;
-
-    // Find a connected connector
-    for (int i = 0; i < resources->count_connectors; i++) {
-        drmModeConnector *conn = drmModeGetConnector(kms.fd, resources->connectors[i]);
-        if (conn->connection == DRM_MODE_CONNECTED) {
-            kms.connector = conn;
-            break;
-        }
-        drmModeFreeConnector(conn);
-    }
-    if (!kms.connector) {
-        fprintf(stderr, "Error: No connected monitor found.\n");
-        return -1;
-    }
-
-    // Pick first mode
-    kms.mode = kms.connector->modes[0];
-    printf("Selected Mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay, kms.mode.vrefresh);
-
-    // Find encoder/CRTC
-    drmModeEncoder *enc = drmModeGetEncoder(kms.fd, kms.connector->encoders[0]);
-    if (enc && enc->crtc_id) {
-        kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-    } else {
-        kms.crtc = drmModeGetCrtc(kms.fd, resources->crtcs[0]); 
-    }
-    if (enc) drmModeFreeEncoder(enc);
-
-    // 3. Setup GBM
-    kms.gbm_dev = gbm_create_device(kms.fd);
-    // GBM_FORMAT_XRGB8888 >-< XR24 (/sys/kernel/debug/dri/1/state) 
-    // GBM_FORMAT_RGB888 >-< BG24 
-    // GBM_FORMAT_ARGB8888
-    uint32_t gbm_format = GBM_FORMAT_XRGB8888; 
-
-    kms.gbm_surf = gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay, kms.mode.vdisplay,
-                                      gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-    if (!kms.gbm_surf) return -1;
-
-    // 4. Setup EGL
-    kms.egl_disp = eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, kms.gbm_dev, NULL);
-    eglInitialize(kms.egl_disp, NULL, NULL);
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    // --- FIND MATCHING CONFIG ---
-    EGLConfig config;
-    EGLint num_configs;
-    EGLConfig *configs;
-    int found_config = 0;
-
-    if (!eglGetConfigs(kms.egl_disp, NULL, 0, &num_configs)) return -1;
-    configs = malloc(num_configs * sizeof(EGLConfig));
-    eglGetConfigs(kms.egl_disp, configs, num_configs, &num_configs);
-
-    for (int i = 0; i < num_configs; i++) {
-        EGLint id;
-        eglGetConfigAttrib(kms.egl_disp, configs[i], EGL_NATIVE_VISUAL_ID, &id);
-        if (id == gbm_format) {
-            config = configs[i];
-            found_config = 1;
-            break;
-        }
-    }
-    free(configs);
-
-    if (!found_config) {
-        fprintf(stderr, "Error: No matching EGL config for GBM format 0x%x\n", gbm_format);
-        return -1;
-    }
-
-    EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-    kms.egl_ctx = eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, ctx_attribs);
-    kms.egl_surf = eglCreateWindowSurface(kms.egl_disp, config, (EGLNativeWindowType)kms.gbm_surf, NULL);
-
-    eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
-
-    printf("KMS/GBM/EGL Initialized successfully.\n");
-    return 0;
-}
-
-// --- FLIP HANDLER ---
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
                               unsigned int usec, void *data) {
-    int *waiting = (int *)data;
-    *waiting = 0; 
+  *(int *)data = 0;
 }
 
 uint32_t get_fb_for_bo(struct gbm_bo *bo) {
-    uint32_t fb_id;
-    uint32_t handle = gbm_bo_get_handle(bo).u32;
-    uint32_t stride = gbm_bo_get_stride(bo);
-    uint32_t width = gbm_bo_get_width(bo);
-    uint32_t height = gbm_bo_get_height(bo);
-
-    drmModeAddFB(kms.fd, width, height, 24, 32, stride, handle, &fb_id);
-    return fb_id;
+  uint32_t fb_id;
+  uint32_t handle = gbm_bo_get_handle(bo).u32;
+  uint32_t stride = gbm_bo_get_stride(bo);
+  uint32_t width = gbm_bo_get_width(bo);
+  uint32_t height = gbm_bo_get_height(bo);
+  drmModeAddFB(kms.fd, width, height, 24, 32, stride, handle, &fb_id);
+  return fb_id;
 }
 
 void swap_buffers_kms() {
-    // 1. Finish GL Rendering
-    eglSwapBuffers(kms.egl_disp, kms.egl_surf);
-
-    // 2. Lock the newly rendered buffer
-    struct gbm_bo *next_bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
-    uint32_t next_fb_id = get_fb_for_bo(next_bo);
-
-    // 3. Flip to screen
-    int ret = drmModePageFlip(kms.fd, kms.crtc->crtc_id, next_fb_id,
-                              DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-
-    if (ret) {
-        fprintf(stderr, "Page Flip failed: %d\n", ret);
-        gbm_surface_release_buffer(kms.gbm_surf, next_bo);
-        return;
-    }
-
-    waiting_for_flip = 1;
-
-    // 4. Cleanup previous buffer
-    if (kms.current_bo) {
-        gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
-    }
-
-    kms.current_bo = next_bo;
-    kms.current_fb_id = next_fb_id;
+  eglSwapBuffers(kms.egl_disp, kms.egl_surf);
+  struct gbm_bo *next_bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
+  uint32_t next_fb_id = get_fb_for_bo(next_bo);
+  drmModePageFlip(kms.fd, kms.crtc->crtc_id, next_fb_id,
+                  DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+  waiting_for_flip = 1;
+  if (kms.current_bo)
+    gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
+  kms.current_bo = next_bo;
 }
 
-int main(int argc, char **argv) {
-    signal(SIGINT, handle_sigint);
+int init_kms() {
+  kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+  if (kms.fd < 0)
+    kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  if (kms.fd < 0)
+    return -1;
 
-    if (init_kms() != 0) {
-        return -1;
+  drmModeRes *res = drmModeGetResources(kms.fd);
+  for (int i = 0; i < res->count_connectors; i++) {
+    drmModeConnector *conn = drmModeGetConnector(kms.fd, res->connectors[i]);
+    if (conn->connection == DRM_MODE_CONNECTED) {
+      kms.connector = conn;
+      break;
     }
+    drmModeFreeConnector(conn);
+  }
+  if (!kms.connector)
+    return -1;
+  kms.mode = kms.connector->modes[0];
 
-    // Setup event context for VSync
-    drmEventContext evctx = {0};
-    evctx.version = 2;
-    evctx.page_flip_handler = page_flip_handler;
-    fd_set fds;
+  drmModeEncoder *enc = drmModeGetEncoder(kms.fd, kms.connector->encoders[0]);
+  kms.crtc = drmModeGetCrtc(kms.fd, enc ? enc->crtc_id : res->crtcs[0]);
+  if (enc)
+    drmModeFreeEncoder(enc);
 
-    printf("Starting render loop... Press Ctrl+C to exit.\n");
+  kms.gbm_dev = gbm_create_device(kms.fd);
+  kms.gbm_surf = gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay,
+                                    kms.mode.vdisplay, GBM_FORMAT_ARGB8888,
+                                    GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 
-    while (running) {
-        // 1. Wait for previous Flip to finish (VSync)
-        while (waiting_for_flip) {
-            FD_ZERO(&fds);
-            FD_SET(kms.fd, &fds);
-            int ret = select(kms.fd + 1, &fds, NULL, NULL, NULL);
-            if (ret > 0) {
-                drmHandleEvent(kms.fd, &evctx);
-            } else if (ret < 0 && errno != EINTR) {
-                break; 
-            }
-        }
+  kms.egl_disp =
+      eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, kms.gbm_dev, NULL);
+  eglInitialize(kms.egl_disp, NULL, NULL);
+  eglBindAPI(EGL_OPENGL_ES_API);
 
-        double t = get_time_sec();
-        float r = (sin(t) + 1.0f) / 2.0f;
-        float g = (sin(t + 2.0f) + 1.0f) / 2.0f;
-        float b = (sin(t + 4.0f) + 1.0f) / 2.0f;
+  EGLConfig config;
+  EGLint n;
+  EGLint attribs[] = {EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+                      EGL_ALPHA_SIZE, 8, EGL_NONE};
+  eglChooseConfig(kms.egl_disp, attribs, &config, 1, &n);
 
-        glClearColor(r, g, b, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+  kms.egl_ctx =
+      eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
+                       (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
+  kms.egl_surf = eglCreateWindowSurface(
+      kms.egl_disp, config, (EGLNativeWindowType)kms.gbm_surf, NULL);
+  eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
 
-        swap_buffers_kms();
-    }
+  return 0;
+}
 
-    printf("\nExiting...\n");
+// --- SHADERS ---
+
+const char *vs_src =
+    "attribute vec4 a_pos;    \n"
+    "attribute vec2 a_tex;    \n"
+    "varying vec2 v_tex;      \n"
+    "void main() {            \n"
+    "   gl_Position = a_pos;  \n" // * vec4(0.5, 0.5, 0.5, 1.0)
+    "   v_tex = a_tex;        \n" // * vec2(2.0, 2.0) * vec2(0.5, 0.5)
+    "}                        \n";
+
+const char *fs_src =
+    "precision mediump float; \n"
+    "varying vec2 v_tex;      \n"
+    "uniform sampler2D u_tex; \n"
+    "void main() {            \n"
+    "   gl_FragColor = texture2D(u_tex, v_tex); \n" // * vec4(1.0, 0.0,
+                                                    // 0.0, 1.0)
+    "}                        \n";
+
+GLuint create_shader(const char *src, GLenum type) {
+  GLuint s = glCreateShader(type);
+  glShaderSource(s, 1, &src, NULL);
+  glCompileShader(s);
+  // (Skipping error check for brevity, but you should add it in production)
+  return s;
+}
+
+
+GLuint load_png_texture(const char *filename) {
+  int w, h, ch;
+  unsigned char *data =
+      stbi_load(filename, &w, &h, &ch, 4); // Force 4 channels (RGBA)
+  if (!data) {
+    fprintf(stderr, "Failed to load image: %s\n", filename);
     return 0;
+  }
+
+  GLuint tex;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+
+  // Upload to GPU
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+               data);
+
+  // Set filtering (REQUIRED or texture wont show)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+  stbi_image_free(data); // Free CPU RAM
+  return tex;
+}
+
+void handle_sigint(int sig) { running = 0; }
+
+
+int main() {
+  signal(SIGINT, handle_sigint);
+
+  if (init_kms() != 0) {
+    fprintf(stderr, "KMS Init Failed\n");
+    return -1;
+  }
+
+  // 1. Setup Shaders
+  GLuint prog = glCreateProgram();
+  glAttachShader(prog, create_shader(vs_src, GL_VERTEX_SHADER));
+  glAttachShader(prog, create_shader(fs_src, GL_FRAGMENT_SHADER));
+  glLinkProgram(prog);
+  glUseProgram(prog);
+
+  // 2. Setup Texture
+  GLuint tex_id = load_png_texture("videos/test.png");
+  if (tex_id == 0)
+    return -1;
+
+  // 3. Setup Geometry (Full screen quad)
+  // x, y, u, v
+  GLfloat vertices[] = {
+      -1.0f, 1.0f,  0.0f, 0.0f, // Top Left
+      -1.0f, -1.0f, 0.0f, 1.0f, // Bottom Left
+      1.0f,  1.0f,  1.0f, 0.0f, // Top Right
+      1.0f,  -1.0f, 1.0f, 1.0f  // Bottom Right
+  };
+
+  GLint loc_pos = glGetAttribLocation(prog, "a_pos");
+  GLint loc_tex = glGetAttribLocation(prog, "a_tex");
+
+  glEnableVertexAttribArray(loc_pos);
+  glEnableVertexAttribArray(loc_tex);
+
+  // Stride is 4 floats (x,y,u,v). Pos is offset 0. Tex is offset 2.
+  glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                        vertices);
+  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                        vertices + 2);
+
+  // Enable Alpha Blending (for PNG transparency)
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  // --- RENDER LOOP ---
+  drmEventContext ev = {0};
+  ev.version = 2;
+  ev.page_flip_handler = page_flip_handler;
+  fd_set fds;
+
+  printf("Rendering PNG... Ctrl+C to exit.\n");
+
+  while (running) {
+    // --- CORRECTED WAIT LOGIC ---
+    while (waiting_for_flip) {
+      // 1. If Ctrl+C was pressed, stop waiting immediately
+      if (!running)
+        break;
+
+      FD_ZERO(&fds);
+      FD_SET(kms.fd, &fds);
+
+      // 2. Wait for VSync (blocking)
+      int ret = select(kms.fd + 1, &fds, NULL, NULL, NULL);
+
+      if (ret > 0) {
+        // Success: VSync event arrived, handle it (clears waiting_for_flip)
+        drmHandleEvent(kms.fd, &ev);
+      } else if (ret < 0) {
+        // Error: If interrupted by Ctrl+C (EINTR), break the loop
+        if (errno == EINTR)
+          break;
+
+        // Real error? Print it and bail
+        perror("select error");
+        break;
+      }
+    }
+
+    // 3. Final check: If we stopped waiting because of Ctrl+C, exit the main
+    // loop
+    if (!running)
+      break;
+
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark gray background
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    swap_buffers_kms();
+  }
+
+  return 0;
 }
