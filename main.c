@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <string.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -45,6 +46,36 @@ double get_time_sec() {
 }
 
 void handle_sigint(int sig) { running = 0; }
+
+void print_egl_diagnostics(EGLDisplay dpy) {
+    printf("--- EGL DIAGNOSTICS ---\n");
+
+    const char *vendor = eglQueryString(dpy, EGL_VENDOR);
+    printf("Vendor:   %s\n", vendor ? vendor : "UNKNOWN");
+
+    const char *version = eglQueryString(dpy, EGL_VERSION);
+    printf("Version:  %s\n", version ? version : "UNKNOWN");
+
+    const char *apis = eglQueryString(dpy, EGL_CLIENT_APIS);
+    printf("APIs:     %s\n", apis ? apis : "UNKNOWN");
+
+    const char *exts = eglQueryString(dpy, EGL_EXTENSIONS);
+    if (exts) {
+        int has_dma = (strstr(exts, "EGL_EXT_image_dma_buf_import") != NULL);
+        int has_modifiers = (strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers") != NULL);
+        int has_khr_plaform_gbm = (strstr(exts, "EGL_KHR_platform_gbm") != NULL);
+        int has_khr_surfaceless_context = (strstr(exts, "EGL_KHR_surfaceless_context") != NULL);
+        
+        printf("Support for DMA-BUF Import:              %s\n", has_dma ? "YES" : "NO (Zero-Copy will fail)");
+        printf("Support for DMA-BUF Modifiers:           %s\n", has_modifiers ? "YES" : "NO");
+        printf("Support for KHR-GBM Platform :           %s\n", has_khr_plaform_gbm ? "YES" : "NO");        
+        printf("Support for KHR Surfaceless Context :    %s\n", has_khr_surfaceless_context ? "YES" : "NO");        
+    } else {
+        printf("Extensions: NONE (Critical Error)\n");
+    }
+
+    printf("-----------------------\n");
+}
 
 int init_kms() {
   // 1. Open DRM Device
@@ -85,6 +116,9 @@ int init_kms() {
     fprintf(stderr, "Error: No connected monitor found.\n");
     return -1;
   }
+
+  printf("Connector type is %s\n",
+         drmModeGetConnectorTypeName(kms.connector->connector_type));
 
   // Pick first mode
   kms.mode = kms.connector->modes[0];
@@ -135,13 +169,21 @@ int init_kms() {
     return -1;
 
   // 4. Setup EGL
-  kms.egl_disp =
-      eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, kms.gbm_dev, NULL);
+  kms.egl_disp = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, kms.gbm_dev,
+                                       NULL); // EGL_PLATFORM_GBM_MESA
   if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
     fprintf(stderr, "Error: EGL Initialize failed.\n");
     return -1;
   }
-  eglBindAPI(EGL_OPENGL_ES_API);
+
+  // 5.  Check EGL Properties
+  print_egl_diagnostics(kms.egl_disp);
+
+  if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+    fprintf(stderr, "Couldn't bind the egl to GLES api!\n");
+    return -1;
+  }
+  printf("Current egl api: 0x%x\n", eglQueryAPI());
 
   // --- FIND MATCHING CONFIG ---
   EGLConfig config;
@@ -291,7 +333,7 @@ void swap_buffers_kms() {
   // 4. Cleanup previous buffer
   if (kms.current_bo) {
     gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
-    drmModeRmFB(kms.fd, kms.current_fb_id);
+    drmModeCloseFB(kms.fd, kms.current_fb_id); // drmModeRmFB
   }
 
   kms.current_bo = next_bo;
