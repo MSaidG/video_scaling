@@ -2,43 +2,58 @@
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
-#include <string.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <drm/drm_fourcc.h>
-#include <gbm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+// --- EXTENSION FUNCTION POINTERS ---
+// We need these to manually talk to the extension APIs
+PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
+PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC
+glEGLImageTargetRenderbufferStorageOES;
+
+#define NUM_BUFFERS 3
+
+struct DumbBuffer {
+  uint32_t handle;
+  uint32_t stride;
+  uint32_t size;
+  int fd;         // DMA-BUF FD
+  uint32_t fb_id; // DRM Framebuffer ID
+
+  // OpenGL/EGL Objects linked to this buffer
+  EGLImageKHR image;
+  GLuint rbo; // Renderbuffer
+  GLuint fbo; // Framebuffer Object
+};
+
 struct {
   int fd;
-  uint32_t current_fb_id;
-
   drmModeConnector *connector;
   drmModeModeInfo mode;
   drmModeCrtc *crtc;
 
-  struct gbm_device *gbm_dev;
-  struct gbm_surface *gbm_surf;
-  struct gbm_bo *current_bo;
+  struct DumbBuffer buffers[NUM_BUFFERS];
+  int current_buf_idx;
 
   EGLDisplay egl_disp;
   EGLContext egl_ctx;
-  EGLSurface egl_surf;
-
 } kms;
 
 volatile sig_atomic_t running = 1;
 int waiting_for_flip = 0;
 
-// Standard Linux clock for timing animations
 double get_time_sec() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -47,343 +62,296 @@ double get_time_sec() {
 
 void handle_sigint(int sig) { running = 0; }
 
-void print_egl_diagnostics(EGLDisplay dpy) {
-    printf("--- EGL DIAGNOSTICS ---\n");
+// --- DRM DUMB BUFFER MANAGEMENT ---
 
-    const char *vendor = eglQueryString(dpy, EGL_VENDOR);
-    printf("Vendor:   %s\n", vendor ? vendor : "UNKNOWN");
+int create_dumb_buffer(struct DumbBuffer *buf) {
+  // 1. Ask DRM to allocate a "Dumb" buffer (Scanout capable RAM)
+  struct drm_mode_create_dumb creq = {0};
+  creq.width = kms.mode.hdisplay;
+  creq.height = kms.mode.vdisplay;
+  creq.bpp = 32;
 
-    const char *version = eglQueryString(dpy, EGL_VERSION);
-    printf("Version:  %s\n", version ? version : "UNKNOWN");
+  if (ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+    perror("Create Dumb");
+    return -1;
+  }
 
-    const char *apis = eglQueryString(dpy, EGL_CLIENT_APIS);
-    printf("APIs:     %s\n", apis ? apis : "UNKNOWN");
+  buf->handle = creq.handle;
+  buf->stride = creq.pitch;
+  buf->size = creq.size;
 
-    const char *exts = eglQueryString(dpy, EGL_EXTENSIONS);
-    if (exts) {
-        int has_dma = (strstr(exts, "EGL_EXT_image_dma_buf_import") != NULL);
-        int has_modifiers = (strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers") != NULL);
-        int has_khr_plaform_gbm = (strstr(exts, "EGL_KHR_platform_gbm") != NULL);
-        int has_khr_surfaceless_context = (strstr(exts, "EGL_KHR_surfaceless_context") != NULL);
-        
-        printf("Support for DMA-BUF Import:              %s\n", has_dma ? "YES" : "NO (Zero-Copy will fail)");
-        printf("Support for DMA-BUF Modifiers:           %s\n", has_modifiers ? "YES" : "NO");
-        printf("Support for KHR-GBM Platform :           %s\n", has_khr_plaform_gbm ? "YES" : "NO");        
-        printf("Support for KHR Surfaceless Context :    %s\n", has_khr_surfaceless_context ? "YES" : "NO");        
-    } else {
-        printf("Extensions: NONE (Critical Error)\n");
-    }
+  // 2. Create a DRM Framebuffer ID (So KMS can display it)
+  if (drmModeAddFB(kms.fd, creq.width, creq.height, 24, 32, creq.pitch,
+                   buf->handle, &buf->fb_id)) {
+    perror("Add FB");
+    return -1;
+  }
 
-    printf("-----------------------\n");
+  // 3. Export as DMA-BUF (So EGL can see it)
+  // We convert the "Handle" (Driver specific) to "FD" (Universal)
+  if (drmPrimeHandleToFD(kms.fd, buf->handle, DRM_CLOEXEC, &buf->fd)) {
+    perror("Prime Export");
+    return -1;
+  }
+
+  return 0;
 }
 
+int bind_buffer_to_gl(struct DumbBuffer *buf) {
+  EGLint attribs[] = {EGL_WIDTH,
+                      kms.mode.hdisplay,
+                      EGL_HEIGHT,
+                      kms.mode.vdisplay,
+                      EGL_LINUX_DRM_FOURCC_EXT,
+                      DRM_FORMAT_XRGB8888, // Must match .bpp=32
+                      EGL_DMA_BUF_PLANE0_FD_EXT,
+                      buf->fd,
+                      EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                      0,
+                      EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                      (int)buf->stride,
+                      EGL_NONE};
+
+  buf->image = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
+                                 EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+  if (buf->image == EGL_NO_IMAGE_KHR) {
+    fprintf(stderr, "Failed to create EGLImage\n");
+    return -1;
+  }
+
+  // 2. Bind EGL Image to OpenGL Renderbuffer
+  // We use a Renderbuffer because we want to Draw INTO it (FBO attachment)
+  glGenRenderbuffers(1, &buf->rbo);
+  glBindRenderbuffer(GL_RENDERBUFFER, buf->rbo);
+  glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, buf->image);
+
+  // 3. Wrap Renderbuffer in a Framebuffer Object (FBO)
+  glGenFramebuffers(1, &buf->fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                            GL_RENDERBUFFER, buf->rbo);
+
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    fprintf(stderr, "FBO Incomplete\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+
 int init_kms() {
-  // 1. Open DRM Device
-  kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) {
-    kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-    if (kms.fd < 0) {
-      fprintf(stderr, "Error: Could not open /dev/dri/card0 or card1\n");
+  kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  if (kms.fd < 0)
+    return -1;
+
+  drmModeRes *res = drmModeGetResources(kms.fd);
+  for (int i = 0; i < res->count_connectors; i++) {
+    drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
+    if (c->connection == DRM_MODE_CONNECTED) {
+      kms.connector = c;
+      break;
+    }
+    drmModeFreeConnector(c);
+  }
+  drmModeFreeResources(res);
+  if (!kms.connector)
+    return -1;
+
+  kms.mode = kms.connector->modes[0];
+  drmModeEncoder *enc = drmModeGetEncoder(kms.fd, kms.connector->encoder_id);
+  kms.crtc =
+      drmModeGetCrtc(kms.fd, enc ? enc->crtc_id : 0); // Simplified fallback
+  if (enc)
+    drmModeFreeEncoder(enc);
+
+  return 0;
+}
+
+int init_egl() {
+  kms.egl_disp =
+      eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+
+  // 2. Fallback: If Surfaceless is missing (e.g., older ZynqMP drivers), try
+  // Default
+  if (kms.egl_disp == EGL_NO_DISPLAY) {
+    printf("Surfaceless platform not found, falling back to Default...\n");
+    kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  }
+
+  if (kms.egl_disp == EGL_NO_DISPLAY) {
+    fprintf(stderr, "Failed to get EGL display connection\n");
+    return -1;
+  }
+
+  EGLint major, minor;
+  if (!eglInitialize(kms.egl_disp, &major, &minor)) {
+    // Detailed error printing
+    EGLint err = eglGetError();
+    fprintf(stderr, "EGL Init Failed! Error: 0x%x\n", err);
+    if (err == EGL_NOT_INITIALIZED) {
+      fprintf(stderr, "Hint: This often happens if no X11/Wayland is running "
+                      "and 'Surfaceless' is not supported.\n");
+    }
+    return -1;
+  }
+  printf("EGL Initialized (Version %d.%d)\n", major, minor);
+
+  // Load Extensions
+  eglCreateImageKHR =
+      (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+  glEGLImageTargetRenderbufferStorageOES =
+      (PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)eglGetProcAddress(
+          "glEGLImageTargetRenderbufferStorageOES");
+
+  if (!eglCreateImageKHR || !glEGLImageTargetRenderbufferStorageOES) {
+    fprintf(stderr, "Missing Required EGL/GL Extensions for DMA-BUF\n");
+    return -1;
+  }
+
+  EGLConfig config;
+  EGLint n;
+  EGLint attribs[] = {EGL_SURFACE_TYPE,
+                      EGL_PBUFFER_BIT, // <--- CRITICAL FIX
+                      EGL_RENDERABLE_TYPE,
+                      EGL_OPENGL_ES2_BIT,
+                      EGL_RED_SIZE,
+                      8,
+                      EGL_GREEN_SIZE,
+                      8,
+                      EGL_BLUE_SIZE,
+                      8,
+                      EGL_ALPHA_SIZE,
+                      0, // DUMB buffers usually XRGB (Alpha ignored)
+                      EGL_NONE};
+
+  // Choose Config
+  if (!eglChooseConfig(kms.egl_disp, attribs, &config, 1, &n) || n != 1) {
+    // Fallback: Try with absolutely NO surface requirements (if PBUFFER failed)
+    EGLint fallback_attribs[] = {EGL_SURFACE_TYPE, 0, EGL_RENDERABLE_TYPE,
+                                 EGL_OPENGL_ES2_BIT, EGL_NONE};
+    if (!eglChooseConfig(kms.egl_disp, fallback_attribs, &config, 1, &n) ||
+        n != 1) {
+      fprintf(stderr, "Failed to choose EGL config (Surfaceless)\n");
       return -1;
     }
   }
 
-  if (drmIsKMS(kms.fd)) {
-    printf("DRM node support kernel mode setting.\n");
-  } else {
-    printf("DRM node does not support kernel mode setting.\n");
-  }
-
-  // 2. Setup KMS (Connector, CRTC, Mode)
-  drmModeRes *resources = drmModeGetResources(kms.fd);
-  if (!resources)
-    return -1;
-
-  // Find a connected connector
-  for (int i = 0; i < resources->count_connectors; i++) {
-    drmModeConnector *conn =
-        drmModeGetConnector(kms.fd, resources->connectors[i]);
-    if (conn->connection == DRM_MODE_CONNECTED) {
-      kms.connector = conn;
-      break;
-    }
-    drmModeFreeConnector(conn);
-  }
-  // Clean up resources immediately as we only need the connector now
-  drmModeFreeResources(resources);
-
-  if (!kms.connector) {
-    fprintf(stderr, "Error: No connected monitor found.\n");
-    return -1;
-  }
-
-  printf("Connector type is %s\n",
-         drmModeGetConnectorTypeName(kms.connector->connector_type));
-
-  // Pick first mode
-  kms.mode = kms.connector->modes[0];
-  printf("Selected Mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay,
-         kms.mode.vrefresh);
-
-  // Find encoder/CRTC
-  drmModeEncoder *enc = NULL;
-  if (kms.connector->encoder_id) {
-    enc = drmModeGetEncoder(kms.fd, kms.connector->encoder_id);
-  }
-
-  if (enc && enc->crtc_id) {
-    kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-  } else {
-    // Re-fetch resources just to find a CRTC if the encoder method failed
-    resources = drmModeGetResources(kms.fd);
-    if (resources && resources->count_crtcs > 0) {
-      kms.crtc = drmModeGetCrtc(kms.fd, resources->crtcs[0]);
-    }
-    if (resources)
-      drmModeFreeResources(resources);
-  }
-  if (enc)
-    drmModeFreeEncoder(enc);
-
-  if (!kms.crtc) {
-    fprintf(stderr, "Error: Could not find a valid CRTC.\n");
-    return -1;
-  }
-
-  // 3. Setup GBM
-  kms.gbm_dev = gbm_create_device(kms.fd);
-  printf("GBM backend: %s\n", gbm_device_get_backend_name(kms.gbm_dev));
-
-  uint32_t gbm_format = GBM_FORMAT_XRGB8888;
-  if (!gbm_device_is_format_supported(
-          kms.gbm_dev, gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING)) {
-    fprintf(stderr, "Format (Ox%x) is not supported!\n", gbm_format);
-  } else {
-    printf("Format (Ox%x) is supported!\n", gbm_format);
-  }
-
-  kms.gbm_surf =
-      gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay, kms.mode.vdisplay,
-                         gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-  if (!kms.gbm_surf)
-    return -1;
-
-  // 4. Setup EGL
-  kms.egl_disp = eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, kms.gbm_dev,
-                                       NULL); // EGL_PLATFORM_GBM_MESA
-  if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
-    fprintf(stderr, "Error: EGL Initialize failed.\n");
-    return -1;
-  }
-
-  // 5.  Check EGL Properties
-  print_egl_diagnostics(kms.egl_disp);
-
-  if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-    fprintf(stderr, "Couldn't bind the egl to GLES api!\n");
-    return -1;
-  }
-  printf("Current egl api: 0x%x\n", eglQueryAPI());
-
-  // --- FIND MATCHING CONFIG ---
-  EGLConfig config;
-  EGLint num_configs;
-  EGLConfig *configs;
-  int found_config = 0;
-
-  if (!eglGetConfigs(kms.egl_disp, NULL, 0, &num_configs))
-    return -1;
-  configs = malloc(num_configs * sizeof(EGLConfig));
-  eglGetConfigs(kms.egl_disp, configs, num_configs, &num_configs);
-
-  for (int i = 0; i < num_configs; i++) {
-    EGLint id;
-    eglGetConfigAttrib(kms.egl_disp, configs[i], EGL_NATIVE_VISUAL_ID, &id);
-    if (id == gbm_format) {
-      config = configs[i];
-      found_config = 1;
-      break;
-    }
-  }
-  free(configs);
-
-  if (!found_config) {
-    fprintf(stderr, "Error: No matching EGL config for GBM format 0x%x\n",
-            gbm_format);
-    return -1;
-  }
-
+  // 4. Create Context
   EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
   kms.egl_ctx =
       eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, ctx_attribs);
-  kms.egl_surf = eglCreateWindowSurface(
-      kms.egl_disp, config, (EGLNativeWindowType)kms.gbm_surf, NULL);
 
-  if (kms.egl_surf == EGL_NO_SURFACE) {
-    fprintf(stderr, "Error: Failed to create EGL Surface.\n");
+  if (kms.egl_ctx == EGL_NO_CONTEXT) {
+    fprintf(stderr, "Context creation failed\n");
     return -1;
   }
 
-  eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
+  // 5. Make Current (NO SURFACE)
+  // This is the key: We pass EGL_NO_SURFACE because we have no window.
+  if (!eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                      kms.egl_ctx)) {
+    fprintf(stderr, "eglMakeCurrent failed (Error 0x%x)\n", eglGetError());
+    return -1;
+  }
 
-  printf("KMS/GBM/EGL Initialized successfully.\n");
   return 0;
 }
 
-// --- FLIP HANDLER ---
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
                               unsigned int usec, void *data) {
-  int *waiting = (int *)data;
-  *waiting = 0;
+  *(int *)data = 0;
 }
 
-uint32_t get_fb_for_bo(struct gbm_bo *bo) {
-  // uint32_t fb_id;
-  // uint32_t handle = gbm_bo_get_handle(bo).u32;
-  // uint32_t stride = gbm_bo_get_stride(bo);
-  // uint32_t width = gbm_bo_get_width(bo);
-  // uint32_t height = gbm_bo_get_height(bo);
-  // uint32_t bpp = gbm_bo_get_bpp(bo);
-  // uint32_t depth = 24; // DEPENDS ON THE GBM/DRM FORMAT
+// Helper to destroy the physical dumb buffer memory in Kernel
+void destroy_dumb_buffer_memory(struct DumbBuffer *buf) {
+  struct drm_mode_destroy_dumb dreq = {0};
+  dreq.handle = buf->handle;
 
-  // int ret = drmModeAddFB(kms.fd, width, height, (uint8_t)depth, (uint8_t)bpp,
-  //                        stride, handle, &fb_id);
-  // if (ret) {
-  //   perror("drmModeAddFB");
-  //   return -1;
-  // }
-  // return fb_id;
-
-  uint32_t fb_id;
-
-  uint32_t width = gbm_bo_get_width(bo);
-  uint32_t height = gbm_bo_get_height(bo);
-  uint32_t format = gbm_bo_get_format(bo);
-
-  uint32_t handles[4] = {0};
-  uint32_t pitches[4] = {0};
-  uint32_t offsets[4] = {0};
-  uint64_t modifiers[4] = {0};
-
-  int planes = gbm_bo_get_plane_count(bo);
-  uint64_t modifier = gbm_bo_get_modifier(bo);
-
-  /* Fill only valid planes */
-  for (int i = 0; i < planes; i++) {
-    handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
-    pitches[i] = gbm_bo_get_stride_for_plane(bo, i);
-    offsets[i] = gbm_bo_get_offset(bo, i);
+  if (drmIoctl(kms.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq) < 0) {
+    perror("Failed to destroy dumb buffer");
   }
-
-  uint64_t mod =
-      (modifier != DRM_FORMAT_MOD_INVALID) ? modifier : DRM_FORMAT_MOD_INVALID;
-
-  /* Zero unused planes explicitly (important!) */
-  for (int i = planes; i < 4; i++) {
-    handles[i] = 0;
-    pitches[i] = 0;
-    offsets[i] = 0;
-    modifiers[i] = mod;
-  }
-
-  int ret;
-  if (modifier == DRM_FORMAT_MOD_INVALID) {
-    ret = drmModeAddFB2(kms.fd, width, height, format, handles, pitches,
-                        offsets, &fb_id, 0);
-  } else {
-    ret = drmModeAddFB2WithModifiers(kms.fd, width, height, format, handles,
-                                     pitches, offsets, modifiers, &fb_id,
-                                     DRM_MODE_FB_MODIFIERS);
-  }
-
-  if (ret) {
-    perror("drmModeAddFB2");
-    return -1;
-  }
-
-  return fb_id;
-}
-
-void swap_buffers_kms() {
-  // 1. Finish GL Rendering
-  eglSwapBuffers(kms.egl_disp, kms.egl_surf);
-
-  // 2. Lock the newly rendered buffer
-  struct gbm_bo *next_bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
-  if (!next_bo) {
-    fprintf(stderr, "Error: Failed to lock front buffer.\n");
-    return;
-  }
-  uint32_t next_fb_id = get_fb_for_bo(next_bo);
-
-  // 3. Flip to screen
-  int ret = drmModePageFlip(kms.fd, kms.crtc->crtc_id, next_fb_id,
-                            DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-
-  if (ret) {
-    fprintf(stderr, "Page Flip failed: %d\n", ret);
-    gbm_surface_release_buffer(kms.gbm_surf, next_bo);
-    // If flip failed, we also need to clean up the FB we just created
-    drmModeRmFB(kms.fd, next_fb_id);
-    return;
-  }
-
-  waiting_for_flip = 1;
-
-  // 4. Cleanup previous buffer
-  if (kms.current_bo) {
-    gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
-    drmModeCloseFB(kms.fd, kms.current_fb_id); // drmModeRmFB
-  }
-
-  kms.current_bo = next_bo;
-  kms.current_fb_id = next_fb_id;
 }
 
 void cleanup() {
   printf("Cleaning up resources...\n");
 
-  // 1. Release the current GBM buffer if it exists
-  if (kms.current_bo) {
-    gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
-    drmModeRmFB(kms.fd, kms.current_fb_id);
-    kms.current_bo = NULL;
+  for (int i = 0; i < NUM_BUFFERS; i++) {
+    struct DumbBuffer *buf = &kms.buffers[i];
+
+    // A. OpenGL Cleanup
+    if (buf->fbo)
+      glDeleteFramebuffers(1, &buf->fbo);
+    if (buf->rbo)
+      glDeleteRenderbuffers(1, &buf->rbo);
+
+    // B. EGL Image Cleanup
+    if (buf->image != EGL_NO_IMAGE_KHR && eglDestroyImageKHR) {
+      eglDestroyImageKHR(kms.egl_disp, buf->image);
+    }
+
+    // C. DRM Framebuffer Cleanup
+    // Tells Display Controller to stop using this ID
+    if (buf->fb_id) {
+      drmModeRmFB(kms.fd, buf->fb_id);
+    }
+
+    // D. Close the DMA-BUF File Descriptor
+    if (buf->fd >= 0) {
+      close(buf->fd);
+    }
+
+    // E. Free the physical RAM (Dumb Buffer)
+    if (buf->handle) {
+      destroy_dumb_buffer_memory(buf);
+    }
   }
 
-  // 2. Destroy EGL (Reverse Order)
+  // 2. EGL Teardown
   if (kms.egl_disp != EGL_NO_DISPLAY) {
+    // Unbind context
     eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    EGL_NO_CONTEXT);
-    if (kms.egl_surf != EGL_NO_SURFACE)
-      eglDestroySurface(kms.egl_disp, kms.egl_surf);
-    if (kms.egl_ctx != EGL_NO_CONTEXT)
+
+    if (kms.egl_ctx != EGL_NO_CONTEXT) {
       eglDestroyContext(kms.egl_disp, kms.egl_ctx);
+    }
     eglTerminate(kms.egl_disp);
+    eglReleaseThread();
   }
 
-  // 3. Destroy GBM
-  if (kms.gbm_surf)
-    gbm_surface_destroy(kms.gbm_surf);
-  if (kms.gbm_dev)
-    gbm_device_destroy(kms.gbm_dev);
-
-  // 4. Destroy DRM/KMS
+  // 3. DRM Cleanup
   if (kms.crtc)
     drmModeFreeCrtc(kms.crtc);
   if (kms.connector)
     drmModeFreeConnector(kms.connector);
-  if (kms.fd >= 0)
+
+  if (kms.fd >= 0) {
     close(kms.fd);
+  }
 
   printf("Cleanup Done.\n");
 }
 
-int main(int argc, char **argv) {
+
+int main() {
   signal(SIGINT, handle_sigint);
 
-  if (init_kms() != 0) {
+  if (init_kms() != 0)
     return -1;
+  if (init_egl() != 0)
+    return -1;
+
+  // Create 2 buffers for Double Buffering
+  for (int i = 0; i < NUM_BUFFERS; i++) {
+    if (create_dumb_buffer(&kms.buffers[i]) != 0)
+      return -1;
+    if (bind_buffer_to_gl(&kms.buffers[i]) != 0)
+      return -1;
   }
+  printf("Triple Buffering Init (%dx%d)\n", kms.mode.hdisplay,
+         kms.mode.vdisplay);
+  printf("Initialized: %dx%d \n", kms.mode.hdisplay, kms.mode.vdisplay);
 
   // Setup event context for VSync
   drmEventContext evctx = {0};
@@ -391,30 +359,37 @@ int main(int argc, char **argv) {
   evctx.page_flip_handler = page_flip_handler;
   fd_set fds;
 
-  printf("Starting render loop... Press Ctrl+C to exit.\n");
-
   while (running) {
-    // 1. Wait for previous Flip to finish (VSync)
+
     while (waiting_for_flip) {
+      if (!running)
+        break;
       FD_ZERO(&fds);
       FD_SET(kms.fd, &fds);
-      int ret = select(kms.fd + 1, &fds, NULL, NULL, NULL);
-      if (ret > 0) {
+      int ret = select(kms.fd + 1, &fds, 0, 0, 0);
+      if (ret > 0)
         drmHandleEvent(kms.fd, &evctx);
-      } else if (ret < 0 && errno != EINTR) {
+      else if (ret < 0 && errno == EINTR)
         break;
-      }
     }
+    if (!running)
+      break;
+
+    // --- 2. RENDER ---
+    struct DumbBuffer *buf = &kms.buffers[kms.current_buf_idx];
+    glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo);
 
     double t = get_time_sec();
-    float r = (sin(t) + 1.0f) / 2.0f;
-    float g = (sin(t + 2.0f) + 1.0f) / 2.0f;
-    float b = (sin(t + 4.0f) + 1.0f) / 2.0f;
-
-    glClearColor(r, g, b, 1.0f);
+    glClearColor((sin(t) + 1) / 2, (sin(t + 2) + 1) / 2, (sin(t + 4) + 1) / 2,
+                 1.0);
     glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
 
-    swap_buffers_kms();
+    drmModePageFlip(kms.fd, kms.crtc->crtc_id, buf->fb_id,
+                    DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+    waiting_for_flip = 1;
+
+    kms.current_buf_idx = (kms.current_buf_idx + 1) % NUM_BUFFERS;
   }
 
   printf("\nExiting...\n");
