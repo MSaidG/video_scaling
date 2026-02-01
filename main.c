@@ -4,14 +4,15 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <gbm.h>
-#include <signal.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+
+#include <stdio.h>
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 struct {
   int fd;
