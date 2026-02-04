@@ -302,14 +302,14 @@ void swap_buffers_kms() {
   eglSwapBuffers(kms.egl_disp, kms.egl_surf);
 
   struct gbm_bo *next_bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
-  if (!next_bo)
+  if (!next_bo) {
+    fprintf(stderr, "Error: Failed to lock front buffer.\n");
     return;
-
+  }
   uint32_t next_fb_id = get_fb_for_bo(next_bo);
 
   int ret = drmModePageFlip(kms.fd, kms.crtc->crtc_id, next_fb_id,
                             DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
-
   if (ret) {
     fprintf(stderr, "Page Flip failed: %d\n", ret);
     gbm_surface_release_buffer(kms.gbm_surf, next_bo);
