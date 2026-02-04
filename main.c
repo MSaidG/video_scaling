@@ -78,6 +78,7 @@ void print_egl_diagnostics(EGLDisplay dpy) {
 }
 
 int init_kms() {
+
   // 1. Open DRM Device
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0) {
@@ -238,71 +239,129 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
 }
 
 uint32_t get_fb_for_bo(struct gbm_bo *bo) {
-  // uint32_t fb_id;
-  // uint32_t handle = gbm_bo_get_handle(bo).u32;
-  // uint32_t stride = gbm_bo_get_stride(bo);
-  // uint32_t width = gbm_bo_get_width(bo);
-  // uint32_t height = gbm_bo_get_height(bo);
-  // uint32_t bpp = gbm_bo_get_bpp(bo);
-  // uint32_t depth = 24; // DEPENDS ON THE GBM/DRM FORMAT
+    uint32_t fb_id;
+    uint32_t width = gbm_bo_get_width(bo);
+    uint32_t height = gbm_bo_get_height(bo);
+    uint32_t format = gbm_bo_get_format(bo);
 
-  // int ret = drmModeAddFB(kms.fd, width, height, (uint8_t)depth, (uint8_t)bpp,
-  //                        stride, handle, &fb_id);
-  // if (ret) {
-  //   perror("drmModeAddFB");
-  //   return -1;
-  // }
-  // return fb_id;
+    uint32_t handles[4] = {0};
+    uint32_t pitches[4] = {0};
+    uint32_t offsets[4] = {0};
+    uint64_t modifiers[4] = {0};
 
-  uint32_t fb_id;
+    int planes = gbm_bo_get_plane_count(bo);
+    uint64_t modifier = gbm_bo_get_modifier(bo);
 
-  uint32_t width = gbm_bo_get_width(bo);
-  uint32_t height = gbm_bo_get_height(bo);
-  uint32_t format = gbm_bo_get_format(bo);
+    // 1. Setup Handles/Strides
+    for (int i = 0; i < planes; i++) {
+        handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
+        pitches[i] = gbm_bo_get_stride_for_plane(bo, i);
+        offsets[i] = gbm_bo_get_offset(bo, i);
+        
+        // FIX: Only set modifiers for valid planes. 
+        // Setting junk in modifiers[1..3] for a 1-plane format causes EINVAL on strict drivers.
+        if (modifier != DRM_FORMAT_MOD_INVALID) {
+             modifiers[i] = modifier;
+        }
+    }
 
-  uint32_t handles[4] = {0};
-  uint32_t pitches[4] = {0};
-  uint32_t offsets[4] = {0};
-  uint64_t modifiers[4] = {0};
+    int ret = -1;
 
-  int planes = gbm_bo_get_plane_count(bo);
-  uint64_t modifier = gbm_bo_get_modifier(bo);
+    // ATTEMPT 1: Try AddFB2 with Modifiers (The "Correct" Modern Way)
+    if (modifier != DRM_FORMAT_MOD_INVALID) {
+        ret = drmModeAddFB2WithModifiers(kms.fd, width, height, format, handles,
+                                         pitches, offsets, modifiers, &fb_id,
+                                         DRM_MODE_FB_MODIFIERS);
+    }
 
-  /* Fill only valid planes */
-  for (int i = 0; i < planes; i++) {
-    handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
-    pitches[i] = gbm_bo_get_stride_for_plane(bo, i);
-    offsets[i] = gbm_bo_get_offset(bo, i);
-  }
+    // ATTEMPT 2: Fallback to AddFB2 without Modifiers (If driver dislikes the specific modifier)
+    if (ret) {
+        ret = drmModeAddFB2(kms.fd, width, height, format, handles, pitches,
+                            offsets, &fb_id, 0);
+    }
 
-  uint64_t mod =
-      (modifier != DRM_FORMAT_MOD_INVALID) ? modifier : DRM_FORMAT_MOD_INVALID;
+    // ATTEMPT 3: Ultimate Fallback to Legacy AddFB (The "Safe" Way)
+    // This is what fixed it on your Laptop. Laptops often prefer this for simple RGB buffers.
+    if (ret) {
+        // Assuming XRGB8888 (Depth 24, Bpp 32)
+        ret = drmModeAddFB(kms.fd, width, height, 24, 32, pitches[0], handles[0], &fb_id);
+    }
 
-  /* Zero unused planes explicitly (important!) */
-  for (int i = planes; i < 4; i++) {
-    handles[i] = 0;
-    pitches[i] = 0;
-    offsets[i] = 0;
-    modifiers[i] = mod;
-  }
+    if (ret) {
+        // If all 3 failed, we have a real problem
+        perror("Error: Failed to create DRM Framebuffer (All attempts failed)");
+        return 0; // Return 0 to indicate failure
+    }
 
-  int ret;
-  if (modifier == DRM_FORMAT_MOD_INVALID) {
-    ret = drmModeAddFB2(kms.fd, width, height, format, handles, pitches,
-                        offsets, &fb_id, 0);
-  } else {
-    ret = drmModeAddFB2WithModifiers(kms.fd, width, height, format, handles,
-                                     pitches, offsets, modifiers, &fb_id,
-                                     DRM_MODE_FB_MODIFIERS);
-  }
-
-  if (ret) {
-    perror("drmModeAddFB2");
-    return -1;
-  }
-
-  return fb_id;
+    return fb_id;
 }
+
+// uint32_t get_fb_for_bo(struct gbm_bo *bo) {
+//   // uint32_t fb_id;
+//   // uint32_t handle = gbm_bo_get_handle(bo).u32;
+//   // uint32_t stride = gbm_bo_get_stride(bo);
+//   // uint32_t width = gbm_bo_get_width(bo);
+//   // uint32_t height = gbm_bo_get_height(bo);
+//   // uint32_t bpp = gbm_bo_get_bpp(bo);
+//   // uint32_t depth = 24; // DEPENDS ON THE GBM/DRM FORMAT
+
+//   // int ret = drmModeAddFB(kms.fd, width, height, (uint8_t)depth, (uint8_t)bpp,
+//   //                        stride, handle, &fb_id);
+//   // if (ret) {
+//   //   perror("drmModeAddFB");
+//   //   return -1;
+//   // }
+//   // return fb_id;
+
+//   uint32_t fb_id;
+
+//   uint32_t width = gbm_bo_get_width(bo);
+//   uint32_t height = gbm_bo_get_height(bo);
+//   uint32_t format = gbm_bo_get_format(bo);
+
+//   uint32_t handles[4] = {0};
+//   uint32_t pitches[4] = {0};
+//   uint32_t offsets[4] = {0};
+//   uint64_t modifiers[4] = {0};
+
+//   int planes = gbm_bo_get_plane_count(bo);
+//   uint64_t modifier = gbm_bo_get_modifier(bo);
+
+//   /* Fill only valid planes */
+//   for (int i = 0; i < planes; i++) {
+//     handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
+//     pitches[i] = gbm_bo_get_stride_for_plane(bo, i);
+//     offsets[i] = gbm_bo_get_offset(bo, i);
+//   }
+
+//   uint64_t mod =
+//       (modifier != DRM_FORMAT_MOD_INVALID) ? modifier : DRM_FORMAT_MOD_INVALID;
+
+//   /* Zero unused planes explicitly (important!) */
+//   for (int i = planes; i < 4; i++) {
+//     handles[i] = 0;
+//     pitches[i] = 0;
+//     offsets[i] = 0;
+//     modifiers[i] = mod;
+//   }
+
+//   int ret;
+//   if (modifier == DRM_FORMAT_MOD_INVALID) {
+//     ret = drmModeAddFB2(kms.fd, width, height, format, handles, pitches,
+//                         offsets, &fb_id, 0);
+//   } else {
+//     ret = drmModeAddFB2WithModifiers(kms.fd, width, height, format, handles,
+//                                      pitches, offsets, modifiers, &fb_id,
+//                                      DRM_MODE_FB_MODIFIERS);
+//   }
+
+//   if (ret) {
+//     perror("drmModeAddFB2");
+//     return -1;
+//   }
+
+//   return fb_id;
+// }
 
 void swap_buffers_kms() {
   // 1. Finish GL Rendering
@@ -379,6 +438,8 @@ void cleanup() {
 }
 
 int main(int argc, char **argv) {
+  printf("> <\n");
+  
   signal(SIGINT, handle_sigint);
 
   if (init_kms() != 0) {
