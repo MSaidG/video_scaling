@@ -16,6 +16,14 @@
 #include <xf86drmMode.h>
 
 // --- RESOURCES ---
+typedef struct {
+  uint32_t handle;
+  uint32_t stride;
+  uint32_t size;
+  uint32_t fb_id;
+  uint8_t *map;
+} DumbBuffer;
+
 struct {
   int fd;
   drmModeConnector *connector;
@@ -23,14 +31,12 @@ struct {
   drmModeCrtc *crtc;
 
   // ZynqMP Specific Plane IDs
-  uint32_t plane_primary_id; // Usually 39
-  uint32_t plane_overlay_id; // Usually 41 (TTY)
+  uint32_t plane_primary_id;
+  uint32_t plane_overlay_id;
 
-  uint32_t dumb_handle;
-  uint32_t dumb_stride;
-  uint32_t dumb_size;
-  uint32_t dumb_fb_id;
-  uint8_t *dumb_map;
+  // Double Buffering
+  DumbBuffer bufs[2];
+  int current_buf_idx;
 
   EGLDisplay egl_disp;
   EGLContext egl_ctx;
@@ -47,35 +53,66 @@ double get_time_sec() {
 
 void handle_sigint(int sig) { running = 0; }
 
-// --- FIND PLANES ---
-void find_planes() {
-  drmModePlaneRes *plane_res = drmModeGetPlaneResources(kms.fd);
-  if (!plane_res) {
-    fprintf(stderr, "Failed to get plane resources\n");
-    return;
+// --- CLEANUP FUNCTION ---
+void cleanup() {
+  printf("\nCleaning up resources...\n");
+
+  // 1. Disable Planes (Clear screen)
+  if (kms.fd >= 0 && kms.crtc) {
+    // Disable Primary Plane (Our App)
+    drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0);
+
+    // Optional: We could try to re-enable the console plane here if we knew its
+    // original FB ID, but typically closing the DRM Master FD allows the kernel
+    // to restore the console eventually.
   }
 
-  // Default fallbacks for ZynqMP
-  kms.plane_primary_id = 39;
-  kms.plane_overlay_id = 41;
+  // 2. EGL Cleanup
+  if (kms.egl_disp != EGL_NO_DISPLAY) {
+    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+    if (kms.egl_surf != EGL_NO_SURFACE)
+      eglDestroySurface(kms.egl_disp, kms.egl_surf);
+    if (kms.egl_ctx != EGL_NO_CONTEXT)
+      eglDestroyContext(kms.egl_disp, kms.egl_ctx);
+    eglTerminate(kms.egl_disp);
+  }
 
-  // Optional: Iterate to find them dynamically if needed
-  // For now, hardcoding based on your log is safer for ZynqMP.
-  printf("Targeting Primary Plane: %u, Disabling Overlay Plane: %u\n",
-         kms.plane_primary_id, kms.plane_overlay_id);
+  // 3. Dumb Buffer Cleanup
+  for (int i = 0; i < 2; i++) {
+    // Unmap Memory
+    if (kms.bufs[i].map) {
+      munmap(kms.bufs[i].map, kms.bufs[i].size);
+    }
+    // Remove Framebuffer Object
+    if (kms.bufs[i].fb_id) {
+      drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
+    }
+    // Destroy Dumb Buffer Handle (Frees GPU memory)
+    if (kms.bufs[i].handle) {
+      struct drm_mode_destroy_dumb destroy_req = {.handle = kms.bufs[i].handle};
+      ioctl(kms.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_req);
+    }
+  }
 
-  drmModeFreePlaneResources(plane_res);
+  // 4. DRM Resources
+  if (kms.crtc)
+    drmModeFreeCrtc(kms.crtc);
+  if (kms.connector)
+    drmModeFreeConnector(kms.connector);
+  if (kms.fd >= 0)
+    close(kms.fd);
+
+  printf("Cleanup Done.\n");
 }
 
-// --- DRM SETUP ---
 int init_drm() {
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) {
-    perror("Failed to open card0 or card1");
+  if (kms.fd < 0)
     return -1;
-  }
 
   drmModeRes *res = drmModeGetResources(kms.fd);
   if (!res)
@@ -110,38 +147,40 @@ int init_drm() {
     drmModeFreeResources(res);
   }
 
-  find_planes(); // Find the plane IDs
+  kms.plane_primary_id = 39;
+  kms.plane_overlay_id = 41;
+
   return 0;
 }
 
-// --- DUMB BUFFER SETUP ---
-int init_dumb_buffer() {
+int create_dumb_buffer(DumbBuffer *buf) {
   struct drm_mode_create_dumb create_req = {0};
   create_req.width = kms.mode.hdisplay;
   create_req.height = kms.mode.vdisplay;
   create_req.bpp = 32;
 
-  ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req);
-  kms.dumb_handle = create_req.handle;
-  kms.dumb_stride = create_req.pitch;
-  kms.dumb_size = create_req.size;
+  if (ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req) < 0)
+    return -1;
+  buf->handle = create_req.handle;
+  buf->stride = create_req.pitch;
+  buf->size = create_req.size;
 
   struct drm_mode_map_dumb map_req = {0};
-  map_req.handle = kms.dumb_handle;
-  ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req);
+  map_req.handle = buf->handle;
+  if (ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) < 0)
+    return -1;
 
-  kms.dumb_map = mmap(0, kms.dumb_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                      kms.fd, map_req.offset);
-  memset(kms.dumb_map, 0x00, kms.dumb_size); // Clear to Black
+  buf->map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, kms.fd,
+                  map_req.offset);
+  if (buf->map == MAP_FAILED)
+    return -1;
 
-  // Use XRGB8888 (24 depth, 32 bpp) for the Display
-  drmModeAddFB(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay, 24, 32,
-               kms.dumb_stride, kms.dumb_handle, &kms.dumb_fb_id);
+  memset(buf->map, 0, buf->size);
 
-  return 0;
+  return drmModeAddFB(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay, 24, 32,
+                      buf->stride, buf->handle, &buf->fb_id);
 }
 
-// --- EGL SETUP ---
 int init_egl() {
   kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
@@ -182,72 +221,76 @@ int init_egl() {
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
 
-  if (init_drm() < 0)
+  if (init_drm() < 0) {
+    fprintf(stderr, "Failed to init DRM\n");
     return -1;
-  if (init_dumb_buffer() < 0)
+  }
+
+  // Create TWO buffers for Double Buffering
+  if (create_dumb_buffer(&kms.bufs[0]) < 0) {
+    cleanup();
     return -1;
-
-  // 1. Fill with WHITE to prove screen works (You confirmed this works)
-  printf("Filling buffer with WHITE...\n");
-  memset(kms.dumb_map, 0xFF, kms.dumb_size);
-
-  if (init_egl() < 0)
+  }
+  if (create_dumb_buffer(&kms.bufs[1]) < 0) {
+    cleanup();
     return -1;
+  }
 
-  // Force Planes (Keep this, it's working)
+  if (init_egl() < 0) {
+    cleanup();
+    return -1;
+  }
+
+  printf("Setup Complete. Double Buffering Active.\n");
+
+  // 1. Disable Console Plane
   drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
                   0, 0, 0, 0, 0, 0);
-  drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
-                  kms.dumb_fb_id, 0, 0, 0, kms.mode.hdisplay, kms.mode.vdisplay,
-                  0, 0, kms.mode.hdisplay << 16, kms.mode.vdisplay << 16);
 
-  printf("Starting render loop...\n");
+  // 2. Set Initial Buffer (Buffer 0) to Primary Plane
+  drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
+                  kms.bufs[0].fb_id, 0, 0, 0, kms.mode.hdisplay,
+                  kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
+                  kms.mode.vdisplay << 16);
+
+  int back_buf_idx = 1; // Start writing to Buffer 1
+
+  printf("Rendering... Press Ctrl+C to exit.\n");
 
   while (running) {
     double t = get_time_sec();
 
-    // --- RENDER ---
-    // Cycle background color
+    // --- 1. RENDER (To PBuffer) ---
     glClearColor((sin(t) + 1) / 2, (sin(t + 2) + 1) / 2, (sin(t + 4) + 1) / 2,
                  1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Draw Red Box
     glEnable(GL_SCISSOR_TEST);
-    glScissor(100, 100, 400, 400);
+    glScissor((int)(t * 100) % 1720, 100, 200, 200);
     glClearColor(1.0, 0.0, 0.0, 1.0);
     glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
 
     glFinish();
 
-    // --- READ BACK (The Fix) ---
-    // Try Standard GL_RGBA first.
-    // Note: ZynqMP is Little Endian, so GL_RGBA in memory = ABGR to the
-    // hardware. If colors look swapped, we can swap bytes later.
+    // --- 2. COPY (To Back Buffer) ---
     glReadPixels(0, 0, kms.mode.hdisplay, kms.mode.vdisplay, GL_RGBA,
-                 GL_UNSIGNED_BYTE, kms.dumb_map);
+                 GL_UNSIGNED_BYTE, kms.bufs[back_buf_idx].map);
 
-    // --- DEBUGGING ---
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-      printf("glReadPixels Error: 0x%x\n", err);
+    // --- 3. FLIP (Swap Buffers) ---
+    int ret = drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
+                              kms.bufs[back_buf_idx].fb_id, 0, 0, 0,
+                              kms.mode.hdisplay, kms.mode.vdisplay, 0, 0,
+                              kms.mode.hdisplay << 16, kms.mode.vdisplay << 16);
+
+    if (ret != 0) {
+      perror("Flip failed");
     }
 
-    // Print the first pixel. If it stays FF FF FF FF, the copy is failing.
-    // If it changes, the copy works but the display isn't updating (cache
-    // issue).
-    static int frame = 0;
-    if (frame++ % 60 == 0) {
-      printf("Pixel[0]: %02X %02X %02X %02X\n", kms.dumb_map[0],
-             kms.dumb_map[1], kms.dumb_map[2], kms.dumb_map[3]);
-    }
-
-    // Tell DRM to show the new frame
-    drmModeDirtyFB(kms.fd, kms.dumb_fb_id, NULL, 0);
-
-    usleep(16000);
+    // Swap indices
+    back_buf_idx = (back_buf_idx + 1) % 2;
   }
 
+  cleanup(); // Clean up on exit
   return 0;
 }
