@@ -1,8 +1,10 @@
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -12,78 +14,249 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
-#include <gbm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-// --- CONFIG ---
-#define RAW_FILE "videos/test_nv12.yuv"
 #define VID_W 1920
 #define VID_H 1080
-#define FPS 60
+#define RAW_FILE "nv12_1080p60.yuv"
 
-// --- GLOBALS ---
+// --- YUV TO RGB SHADER ---
+const char *vs_src = "attribute vec4 a_pos;    \n"
+                     "attribute vec2 a_tex;    \n"
+                     "varying vec2 v_tex;      \n"
+                     "void main() {            \n"
+                     "   gl_Position = a_pos;  \n"
+                     "   v_tex = a_tex;        \n"
+                     "}                        \n";
+
+const char *fs_src = "precision mediump float;             \n"
+                     "varying vec2 v_tex;                  \n"
+                     "uniform sampler2D tex_y;             \n" // Texture Unit 0
+                     "uniform sampler2D tex_uv;            \n" // Texture Unit 1
+                     "void main() {                        \n"
+                     "  float y = texture2D(tex_y, v_tex).r;          \n"
+                     "  vec4 uv_raw = texture2D(tex_uv, v_tex);       \n"
+                     // NV12 Logic: U is in Luminance (r), V is in Alpha (a)
+                     "  float u = uv_raw.r - 0.5;                     \n"
+                     "  float v = uv_raw.a - 0.5;                     \n"
+                     // BT.601 Conversion
+                     "  float r = y + 1.402 * v;                      \n"
+                     "  float g = y - 0.344 * u - 0.714 * v;          \n"
+                     "  float b = y + 1.772 * u;                      \n"
+                     "  gl_FragColor = vec4(r, g, b, 1.0);            \n"
+                     "}                                    \n";
+
+GLuint create_shader(const char *src, GLenum type) {
+  GLuint s = glCreateShader(type);
+  glShaderSource(s, 1, &src, NULL);
+  glCompileShader(s);
+  GLint ok;
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[512];
+    glGetShaderInfoLog(s, 512, NULL, log);
+    fprintf(stderr, "Shader Compile Error: %s\n", log);
+    return 0;
+  }
+  return s;
+}
+
+// --- RESOURCES ---
+typedef struct {
+  uint32_t handle;
+  uint32_t stride;
+  uint32_t size;
+  uint32_t fb_id;
+  uint8_t *map;
+} DumbBuffer;
+
 struct {
   int fd;
-  drmModeConnector *conn;
+  drmModeConnector *connector;
   drmModeModeInfo mode;
   drmModeCrtc *crtc;
-  struct gbm_device *gbm_dev;
-  struct gbm_surface *gbm_surf;
-  struct gbm_bo *curr_bo;
-  uint32_t curr_fb;
+  uint32_t plane_primary_id;
+  uint32_t plane_overlay_id;
+  DumbBuffer bufs[2];
   EGLDisplay egl_disp;
   EGLContext egl_ctx;
   EGLSurface egl_surf;
-} kms;
-
-struct {
-  int fd;
-  unsigned char *data; // Memory mapped file
-  size_t size;
+  // GPU Resources
+  GLuint prog;
+  GLuint vbo;
+  // Camera/Video Resources
+  int cam_fd;
   size_t frame_size;
-  int total_frames;
-  int curr_frame_idx;
+  unsigned char *frame_buffer; // RAM buffer for current frame
   GLuint tex_y;
   GLuint tex_uv;
-} cam;
+} kms;
 
 volatile sig_atomic_t running = 1;
-int waiting_for_flip = 0;
 
-// --- UTILS ---
-void handle_signal(int s) { running = 0; }
+void handle_sigint(int sig) { running = 0; }
 
-// --- SHADERS (NV12 -> RGB Conversion) ---
-// NV12 has Y plane (full res) and UV plane (half res interleaved)
-const char *vs_src =
-    "attribute vec4 pos; attribute vec2 tex; varying vec2 v_tex; "
-    "void main() { gl_Position = pos; v_tex = tex; }";
+double get_time_sec() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
-const char *fs_src =
-    "precision mediump float;"
-    "varying vec2 v_tex;"
-    "uniform sampler2D tex_y;"
-    "uniform sampler2D tex_uv;"
-    "void main() {"
-    "  float y = texture2D(tex_y, v_tex).r;"
-    "  // UV texture is half size, but GL handles coordinates automatically \n"
-    "  // We read RG from the texture because UV are interleaved bytes \n"
-    "  // NV12: U is in 'r' (or 'a' depending on GL format), V is in 'g' (or "
-    "'l') \n"
-    "  // Standard luminance conversion: \n"
-    "  vec4 uv_raw = texture2D(tex_uv, v_tex);"
-    "  float u = uv_raw.r - 0.5;"
-    "  float v = uv_raw.a - 0.5;" // Usually stored as Luminance Alpha (L=U,
-                                  // A=V) or RG
+// --- VIDEO INPUT ---
+int init_raw_input() {
+  kms.cam_fd = open(RAW_FILE, O_RDONLY);
+  if (kms.cam_fd < 0) {
+    fprintf(stderr, "Error: Cannot open %s\n", RAW_FILE);
+    return -1;
+  }
 
-    "  float r = y + 1.402 * v;"
-    "  float g = y - 0.344 * u - 0.714 * v;"
-    "  float b = y + 1.772 * u;"
-    "  gl_FragColor = vec4(r, g, b, 1.0);"
-    "}";
+  // NV12 Size = W * H * 1.5
+  kms.frame_size = VID_W * VID_H * 3 / 2;
+  kms.frame_buffer = malloc(kms.frame_size);
+  if (!kms.frame_buffer) {
+    fprintf(stderr, "OOM: Cannot allocate frame buffer\n");
+    return -1;
+  }
 
-int init_kms() {
+  printf("Opened Raw File. Frame Size: %zu bytes\n", kms.frame_size);
+
+  // 1. Create Y Texture (Luminance)
+  glGenTextures(1, &kms.tex_y);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, kms.tex_y);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  // 2. Create UV Texture (Luminance Alpha)
+  glGenTextures(1, &kms.tex_uv);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, kms.tex_uv);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  return 0;
+}
+
+// Read next frame from disk and upload to GPU
+void update_texture() {
+  // Read from file
+  ssize_t ret = read(kms.cam_fd, kms.frame_buffer, kms.frame_size);
+  if (ret != kms.frame_size) {
+    // Loop video: Seek to beginning
+    lseek(kms.cam_fd, 0, SEEK_SET);
+    read(kms.cam_fd, kms.frame_buffer, kms.frame_size);
+  }
+
+  unsigned char *y_plane = kms.frame_buffer;
+  unsigned char *uv_plane = kms.frame_buffer + (VID_W * VID_H);
+
+  // Upload Y (Unit 0)
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, kms.tex_y);
+  // Note: GL_LUMINANCE is deprecated in modern GL but valid in GLES2
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
+               GL_UNSIGNED_BYTE, y_plane);
+
+  // Upload UV (Unit 1)
+  // Resolution is W/2 x H/2. Format is Lum/Alpha (2 bytes per pixel)
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, kms.tex_uv);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
+               GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_plane);
+}
+
+// --- INIT GLES ---
+int init_gles_objects() {
+  kms.prog = glCreateProgram();
+  GLuint vs = create_shader(vs_src, GL_VERTEX_SHADER);
+  GLuint fs = create_shader(fs_src, GL_FRAGMENT_SHADER);
+  if (!vs || !fs)
+    return -1;
+
+  glAttachShader(kms.prog, vs);
+  glAttachShader(kms.prog, fs);
+  glLinkProgram(kms.prog);
+  glUseProgram(kms.prog);
+
+  // Pass-through Quad (No flip needed if video is naturally right-side up)
+  // If video is upside down, swap the V coordinates (0.0 <-> 1.0)
+  GLfloat vertices[] = {
+      // X      Y      U     V
+      -1.0f, 1.0f,  0.0f, 1.0f, // Top Left     (V was 0.0)
+      -1.0f, -1.0f, 0.0f, 0.0f, // Bottom Left  (V was 1.0)
+      1.0f,  1.0f,  1.0f, 1.0f, // Top Right    (V was 0.0)
+      1.0f,  -1.0f, 1.0f, 0.0f  // Bottom Right (V was 1.0)
+  };
+
+  glGenBuffers(1, &kms.vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+  GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
+  GLint loc_tex = glGetAttribLocation(kms.prog, "a_tex");
+  GLint loc_y = glGetUniformLocation(kms.prog, "tex_y");
+  GLint loc_uv = glGetUniformLocation(kms.prog, "tex_uv");
+
+  glEnableVertexAttribArray(loc_pos);
+  glEnableVertexAttribArray(loc_tex);
+  glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                        (void *)0);
+  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                        (void *)(2 * sizeof(float)));
+
+  // Set Uniforms to match Texture Units
+  glUniform1i(loc_y, 0);  // tex_y  -> Unit 0
+  glUniform1i(loc_uv, 1); // tex_uv -> Unit 1
+
+  return 0;
+}
+
+void cleanup() {
+  printf("\nCleaning up...\n");
+  if (kms.frame_buffer)
+    free(kms.frame_buffer);
+  if (kms.cam_fd >= 0)
+    close(kms.cam_fd);
+
+  // Standard Cleanup...
+  if (kms.prog)
+    glDeleteProgram(kms.prog);
+  if (kms.tex_y)
+    glDeleteTextures(1, &kms.tex_y);
+  if (kms.tex_uv)
+    glDeleteTextures(1, &kms.tex_uv);
+  if (kms.vbo)
+    glDeleteBuffers(1, &kms.vbo);
+
+  if (kms.fd >= 0 && kms.crtc) {
+    drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0);
+  }
+  if (kms.egl_disp != EGL_NO_DISPLAY) {
+    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+    eglTerminate(kms.egl_disp);
+  }
+  for (int i = 0; i < 2; i++) {
+    if (kms.bufs[i].map)
+      munmap(kms.bufs[i].map, kms.bufs[i].size);
+    if (kms.bufs[i].fb_id)
+      drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
+    if (kms.bufs[i].handle) {
+      struct drm_mode_destroy_dumb dreq = {.handle = kms.bufs[i].handle};
+      ioctl(kms.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+    }
+  }
+  close(kms.fd);
+  printf("Done.\n");
+}
+
+int init_drm() {
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
@@ -93,295 +266,153 @@ int init_kms() {
   drmModeRes *res = drmModeGetResources(kms.fd);
   if (!res)
     return -1;
-
-  // Find a connected connector
   for (int i = 0; i < res->count_connectors; i++) {
-    drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
-    if (c->connection == DRM_MODE_CONNECTED) {
-      kms.conn = c;
+    drmModeConnector *conn = drmModeGetConnector(kms.fd, res->connectors[i]);
+    if (conn->connection == DRM_MODE_CONNECTED) {
+      kms.connector = conn;
       break;
     }
-    drmModeFreeConnector(c);
+    drmModeFreeConnector(conn);
   }
-
-  // We are done with resources, free it NOW to prevent leaks
   drmModeFreeResources(res);
-
-  if (!kms.conn) {
-    fprintf(stderr, "No monitor found\n");
+  if (!kms.connector)
     return -1;
-  }
-  kms.mode = kms.conn->modes[0];
 
-  // Find Encoder & CRTC
-  drmModeEncoder *enc = NULL;
-  if (kms.conn->encoder_id) {
-    enc = drmModeGetEncoder(kms.fd, kms.conn->encoder_id);
-  }
-
-  if (enc && enc->crtc_id) {
-    kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-  } else {
-    // Re-fetch resources just for CRTC fallback (rare case)
-    res = drmModeGetResources(kms.fd);
-    if (res && res->count_crtcs > 0) {
-      kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
-    }
-    if (res)
-      drmModeFreeResources(res);
-  }
-
-  // CLEANUP: Free the encoder if we retrieved it
+  kms.mode = kms.connector->modes[0];
+  drmModeEncoder *enc = drmModeGetEncoder(kms.fd, kms.connector->encoder_id);
   if (enc)
-    drmModeFreeEncoder(enc);
+    kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
+  else {
+    res = drmModeGetResources(kms.fd);
+    kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
+    drmModeFreeResources(res);
+  }
+  kms.plane_primary_id = 39;
+  kms.plane_overlay_id = 41;
+  return 0;
+}
 
-  if (!kms.crtc)
+int create_dumb_buffer(DumbBuffer *buf) {
+  struct drm_mode_create_dumb create_req = {0};
+  create_req.width = kms.mode.hdisplay;
+  create_req.height = kms.mode.vdisplay;
+  create_req.bpp = 32;
+  if (ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req) < 0)
     return -1;
+  buf->handle = create_req.handle;
+  buf->stride = create_req.pitch;
+  buf->size = create_req.size;
 
-  // --- GBM / EGL Setup (Same as before) ---
-  kms.gbm_dev = gbm_create_device(kms.fd);
-  uint32_t gbm_format = GBM_FORMAT_XRGB8888;
-  kms.gbm_surf =
-      gbm_surface_create(kms.gbm_dev, kms.mode.hdisplay, kms.mode.vdisplay,
-                         gbm_format, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+  struct drm_mode_map_dumb map_req = {0};
+  map_req.handle = buf->handle;
+  ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req);
+  buf->map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, kms.fd,
+                  map_req.offset);
+  memset(buf->map, 0, buf->size);
+  return drmModeAddFB(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay, 24, 32,
+                      buf->stride, buf->handle, &buf->fb_id);
+}
 
-  kms.egl_disp =
-      eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, kms.gbm_dev, NULL);
-  eglInitialize(kms.egl_disp, NULL, NULL);
+int init_egl() {
+  kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
+    kms.egl_disp = eglGetDisplay((EGLNativeDisplayType)kms.fd);
+    eglInitialize(kms.egl_disp, NULL, NULL);
+  }
   eglBindAPI(EGL_OPENGL_ES_API);
 
-  // Manual Config Selection (Keep this from previous step!)
   EGLConfig config;
   EGLint num_configs;
-  eglGetConfigs(kms.egl_disp, NULL, 0, &num_configs);
-  EGLConfig *configs = malloc(num_configs * sizeof(EGLConfig));
-  eglGetConfigs(kms.egl_disp, configs, num_configs, &num_configs);
-
-  int found_config = 0;
-  for (int i = 0; i < num_configs; i++) {
-    EGLint id;
-    eglGetConfigAttrib(kms.egl_disp, configs[i], EGL_NATIVE_VISUAL_ID, &id);
-    if (id == gbm_format) {
-      config = configs[i];
-      found_config = 1;
-      break;
-    }
-  }
-  free(configs);
-
-  if (!found_config)
-    return -1;
-
+  EGLint attribs[] = {EGL_SURFACE_TYPE,
+                      EGL_PBUFFER_BIT,
+                      EGL_RED_SIZE,
+                      8,
+                      EGL_GREEN_SIZE,
+                      8,
+                      EGL_BLUE_SIZE,
+                      8,
+                      EGL_ALPHA_SIZE,
+                      8,
+                      EGL_RENDERABLE_TYPE,
+                      EGL_OPENGL_ES2_BIT,
+                      EGL_NONE};
+  eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num_configs);
+  EGLint pbuffer_attribs[] = {EGL_WIDTH, kms.mode.hdisplay, EGL_HEIGHT,
+                              kms.mode.vdisplay, EGL_NONE};
+  kms.egl_surf = eglCreatePbufferSurface(kms.egl_disp, config, pbuffer_attribs);
+  EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
   kms.egl_ctx =
-      eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
-                       (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
-  kms.egl_surf = eglCreateWindowSurface(
-      kms.egl_disp, config, (EGLNativeWindowType)kms.gbm_surf, NULL);
+      eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, ctx_attribs);
   eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
-
   return 0;
 }
 
-int init_raw_input() {
-  // Open the generated YUV file
-  cam.fd = open(RAW_FILE, O_RDONLY);
-  if (cam.fd < 0) {
-    perror("Open RAW file failed");
+int main(int argc, char **argv) {
+  signal(SIGINT, handle_sigint);
+
+  if (init_drm() < 0)
+    return -1;
+  if (create_dumb_buffer(&kms.bufs[0]) < 0)
+    return -1;
+  if (create_dumb_buffer(&kms.bufs[1]) < 0)
+    return -1;
+  if (init_egl() < 0)
+    return -1;
+  if (init_raw_input() < 0) {
+    cleanup();
+    return -1;
+  }
+  if (init_gles_objects() < 0) {
+    cleanup();
     return -1;
   }
 
-  struct stat sb;
-  fstat(cam.fd, &sb);
-  cam.size = sb.st_size;
+  printf("Setup Complete. Playing '%s'...\n", RAW_FILE);
 
-  // NV12 Size = W * H * 1.5
-  cam.frame_size = VID_W * VID_H * 3 / 2;
-  cam.total_frames = cam.size / cam.frame_size;
-  cam.curr_frame_idx = 0;
+  // Plane Setup
+  drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
+                  0, 0, 0, 0, 0, 0);
+  drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
+                  kms.bufs[0].fb_id, 0, 0, 0, kms.mode.hdisplay,
+                  kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
+                  kms.mode.vdisplay << 16);
 
-  // Memory map the file to simulate RAM access (like a camera buffer)
-  cam.data = mmap(NULL, cam.size, PROT_READ, MAP_PRIVATE, cam.fd, 0);
-  if (cam.data == MAP_FAILED)
-    return -1;
+  int back_buf_idx = 1;
 
-  printf("Mapped RAW File: %ld bytes (%d frames)\n", cam.size,
-         cam.total_frames);
-
-  // Create Textures for NV12 (Y Plane and UV Plane)
-  glGenTextures(1, &cam.tex_y);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_y);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-  glGenTextures(1, &cam.tex_uv);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_uv);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-  return 0;
-}
-
-void update_texture() {
-  // Point to current frame in the big memory buffer
-  unsigned char *frame_start = cam.data + (cam.curr_frame_idx * cam.frame_size);
-  unsigned char *uv_start = frame_start + (VID_W * VID_H);
-
-  // Upload Y Plane (Luminance) - 1 byte per pixel
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
-               GL_UNSIGNED_BYTE, frame_start);
-
-  // Upload UV Plane (Chrominance) - Interleaved (UVUV...)
-  // This is effectively W/2 x H/2 resolution but 2 bytes per pixel (Luminance
-  // Alpha)
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
-               GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
-
-  // Advance frame
-  cam.curr_frame_idx = (cam.curr_frame_idx + 1) % cam.total_frames;
-}
-
-static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
-                              unsigned int usec, void *data) {
-  *(int *)data = 0;
-}
-
-void swap_buffers() {
-  eglSwapBuffers(kms.egl_disp, kms.egl_surf);
-  struct gbm_bo *bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
-  uint32_t handle = gbm_bo_get_handle(bo).u32;
-  uint32_t fb;
-  drmModeAddFB(kms.fd, gbm_bo_get_width(bo), gbm_bo_get_height(bo), 24, 32,
-               gbm_bo_get_stride(bo), handle, &fb);
-
-  drmModePageFlip(kms.fd, kms.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT,
-                  &waiting_for_flip);
-  waiting_for_flip = 1;
-
-  if (kms.curr_bo) {
-    gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
-    drmModeRmFB(kms.fd, kms.curr_fb);
-  }
-  kms.curr_bo = bo;
-  kms.curr_fb = fb;
-}
-
-void cleanup() {
-  printf("Cleaning up resources...\n");
-
-  // 1. Clean up Camera/Input Resources
-  if (cam.data && cam.data != MAP_FAILED) {
-    munmap(cam.data, cam.size);
-  }
-  if (cam.fd >= 0) {
-    close(cam.fd);
-  }
-
-  // Clean up textures (if GL context is still alive)
-  if (cam.tex_y)
-    glDeleteTextures(1, &cam.tex_y);
-  if (cam.tex_uv)
-    glDeleteTextures(1, &cam.tex_uv);
-
-  // 2. Clean up KMS/GBM Resources (Current Frame)
-  if (kms.curr_bo) {
-    gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
-    drmModeRmFB(kms.fd, kms.curr_fb);
-    kms.curr_bo = NULL;
-  }
-
-  // 3. Clean up EGL
-  if (kms.egl_disp != EGL_NO_DISPLAY) {
-    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
-    if (kms.egl_surf != EGL_NO_SURFACE)
-      eglDestroySurface(kms.egl_disp, kms.egl_surf);
-    if (kms.egl_ctx != EGL_NO_CONTEXT)
-      eglDestroyContext(kms.egl_disp, kms.egl_ctx);
-    eglTerminate(kms.egl_disp);
-  }
-
-  // 4. Clean up GBM Device
-  if (kms.gbm_surf)
-    gbm_surface_destroy(kms.gbm_surf);
-  if (kms.gbm_dev)
-    gbm_device_destroy(kms.gbm_dev);
-
-  // 5. Clean up DRM/KMS
-  if (kms.crtc)
-    drmModeFreeCrtc(kms.crtc);
-  if (kms.conn)
-    drmModeFreeConnector(kms.conn);
-
-  if (kms.fd >= 0) {
-    close(kms.fd);
-  }
-
-  printf("Cleanup Done.\n");
-}
-
-int main() {
-  signal(SIGINT, handle_signal);
-
-  if (init_kms() != 0)
-    return 1;
-  if (init_raw_input() != 0)
-    return 1;
-
-  // Compile Shaders
-  GLuint p = glCreateProgram();
-  GLuint v = glCreateShader(GL_VERTEX_SHADER);
-  glShaderSource(v, 1, &vs_src, 0);
-  glCompileShader(v);
-  GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-  glShaderSource(f, 1, &fs_src, 0);
-  glCompileShader(f);
-  glAttachShader(p, v);
-  glAttachShader(p, f);
-  glLinkProgram(p);
-  glUseProgram(p);
-
-  // Set Uniforms (Texture Units 0 and 1)
-  glUniform1i(glGetUniformLocation(p, "tex_y"), 0);
-  glUniform1i(glGetUniformLocation(p, "tex_uv"), 1);
-
-  GLfloat verts[] = {-1, 1, 0, 0, -1, -1, 0, 1, 1, 1, 1, 0, 1, -1, 1, 1};
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts);
-  glEnableVertexAttribArray(1);
-  glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts + 2);
-
-  drmEventContext ev = {0};
-  ev.version = 2;
-  ev.page_flip_handler = page_flip_handler;
-  fd_set fds;
-
-  printf("Simulating Camera Feed (%dx%d NV12)...\n", VID_W, VID_H);
+  double last_time = get_time_sec();
+  int frames = 0;
 
   while (running) {
-    while (waiting_for_flip) {
-      if (!running)
-        break;
-      FD_ZERO(&fds);
-      FD_SET(kms.fd, &fds);
-      if (select(kms.fd + 1, &fds, 0, 0, 0) > 0)
-        drmHandleEvent(kms.fd, &ev);
-    }
-    if (!running)
-      break;
+    // 1. Upload Next Frame from Disk to GPU
+    update_texture();
 
-    update_texture(); // Load next frame from RAM to GPU
+    // 2. Render Quad
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    swap_buffers();
+    glFinish();
 
-    // Simple FPS cap (usleep is not precise but fine for testing)
-    usleep(16000);
+    // 3. Read Pixels (GPU -> CPU)
+    // Note: If Red/Blue are swapped, change to GL_BGRA_EXT
+    glReadPixels(0, 0, kms.mode.hdisplay, kms.mode.vdisplay, GL_RGBA,
+                 GL_UNSIGNED_BYTE, kms.bufs[back_buf_idx].map);
+
+    // 4. Flip
+    drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
+                    kms.bufs[back_buf_idx].fb_id, 0, 0, 0, kms.mode.hdisplay,
+                    kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
+                    kms.mode.vdisplay << 16);
+
+    back_buf_idx = (back_buf_idx + 1) % 2;
+
+    // FPS Calculation
+    frames++;
+    double current_time = get_time_sec();
+    if (current_time - last_time >= 1.0) {
+      printf("FPS: %d\n", frames);
+      frames = 0;
+      last_time = current_time;
+    }
   }
 
-  glDeleteProgram(p);
   cleanup();
   return 0;
 }
