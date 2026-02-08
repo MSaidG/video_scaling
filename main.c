@@ -17,7 +17,8 @@
 #include <xf86drmMode.h>
 
 // --- CONFIG ---
-#define RAW_FILE "videos/test_nv12.yuv"
+#define RAW_FILE_1 "videos/test_1080p.yuv"
+#define RAW_FILE_2 "videos/test_1080p.yuv"
 #define VID_W 1920
 #define VID_H 1080
 #define FPS 60
@@ -37,7 +38,8 @@ struct {
   EGLSurface egl_surf;
 } kms;
 
-struct {
+typedef struct {
+  const char *filename;
   int fd;
   unsigned char *data; // Memory mapped file
   size_t size;
@@ -46,7 +48,9 @@ struct {
   int curr_frame_idx;
   GLuint tex_y;
   GLuint tex_uv;
-} cam;
+} VideoSource;
+
+VideoSource videos[2];
 
 volatile sig_atomic_t running = 1;
 int waiting_for_flip = 0;
@@ -182,68 +186,61 @@ int init_kms() {
   return 0;
 }
 
-int init_raw_input() {
-  // Open the generated YUV file
-  cam.fd = open(RAW_FILE, O_RDONLY);
-  if (cam.fd < 0) {
-    perror("Open RAW file failed");
+int init_video_source(VideoSource *v, const char *filename) {
+  v->filename = filename;
+  v->fd = open(filename, O_RDONLY);
+  if (v->fd < 0) {
+    fprintf(stderr, "Failed to open %s\n", filename);
     return -1;
   }
 
   struct stat sb;
-  fstat(cam.fd, &sb);
-  cam.size = sb.st_size;
+  fstat(v->fd, &sb);
+  v->size = sb.st_size;
+  v->frame_size = VID_W * VID_H * 3 / 2; // NV12
+  v->total_frames = v->size / v->frame_size;
+  v->curr_frame_idx = 0;
 
-  // NV12 Size = W * H * 1.5
-  cam.frame_size = VID_W * VID_H * 3 / 2;
-  cam.total_frames = cam.size / cam.frame_size;
-  cam.curr_frame_idx = 0;
-
-  // Memory map the file to simulate RAM access (like a camera buffer)
-  cam.data = mmap(NULL, cam.size, PROT_READ, MAP_PRIVATE, cam.fd, 0);
-  if (cam.data == MAP_FAILED)
+  v->data = mmap(NULL, v->size, PROT_READ, MAP_PRIVATE, v->fd, 0);
+  if (v->data == MAP_FAILED)
     return -1;
 
-  printf("Mapped RAW File: %ld bytes (%d frames)\n", cam.size,
-         cam.total_frames);
-
-  // Create Textures for NV12 (Y Plane and UV Plane)
-  glGenTextures(1, &cam.tex_y);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_y);
+  // Create Textures
+  glGenTextures(1, &v->tex_y);
+  glBindTexture(GL_TEXTURE_2D, v->tex_y);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  // Important: Clamp to edge prevents artifacts at split screen border
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-  glGenTextures(1, &cam.tex_uv);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_uv);
+  glGenTextures(1, &v->tex_uv);
+  glBindTexture(GL_TEXTURE_2D, v->tex_uv);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+  printf("Init Video: %s (%d frames)\n", filename, v->total_frames);
   return 0;
 }
 
-void update_texture() {
-  // Point to current frame in the big memory buffer
-  unsigned char *frame_start = cam.data + (cam.curr_frame_idx * cam.frame_size);
+void update_texture(VideoSource *v) {
+  unsigned char *frame_start = v->data + (v->curr_frame_idx * v->frame_size);
   unsigned char *uv_start = frame_start + (VID_W * VID_H);
 
-  // Upload Y Plane (Luminance) - 1 byte per pixel
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_y);
+  glBindTexture(GL_TEXTURE_2D, v->tex_y);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
                GL_UNSIGNED_BYTE, frame_start);
 
-  // Upload UV Plane (Chrominance) - Interleaved (UVUV...)
-  // This is effectively W/2 x H/2 resolution but 2 bytes per pixel (Luminance
-  // Alpha)
   glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, cam.tex_uv);
+  glBindTexture(GL_TEXTURE_2D, v->tex_uv);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
                GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
 
-  // Advance frame
-  cam.curr_frame_idx = (cam.curr_frame_idx + 1) % cam.total_frames;
+  v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
 }
-
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
                               unsigned int usec, void *data) {
   *(int *)data = 0;
@@ -272,19 +269,21 @@ void swap_buffers() {
 void cleanup() {
   printf("Cleaning up resources...\n");
 
-  // 1. Clean up Camera/Input Resources
-  if (cam.data && cam.data != MAP_FAILED) {
-    munmap(cam.data, cam.size);
-  }
-  if (cam.fd >= 0) {
-    close(cam.fd);
-  }
+  for (int i = 0; i < 2; ++i) {
+    // 1. Clean up Camera/Input Resources
+    if (videos[i].data && videos[i].data != MAP_FAILED) {
+      munmap(videos[i].data, videos[i].size);
+    }
+    if (videos[i].fd >= 0) {
+      close(videos[i].fd);
+    }
 
-  // Clean up textures (if GL context is still alive)
-  if (cam.tex_y)
-    glDeleteTextures(1, &cam.tex_y);
-  if (cam.tex_uv)
-    glDeleteTextures(1, &cam.tex_uv);
+    // Clean up textures (if GL context is still alive)
+    if (videos[i].tex_y)
+      glDeleteTextures(1, &videos[i].tex_y);
+    if (videos[i].tex_uv)
+      glDeleteTextures(1, &videos[i].tex_uv);
+  }
 
   // 2. Clean up KMS/GBM Resources (Current Frame)
   if (kms.curr_bo) {
@@ -328,7 +327,10 @@ int main() {
 
   if (init_kms() != 0)
     return 1;
-  if (init_raw_input() != 0)
+
+  if (init_video_source(&videos[0], RAW_FILE_1) != 0)
+    return 1;
+  if (init_video_source(&videos[1], RAW_FILE_2) != 0)
     return 1;
 
   // Compile Shaders
@@ -348,11 +350,28 @@ int main() {
   glUniform1i(glGetUniformLocation(p, "tex_y"), 0);
   glUniform1i(glGetUniformLocation(p, "tex_uv"), 1);
 
-  GLfloat verts[] = {-1, 1, 0, 0, -1, -1, 0, 1, 1, 1, 1, 0, 1, -1, 1, 1};
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts);
-  glEnableVertexAttribArray(1);
-  glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts + 2);
+  // GLfloat verts[] = {-1, 1, 0, 0, -1, -1, 0, 1, 1, 1, 1, 0, 1, -1, 1, 1};
+  // glEnableVertexAttribArray(0);
+  // glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts);
+  // glEnableVertexAttribArray(1);
+  // glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts + 2);
+
+  // Quad 1: LEFT Screen (-1.0 to 0.0)
+  // Format: X, Y, U, V
+  GLfloat verts_left[] = {
+      -1.0f, 1.0f,  0.0f, 0.0f, // Top Left
+      -1.0f, -1.0f, 0.0f, 1.0f, // Bottom Left
+      0.0f,  1.0f,  1.0f, 0.0f, // Top Right (Middle of screen)
+      0.0f,  -1.0f, 1.0f, 1.0f  // Bottom Right (Middle of screen)
+  };
+
+  // Quad 2: RIGHT Screen (0.0 to 1.0)
+  GLfloat verts_right[] = {
+      0.0f, 1.0f,  0.0f, 0.0f, // Top Left (Middle of screen)
+      0.0f, -1.0f, 0.0f, 1.0f, // Bottom Left (Middle of screen)
+      1.0f, 1.0f,  1.0f, 0.0f, // Top Right
+      1.0f, -1.0f, 1.0f, 1.0f  // Bottom Right
+  };
 
   drmEventContext ev = {0};
   ev.version = 2;
@@ -373,10 +392,27 @@ int main() {
     if (!running)
       break;
 
-    update_texture(); // Load next frame from RAM to GPU
+    // 1. Draw Left Video
+    update_texture(&videos[0]); // Upload texture 0
+    // Bind Vertices for Left Quad
+    glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts_left);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts_left + 2);
+    glEnableVertexAttribArray(1);
+    // Draw
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    swap_buffers();
 
+    // 2. Draw Right Video
+    update_texture(&videos[1]); // Upload texture 1 (binds to same texture units 0/1, but different GL IDs)
+    // Bind Vertices for Right Quad
+    glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts_right);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts_right + 2);
+    glEnableVertexAttribArray(1);
+    // Draw
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    swap_buffers();
     // Simple FPS cap (usleep is not precise but fine for testing)
     usleep(16000);
   }
