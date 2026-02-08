@@ -18,7 +18,7 @@
 
 // --- CONFIG ---
 #define RAW_FILE_1 "videos/test_1080p.yuv"
-#define RAW_FILE_2 "videos/test_1080p.yuv"
+#define RAW_FILE_2 "videos/test_480p.yuv"
 #define VID_W 1920
 #define VID_H 1080
 #define FPS 60
@@ -48,6 +48,8 @@ typedef struct {
   int curr_frame_idx;
   GLuint tex_y;
   GLuint tex_uv;
+  int width;
+  int height;
 } VideoSource;
 
 VideoSource videos[2];
@@ -186,7 +188,7 @@ int init_kms() {
   return 0;
 }
 
-int init_video_source(VideoSource *v, const char *filename) {
+int init_video_source(VideoSource *v, const char *filename, int width, int height) {
   v->filename = filename;
   v->fd = open(filename, O_RDONLY);
   if (v->fd < 0) {
@@ -197,9 +199,11 @@ int init_video_source(VideoSource *v, const char *filename) {
   struct stat sb;
   fstat(v->fd, &sb);
   v->size = sb.st_size;
-  v->frame_size = VID_W * VID_H * 3 / 2; // NV12
+  v->frame_size = width * height * 3 / 2; // NV12
   v->total_frames = v->size / v->frame_size;
   v->curr_frame_idx = 0;
+  v->width = width;
+  v->height = height;
 
   v->data = mmap(NULL, v->size, PROT_READ, MAP_PRIVATE, v->fd, 0);
   if (v->data == MAP_FAILED)
@@ -227,16 +231,16 @@ int init_video_source(VideoSource *v, const char *filename) {
 
 void update_texture(VideoSource *v) {
   unsigned char *frame_start = v->data + (v->curr_frame_idx * v->frame_size);
-  unsigned char *uv_start = frame_start + (VID_W * VID_H);
+  unsigned char *uv_start = frame_start + (v->width * v->height);
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, v->tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0, GL_LUMINANCE,
                GL_UNSIGNED_BYTE, frame_start);
 
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, v->tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2, v->height / 2, 0,
                GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
 
   v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
@@ -328,9 +332,9 @@ int main() {
   if (init_kms() != 0)
     return 1;
 
-  if (init_video_source(&videos[0], RAW_FILE_1) != 0)
+  if (init_video_source(&videos[0], RAW_FILE_1, 1920, 1080) != 0)
     return 1;
-  if (init_video_source(&videos[1], RAW_FILE_2) != 0)
+  if (init_video_source(&videos[1], RAW_FILE_2, 640, 480) != 0)
     return 1;
 
   // Compile Shaders
