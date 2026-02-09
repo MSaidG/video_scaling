@@ -17,11 +17,15 @@
 #include <xf86drmMode.h>
 
 // --- CONFIG ---
+#define VIDEO_COUNT 4
 #define RAW_FILE_1 "videos/test_1080p.yuv"
 #define RAW_FILE_2 "videos/test_480p.yuv"
+#define RAW_FILE_3 "videos/snow_nv12_720p30.yuv"
+#define RAW_FILE_4 "videos/circular_nv12_600x600p30.yuv"
+
 #define VID_W 1920
 #define VID_H 1080
-#define FPS 60
+// #define FPS 60
 
 // --- GLOBALS ---
 struct {
@@ -52,7 +56,7 @@ typedef struct {
   int height;
 } VideoSource;
 
-VideoSource videos[2];
+VideoSource videos[VIDEO_COUNT];
 
 volatile sig_atomic_t running = 1;
 int waiting_for_flip = 0;
@@ -74,10 +78,11 @@ const char *vs_src = "attribute vec4 pos;\n"
 const char *fs_src = "precision mediump float;\n"
                      "varying vec2 v_tex;\n"
                      "varying float v_vid;\n"
-                     "uniform sampler2D tex_y_1;\n"
-                     "uniform sampler2D tex_uv_1;\n"
-                     "uniform sampler2D tex_y_2;\n"
-                     "uniform sampler2D tex_uv_2;\n"
+                     // 8 Samplers (4 Videos x 2 Planes)
+                     "uniform sampler2D ty0; uniform sampler2D tu0;\n"
+                     "uniform sampler2D ty1; uniform sampler2D tu1;\n"
+                     "uniform sampler2D ty2; uniform sampler2D tu2;\n"
+                     "uniform sampler2D ty3; uniform sampler2D tu3;\n"
 
                      "vec3 yuv2rgb(float y, float u, float v) {\n"
                      "  float r = y + 1.402 * v;\n"
@@ -88,16 +93,22 @@ const char *fs_src = "precision mediump float;\n"
 
                      "void main() {\n"
                      "  float y, u, v;\n"
-                     "  if (v_vid < 0.5) {\n"
-                     "    y = texture2D(tex_y_1, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tex_uv_1, v_tex);\n"
-                     "    u = uv.r - 0.5;\n"
-                     "    v = uv.a - 0.5;\n"
-                     "  } else {\n"
-                     "    y = texture2D(tex_y_2, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tex_uv_2, v_tex);\n"
-                     "    u = uv.r - 0.5;\n"
-                     "    v = uv.a - 0.5;\n"
+                     "  if (v_vid < 0.5) {\n" // Video 0
+                     "    y = texture2D(ty0, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu0, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  } else if (v_vid < 1.5) {\n" // Video 1
+                     "    y = texture2D(ty1, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu1, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  } else if (v_vid < 2.5) {\n" // Video 2
+                     "    y = texture2D(ty2, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu2, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  } else {\n" // Video 3
+                     "    y = texture2D(ty3, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu3, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
                      "  }\n"
                      "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
                      "}\n";
@@ -288,7 +299,7 @@ void swap_buffers() {
 void cleanup() {
   printf("Cleaning up resources...\n");
 
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < VIDEO_COUNT; ++i) {
     // 1. Clean up Camera/Input Resources
     if (videos[i].data && videos[i].data != MAP_FAILED) {
       munmap(videos[i].data, videos[i].size);
@@ -342,19 +353,19 @@ void cleanup() {
 }
 
 // Uploads data to GPU, but does NOT draw.
-void upload_video_frame(VideoSource *v, int tex_unit_y, int tex_unit_uv) {
+void upload_video_frame(VideoSource *v, int base_unit) {
   unsigned char *f = v->data + (v->curr_frame_idx * v->frame_size);
-  unsigned char *uv = f + (v->width * v->height);
 
-  glActiveTexture(GL_TEXTURE0 + tex_unit_y);
+  glActiveTexture(GL_TEXTURE0 + base_unit);
   glBindTexture(GL_TEXTURE_2D, v->tex_y);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0,
                GL_LUMINANCE, GL_UNSIGNED_BYTE, f);
 
-  glActiveTexture(GL_TEXTURE0 + tex_unit_uv);
+  glActiveTexture(GL_TEXTURE0 + base_unit + 1);
   glBindTexture(GL_TEXTURE_2D, v->tex_uv);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2,
-               v->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv);
+               v->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+               f + (v->width * v->height));
 
   v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
 }
@@ -392,6 +403,10 @@ int main() {
     return 1;
   if (init_video_source(&videos[1], RAW_FILE_2, 640, 480) != 0)
     return 1;
+  if (init_video_source(&videos[2], RAW_FILE_3, 1280, 720) != 0)
+    return 1;
+  if (init_video_source(&videos[3], RAW_FILE_4, 600, 600) != 0)
+    return 1;
 
   // Compile Shaders
   GLuint p = glCreateProgram();
@@ -414,35 +429,38 @@ int main() {
 
   glUseProgram(p);
 
-  glUniform1i(glGetUniformLocation(p, "tex_y_1"), 0);
-  glUniform1i(glGetUniformLocation(p, "tex_uv_1"), 1);
-  glUniform1i(glGetUniformLocation(p, "tex_y_2"), 2);
-  glUniform1i(glGetUniformLocation(p, "tex_uv_2"), 3);
+  glUniform1i(glGetUniformLocation(p, "ty0"), 0);
+  glUniform1i(glGetUniformLocation(p, "tu0"), 1);
+  glUniform1i(glGetUniformLocation(p, "ty1"), 2);
+  glUniform1i(glGetUniformLocation(p, "tu1"), 3);
+  glUniform1i(glGetUniformLocation(p, "ty2"), 4);
+  glUniform1i(glGetUniformLocation(p, "tu2"), 5);
+  glUniform1i(glGetUniformLocation(p, "ty3"), 6);
+  glUniform1i(glGetUniformLocation(p, "tu3"), 7);
 
-  // --- BATCHED GEOMETRY (One Array) ---
-  // Format: X, Y, U, V, VID_ID
-  // We use GL_TRIANGLES (6 vertices per quad) to avoid degenerate triangles
+  // --- 2x2 GRID GEOMETRY ---
+  // Each quad is 2 triangles (6 verts). Total 4 quads = 24 verts.
+  // Format: X, Y, U, V, ID
   GLfloat batch_verts[] = {
-      // --- LEFT QUAD (Video ID 0) ---
-      // Triangle 1
-      -1.0f, 1.0f, 0.0f, 0.0f, 0.0f,  // TL
-      -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, // BL
-      0.0f, 1.0f, 1.0f, 0.0f, 0.0f,   // TR
-                                      // Triangle 2
-      0.0f, 1.0f, 1.0f, 0.0f, 0.0f,   // TR
-      -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, // BL
-      0.0f, -1.0f, 1.0f, 1.0f, 0.0f,  // BR
+      // --- TL (ID 0) [-1, 0] [0, 1] ---
+      -1.0f, 1.0f, 0.0f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f,
+      1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f,
+      0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f,
 
-      // --- RIGHT QUAD (Video ID 1) ---
-      // Triangle 1
-      0.0f, 1.0f, 0.0f, 0.0f, 1.0f,  // TL
-      0.0f, -1.0f, 0.0f, 1.0f, 1.0f, // BL
-      1.0f, 1.0f, 1.0f, 0.0f, 1.0f,  // TR
-                                     // Triangle 2
-      1.0f, 1.0f, 1.0f, 0.0f, 1.0f,  // TR
-      0.0f, -1.0f, 0.0f, 1.0f, 1.0f, // BL
-      1.0f, -1.0f, 1.0f, 1.0f, 1.0f  // BR
-  };
+      // --- TR (ID 1) [0, 1] [0, 1] ---
+      0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+      1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+      1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f,
+
+      // --- BL (ID 2) [-1, 0] [-1, 0] ---
+      -1.0f, 0.0f, 0.0f, 0.0f, 2.0f, -1.0f, -1.0f, 0.0f, 1.0f, 2.0f, 0.0f, 0.0f,
+      1.0f, 0.0f, 2.0f, 0.0f, 0.0f, 1.0f, 0.0f, 2.0f, -1.0f, -1.0f, 0.0f, 1.0f,
+      2.0f, 0.0f, -1.0f, 1.0f, 1.0f, 2.0f,
+
+      // --- BR (ID 3) [0, 1] [-1, 0] ---
+      0.0f, 0.0f, 0.0f, 0.0f, 3.0f, 0.0f, -1.0f, 0.0f, 1.0f, 3.0f, 1.0f, 0.0f,
+      1.0f, 0.0f, 3.0f, 1.0f, 0.0f, 1.0f, 0.0f, 3.0f, 0.0f, -1.0f, 0.0f, 1.0f,
+      3.0f, 1.0f, -1.0f, 1.0f, 1.0f, 3.0f};
 
   glEnableVertexAttribArray(0); // Pos
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, batch_verts);
@@ -472,10 +490,12 @@ int main() {
     if (!running)
       break;
 
-    upload_video_frame(&videos[0], 0, 1);
-    upload_video_frame(&videos[1], 2, 3);
+    upload_video_frame(&videos[0], 0);
+    upload_video_frame(&videos[1], 2);
+    upload_video_frame(&videos[2], 4);
+    upload_video_frame(&videos[3], 6);
 
-    glDrawArrays(GL_TRIANGLES, 0, 12);
+    glDrawArrays(GL_TRIANGLES, 0, 24);
     swap_buffers();
 
     usleep(16000);
