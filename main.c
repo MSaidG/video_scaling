@@ -60,34 +60,47 @@ int waiting_for_flip = 0;
 // --- UTILS ---
 void handle_signal(int s) { running = 0; }
 
-// --- SHADERS (NV12 -> RGB Conversion) ---
-// NV12 has Y plane (full res) and UV plane (half res interleaved)
-const char *vs_src =
-    "attribute vec4 pos; attribute vec2 tex; varying vec2 v_tex; "
-    "void main() { gl_Position = pos; v_tex = tex; }";
+const char *vs_src = "attribute vec4 pos;\n"
+                     "attribute vec2 tex;\n"
+                     "attribute float a_vid;\n"
+                     "varying vec2 v_tex;\n"
+                     "varying float v_vid;\n"
+                     "void main() {\n"
+                     "  gl_Position = pos;\n"
+                     "  v_tex = tex;\n"
+                     "  v_vid = a_vid;\n"
+                     "}\n";
 
-const char *fs_src =
-    "precision mediump float;"
-    "varying vec2 v_tex;"
-    "uniform sampler2D tex_y;"
-    "uniform sampler2D tex_uv;"
-    "void main() {"
-    "  float y = texture2D(tex_y, v_tex).r;"
-    "  // UV texture is half size, but GL handles coordinates automatically \n"
-    "  // We read RG from the texture because UV are interleaved bytes \n"
-    "  // NV12: U is in 'r' (or 'a' depending on GL format), V is in 'g' (or "
-    "'l') \n"
-    "  // Standard luminance conversion: \n"
-    "  vec4 uv_raw = texture2D(tex_uv, v_tex);"
-    "  float u = uv_raw.r - 0.5;"
-    "  float v = uv_raw.a - 0.5;" // Usually stored as Luminance Alpha (L=U,
-                                  // A=V) or RG
+const char *fs_src = "precision mediump float;\n"
+                     "varying vec2 v_tex;\n"
+                     "varying float v_vid;\n"
+                     "uniform sampler2D tex_y_1;\n"
+                     "uniform sampler2D tex_uv_1;\n"
+                     "uniform sampler2D tex_y_2;\n"
+                     "uniform sampler2D tex_uv_2;\n"
 
-    "  float r = y + 1.402 * v;"
-    "  float g = y - 0.344 * u - 0.714 * v;"
-    "  float b = y + 1.772 * u;"
-    "  gl_FragColor = vec4(r, g, b, 1.0);"
-    "}";
+                     "vec3 yuv2rgb(float y, float u, float v) {\n"
+                     "  float r = y + 1.402 * v;\n"
+                     "  float g = y - 0.344 * u - 0.714 * v;\n"
+                     "  float b = y + 1.772 * u;\n"
+                     "  return vec3(r, g, b);\n"
+                     "}\n"
+
+                     "void main() {\n"
+                     "  float y, u, v;\n"
+                     "  if (v_vid < 0.5) {\n"
+                     "    y = texture2D(tex_y_1, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tex_uv_1, v_tex);\n"
+                     "    u = uv.r - 0.5;\n"
+                     "    v = uv.a - 0.5;\n"
+                     "  } else {\n"
+                     "    y = texture2D(tex_y_2, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tex_uv_2, v_tex);\n"
+                     "    u = uv.r - 0.5;\n"
+                     "    v = uv.a - 0.5;\n"
+                     "  }\n"
+                     "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
+                     "}\n";
 
 int init_kms() {
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -188,7 +201,8 @@ int init_kms() {
   return 0;
 }
 
-int init_video_source(VideoSource *v, const char *filename, int width, int height) {
+int init_video_source(VideoSource *v, const char *filename, int width,
+                      int height) {
   v->filename = filename;
   v->fd = open(filename, O_RDONLY);
   if (v->fd < 0) {
@@ -235,13 +249,14 @@ void update_texture(VideoSource *v) {
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, v->tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0, GL_LUMINANCE,
-               GL_UNSIGNED_BYTE, frame_start);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0,
+               GL_LUMINANCE, GL_UNSIGNED_BYTE, frame_start);
 
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, v->tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2, v->height / 2, 0,
-               GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2,
+               v->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+               uv_start);
 
   v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
 }
@@ -326,6 +341,47 @@ void cleanup() {
   printf("Cleanup Done.\n");
 }
 
+// Uploads data to GPU, but does NOT draw.
+void upload_video_frame(VideoSource *v, int tex_unit_y, int tex_unit_uv) {
+  unsigned char *f = v->data + (v->curr_frame_idx * v->frame_size);
+  unsigned char *uv = f + (v->width * v->height);
+
+  glActiveTexture(GL_TEXTURE0 + tex_unit_y);
+  glBindTexture(GL_TEXTURE_2D, v->tex_y);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0,
+               GL_LUMINANCE, GL_UNSIGNED_BYTE, f);
+
+  glActiveTexture(GL_TEXTURE0 + tex_unit_uv);
+  glBindTexture(GL_TEXTURE_2D, v->tex_uv);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2,
+               v->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv);
+
+  v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
+}
+
+// --- DEBUG HELPER ---
+void check_shader(GLuint shader, const char *name) {
+  GLint success;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+  if (!success) {
+    char infoLog[512];
+    glGetShaderInfoLog(shader, 512, NULL, infoLog);
+    fprintf(stderr, "ERROR::%s::COMPILATION_FAILED\n%s\n", name, infoLog);
+    exit(1);
+  }
+}
+
+void check_program(GLuint program) {
+  GLint success;
+  glGetProgramiv(program, GL_LINK_STATUS, &success);
+  if (!success) {
+    char infoLog[512];
+    glGetProgramInfoLog(program, 512, NULL, infoLog);
+    fprintf(stderr, "ERROR::PROGRAM::LINKING_FAILED\n%s\n", infoLog);
+    exit(1);
+  }
+}
+
 int main() {
   signal(SIGINT, handle_signal);
 
@@ -339,43 +395,63 @@ int main() {
 
   // Compile Shaders
   GLuint p = glCreateProgram();
+
   GLuint v = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(v, 1, &vs_src, 0);
   glCompileShader(v);
+  check_shader(v, "Vertex"); // CHECK ERRORS
+
   GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
   glShaderSource(f, 1, &fs_src, 0);
   glCompileShader(f);
+  check_shader(f, "Fragment"); // CHECK ERRORS
+
   glAttachShader(p, v);
   glAttachShader(p, f);
+
   glLinkProgram(p);
+  check_program(p);
+
   glUseProgram(p);
 
-  // Set Uniforms (Texture Units 0 and 1)
-  glUniform1i(glGetUniformLocation(p, "tex_y"), 0);
-  glUniform1i(glGetUniformLocation(p, "tex_uv"), 1);
+  glUniform1i(glGetUniformLocation(p, "tex_y_1"), 0);
+  glUniform1i(glGetUniformLocation(p, "tex_uv_1"), 1);
+  glUniform1i(glGetUniformLocation(p, "tex_y_2"), 2);
+  glUniform1i(glGetUniformLocation(p, "tex_uv_2"), 3);
 
-  // GLfloat verts[] = {-1, 1, 0, 0, -1, -1, 0, 1, 1, 1, 1, 0, 1, -1, 1, 1};
-  // glEnableVertexAttribArray(0);
-  // glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts);
-  // glEnableVertexAttribArray(1);
-  // glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts + 2);
+  // --- BATCHED GEOMETRY (One Array) ---
+  // Format: X, Y, U, V, VID_ID
+  // We use GL_TRIANGLES (6 vertices per quad) to avoid degenerate triangles
+  GLfloat batch_verts[] = {
+      // --- LEFT QUAD (Video ID 0) ---
+      // Triangle 1
+      -1.0f, 1.0f, 0.0f, 0.0f, 0.0f,  // TL
+      -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, // BL
+      0.0f, 1.0f, 1.0f, 0.0f, 0.0f,   // TR
+                                      // Triangle 2
+      0.0f, 1.0f, 1.0f, 0.0f, 0.0f,   // TR
+      -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, // BL
+      0.0f, -1.0f, 1.0f, 1.0f, 0.0f,  // BR
 
-  // Quad 1: LEFT Screen (-1.0 to 0.0)
-  // Format: X, Y, U, V
-  GLfloat verts_left[] = {
-      -1.0f, 1.0f,  0.0f, 0.0f, // Top Left
-      -1.0f, -1.0f, 0.0f, 1.0f, // Bottom Left
-      0.0f,  1.0f,  1.0f, 0.0f, // Top Right (Middle of screen)
-      0.0f,  -1.0f, 1.0f, 1.0f  // Bottom Right (Middle of screen)
+      // --- RIGHT QUAD (Video ID 1) ---
+      // Triangle 1
+      0.0f, 1.0f, 0.0f, 0.0f, 1.0f,  // TL
+      0.0f, -1.0f, 0.0f, 1.0f, 1.0f, // BL
+      1.0f, 1.0f, 1.0f, 0.0f, 1.0f,  // TR
+                                     // Triangle 2
+      1.0f, 1.0f, 1.0f, 0.0f, 1.0f,  // TR
+      0.0f, -1.0f, 0.0f, 1.0f, 1.0f, // BL
+      1.0f, -1.0f, 1.0f, 1.0f, 1.0f  // BR
   };
 
-  // Quad 2: RIGHT Screen (0.0 to 1.0)
-  GLfloat verts_right[] = {
-      0.0f, 1.0f,  0.0f, 0.0f, // Top Left (Middle of screen)
-      0.0f, -1.0f, 0.0f, 1.0f, // Bottom Left (Middle of screen)
-      1.0f, 1.0f,  1.0f, 0.0f, // Top Right
-      1.0f, -1.0f, 1.0f, 1.0f  // Bottom Right
-  };
+  glEnableVertexAttribArray(0); // Pos
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, batch_verts);
+  glEnableVertexAttribArray(1); // Tex
+  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20,
+                        batch_verts + 2); // Offset 2 floats
+  glEnableVertexAttribArray(2);           // Video ID
+  glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 20,
+                        batch_verts + 4); // Offset 4 floats
 
   drmEventContext ev = {0};
   ev.version = 2;
@@ -396,28 +472,12 @@ int main() {
     if (!running)
       break;
 
-    // 1. Draw Left Video
-    update_texture(&videos[0]); // Upload texture 0
-    // Bind Vertices for Left Quad
-    glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts_left);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts_left + 2);
-    glEnableVertexAttribArray(1);
-    // Draw
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    upload_video_frame(&videos[0], 0, 1);
+    upload_video_frame(&videos[1], 2, 3);
 
-    // 2. Draw Right Video
-    update_texture(&videos[1]); // Upload texture 1 (binds to same texture units 0/1, but different GL IDs)
-    // Bind Vertices for Right Quad
-    glVertexAttribPointer(0, 2, GL_FLOAT, 0, 16, verts_right);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 2, GL_FLOAT, 0, 16, verts_right + 2);
-    glEnableVertexAttribArray(1);
-    // Draw
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
+    glDrawArrays(GL_TRIANGLES, 0, 12);
     swap_buffers();
-    // Simple FPS cap (usleep is not precise but fine for testing)
+
     usleep(16000);
   }
 
