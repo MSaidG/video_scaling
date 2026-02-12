@@ -16,6 +16,9 @@
 #include <gbm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <linux/time.h>
+#include <asm-generic/fcntl.h>
+#include <sys/select.h>
 
 struct {
   int fd;
