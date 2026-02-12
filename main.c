@@ -18,10 +18,10 @@
 
 // --- CONFIG ---
 #define VIDEO_COUNT 4
-#define RAW_FILE_1 "videos/test_1080p.yuv"
-#define RAW_FILE_2 "videos/test_480p.yuv"
-#define RAW_FILE_3 "videos/snow_nv12_720p30.yuv"
-#define RAW_FILE_4 "videos/circular_nv12_600x600p30.yuv"
+#define RAW_FILE_1 "videos/smpte_nv12_1080p60.yuv"
+#define RAW_FILE_2 "videos/smpte_nv12_480p30.yuv"
+#define RAW_FILE_3 "videos/smpte_nv12_720p30.yuv"
+#define RAW_FILE_4 "videos/smpte_nv12_600x600p30.yuv"
 
 #define VID_W 1920
 #define VID_H 1080
@@ -239,7 +239,6 @@ int init_video_source(VideoSource *v, const char *filename, int width,
   glBindTexture(GL_TEXTURE_2D, v->tex_y);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  // Important: Clamp to edge prevents artifacts at split screen border
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
