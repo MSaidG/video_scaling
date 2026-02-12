@@ -321,7 +321,7 @@ void swap_buffers_kms() {
 
   if (kms.current_bo) {
     gbm_surface_release_buffer(kms.gbm_surf, kms.current_bo);
-    drmModeCloseFB(kms.fd, kms.current_fb_id);
+    drmModeRmFB(kms.fd, kms.current_fb_id);
   }
 
   kms.current_bo = next_bo;
