@@ -1,12 +1,13 @@
-#include <time.h>
-#include <sys/time.h>
 #include <fcntl.h>
+#include <ncurses.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -30,8 +31,7 @@
 // #define FPS 60
 
 // --- GLOBALS ---
-struct
-{
+struct {
   int fd;
   drmModeConnector *conn;
   drmModeModeInfo mode;
@@ -45,8 +45,7 @@ struct
   EGLSurface egl_surf;
 } kms;
 
-typedef struct
-{
+typedef struct {
   const char *filename;
   int fd;
   unsigned char *data; // Memory mapped file
@@ -64,6 +63,15 @@ VideoSource videos[VIDEO_COUNT];
 
 volatile sig_atomic_t running = 1;
 int waiting_for_flip = 0;
+
+// --- LAYOUT STATE MANAGEMENT ---
+// Maps Screen Position [0..3] -> Video Source Index [0..3]
+// 0: TL, 1: TR, 2: BL, 3: BR
+volatile int layout[4] = {0, 1, 2, 3}; 
+
+// State for the Input Machine
+volatile int selected_slot = -1; // -1 means nothing selected
+volatile int in_change_mode = 0; // 0 = false, 1 = true
 
 // --- UTILS ---
 void handle_signal(int s) { running = 0; }
@@ -117,8 +125,7 @@ const char *fs_src = "precision mediump float;\n"
                      "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
                      "}\n";
 
-int init_kms()
-{
+int init_kms() {
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
@@ -130,22 +137,17 @@ int init_kms()
     return -1;
 
   // Find a connected connector
-  for (int i = 0; i < res->count_connectors; i++)
-  {
+  for (int i = 0; i < res->count_connectors; i++) {
     drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
-    if (c->connection == DRM_MODE_CONNECTED)
-    {
+    if (c->connection == DRM_MODE_CONNECTED) {
       kms.conn = c;
       break;
     }
     drmModeFreeConnector(c);
   }
-
-  // We are done with resources, free it NOW to prevent leaks
   drmModeFreeResources(res);
 
-  if (!kms.conn)
-  {
+  if (!kms.conn) {
     fprintf(stderr, "No monitor found\n");
     return -1;
   }
@@ -153,21 +155,16 @@ int init_kms()
 
   // Find Encoder & CRTC
   drmModeEncoder *enc = NULL;
-  if (kms.conn->encoder_id)
-  {
+  if (kms.conn->encoder_id) {
     enc = drmModeGetEncoder(kms.fd, kms.conn->encoder_id);
   }
 
-  if (enc && enc->crtc_id)
-  {
+  if (enc && enc->crtc_id) {
     kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-  }
-  else
-  {
+  } else {
     // Re-fetch resources just for CRTC fallback (rare case)
     res = drmModeGetResources(kms.fd);
-    if (res && res->count_crtcs > 0)
-    {
+    if (res && res->count_crtcs > 0) {
       kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
     }
     if (res)
@@ -201,12 +198,10 @@ int init_kms()
   eglGetConfigs(kms.egl_disp, configs, num_configs, &num_configs);
 
   int found_config = 0;
-  for (int i = 0; i < num_configs; i++)
-  {
+  for (int i = 0; i < num_configs; i++) {
     EGLint id;
     eglGetConfigAttrib(kms.egl_disp, configs[i], EGL_NATIVE_VISUAL_ID, &id);
-    if (id == gbm_format)
-    {
+    if (id == gbm_format) {
       config = configs[i];
       found_config = 1;
       break;
@@ -228,12 +223,10 @@ int init_kms()
 }
 
 int init_video_source(VideoSource *v, const char *filename, int width,
-                      int height)
-{
+                      int height) {
   v->filename = filename;
   v->fd = open(filename, O_RDONLY);
-  if (v->fd < 0)
-  {
+  if (v->fd < 0) {
     fprintf(stderr, "Failed to open %s\n", filename);
     return -1;
   }
@@ -270,8 +263,7 @@ int init_video_source(VideoSource *v, const char *filename, int width,
   return 0;
 }
 
-void update_texture(VideoSource *v)
-{
+void update_texture(VideoSource *v) {
   unsigned char *frame_start = v->data + (v->curr_frame_idx * v->frame_size);
   unsigned char *uv_start = frame_start + (v->width * v->height);
 
@@ -289,13 +281,11 @@ void update_texture(VideoSource *v)
   v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
 }
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
-                              unsigned int usec, void *data)
-{
+                              unsigned int usec, void *data) {
   *(int *)data = 0;
 }
 
-void swap_buffers()
-{
+void swap_buffers() {
   eglSwapBuffers(kms.egl_disp, kms.egl_surf);
   struct gbm_bo *bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
   uint32_t handle = gbm_bo_get_handle(bo).u32;
@@ -307,8 +297,7 @@ void swap_buffers()
                   &waiting_for_flip);
   waiting_for_flip = 1;
 
-  if (kms.curr_bo)
-  {
+  if (kms.curr_bo) {
     gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
     drmModeRmFB(kms.fd, kms.curr_fb);
   }
@@ -316,19 +305,15 @@ void swap_buffers()
   kms.curr_fb = fb;
 }
 
-void cleanup()
-{
+void cleanup() {
   printf("Cleaning up resources...\n");
 
-  for (int i = 0; i < VIDEO_COUNT; ++i)
-  {
+  for (int i = 0; i < VIDEO_COUNT; ++i) {
     // 1. Clean up Camera/Input Resources
-    if (videos[i].data && videos[i].data != MAP_FAILED)
-    {
+    if (videos[i].data && videos[i].data != MAP_FAILED) {
       munmap(videos[i].data, videos[i].size);
     }
-    if (videos[i].fd >= 0)
-    {
+    if (videos[i].fd >= 0) {
       close(videos[i].fd);
     }
 
@@ -340,16 +325,14 @@ void cleanup()
   }
 
   // 2. Clean up KMS/GBM Resources (Current Frame)
-  if (kms.curr_bo)
-  {
+  if (kms.curr_bo) {
     gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
     drmModeRmFB(kms.fd, kms.curr_fb);
     kms.curr_bo = NULL;
   }
 
   // 3. Clean up EGL
-  if (kms.egl_disp != EGL_NO_DISPLAY)
-  {
+  if (kms.egl_disp != EGL_NO_DISPLAY) {
     eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    EGL_NO_CONTEXT);
     if (kms.egl_surf != EGL_NO_SURFACE)
@@ -371,8 +354,7 @@ void cleanup()
   if (kms.conn)
     drmModeFreeConnector(kms.conn);
 
-  if (kms.fd >= 0)
-  {
+  if (kms.fd >= 0) {
     close(kms.fd);
   }
 
@@ -380,8 +362,7 @@ void cleanup()
 }
 
 // Uploads data to GPU, but does NOT draw.
-void upload_video_frame(VideoSource *v, int base_unit)
-{
+void upload_video_frame(VideoSource *v, int base_unit) {
   unsigned char *f = v->data + (v->curr_frame_idx * v->frame_size);
 
   glActiveTexture(GL_TEXTURE0 + base_unit);
@@ -399,12 +380,10 @@ void upload_video_frame(VideoSource *v, int base_unit)
 }
 
 // --- DEBUG HELPER ---
-void check_shader(GLuint shader, const char *name)
-{
+void check_shader(GLuint shader, const char *name) {
   GLint success;
   glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-  if (!success)
-  {
+  if (!success) {
     char infoLog[512];
     glGetShaderInfoLog(shader, 512, NULL, infoLog);
     fprintf(stderr, "ERROR::%s::COMPILATION_FAILED\n%s\n", name, infoLog);
@@ -412,12 +391,10 @@ void check_shader(GLuint shader, const char *name)
   }
 }
 
-void check_program(GLuint program)
-{
+void check_program(GLuint program) {
   GLint success;
   glGetProgramiv(program, GL_LINK_STATUS, &success);
-  if (!success)
-  {
+  if (!success) {
     char infoLog[512];
     glGetProgramInfoLog(program, 512, NULL, infoLog);
     fprintf(stderr, "ERROR::PROGRAM::LINKING_FAILED\n%s\n", infoLog);
@@ -426,16 +403,39 @@ void check_program(GLuint program)
 }
 
 // Returns current time in milliseconds
-long long current_timestamp()
-{
+long long current_timestamp() {
   struct timeval te;
   gettimeofday(&te, NULL); // get current time
   long long milliseconds = te.tv_sec * 1000LL + te.tv_usec / 1000;
   return milliseconds;
 }
 
-int main()
-{
+void exit_program(int id) { running = false; }
+
+// Separate thread for ncurses input
+void *input_thread(void *arg) {
+  initscr();
+  cbreak();
+  noecho();
+  nodelay(stdscr, TRUE);
+  keypad(stdscr, TRUE); // Enable function keys, arrows
+
+  while (running) {
+    int ch = getch();
+    if (ch != ERR) {
+      switch (ch) {
+      case 'q':
+        exit_program(1);
+        break;
+      }
+    }
+    usleep(10000); // 10ms poll interval
+  }
+  // endwin();
+  return NULL;
+}
+
+int main() {
   signal(SIGINT, handle_signal);
 
   if (init_kms() != 0)
@@ -522,12 +522,15 @@ int main()
   long long last_time = current_timestamp();
   int frame_count = 0;
 
+  // --- INPUT THREAD ---
+  pthread_t tid;
+  pthread_create(&tid, NULL, input_thread, NULL);
+  signal(SIGINT, handle_signal);
+
   printf("Simulating Camera Feed (%dx%d NV12)...\n", VID_W, VID_H);
 
-  while (running)
-  {
-    while (waiting_for_flip)
-    {
+  while (running) {
+    while (waiting_for_flip) {
       if (!running)
         break;
       FD_ZERO(&fds);
@@ -549,8 +552,7 @@ int main()
     // --- FPS CALCULATION ---
     frame_count++;
     long long current_time = current_timestamp();
-    if (current_time - last_time >= 1000)
-    { // If 1 second has passed
+    if (current_time - last_time >= 1000) { // If 1 second has passed
       printf("FPS: %d\n", frame_count);
       frame_count = 0;
       last_time = current_time;
@@ -559,5 +561,9 @@ int main()
 
   glDeleteProgram(p);
   cleanup();
+
+  pthread_join(tid, NULL);
+  endwin();
+  delwin(stdscr);
   return 0;
 }

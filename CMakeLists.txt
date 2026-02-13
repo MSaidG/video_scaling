@@ -20,4 +20,6 @@ target_link_libraries(video_scaling PRIVATE
     PkgConfig::DRM
     PkgConfig::GBM
     m
+    ncurses
+    pthread
 )
