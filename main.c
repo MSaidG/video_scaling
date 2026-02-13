@@ -67,7 +67,7 @@ int waiting_for_flip = 0;
 // --- LAYOUT STATE MANAGEMENT ---
 // Maps Screen Position [0..3] -> Video Source Index [0..3]
 // 0: TL, 1: TR, 2: BL, 3: BR
-volatile int layout[4] = {0, 1, 2, 3}; 
+volatile int layout[4] = {0, 1, 2, 3};
 
 // State for the Input Machine
 volatile int selected_slot = -1; // -1 means nothing selected
@@ -412,26 +412,72 @@ long long current_timestamp() {
 
 void exit_program(int id) { running = false; }
 
-// Separate thread for ncurses input
+// --- INPUT LOGIC ---
 void *input_thread(void *arg) {
   initscr();
   cbreak();
   noecho();
   nodelay(stdscr, TRUE);
-  keypad(stdscr, TRUE); // Enable function keys, arrows
+  keypad(stdscr, TRUE);
 
   while (running) {
     int ch = getch();
     if (ch != ERR) {
-      switch (ch) {
-      case 'q':
+      if (ch == 'q') {
         exit_program(1);
-        break;
+      }
+
+      // Determine if key is 1-4
+      int pressed_slot = -1;
+      if (ch >= '1' && ch <= '4') {
+        pressed_slot = ch - '1'; // 0, 1, 2, or 3
+      }
+
+      if (in_change_mode) {
+        // --- CHANGE MODE LOGIC ---
+        if (pressed_slot != -1) {
+          // User pressed 1, 2, 3 or 4 while in change mode
+          int src = selected_slot;
+          int dst = pressed_slot;
+
+          if (src == dst) {
+            // If I press 1 then c then 1 again: Nothing happens, exit mode
+            in_change_mode = 0;
+            selected_slot = -1;
+          } else {
+            // Swap videos
+            int temp_video_id = layout[src];
+            layout[src] = layout[dst];
+            layout[dst] = temp_video_id;
+
+            // Reset state
+            in_change_mode = 0;
+            selected_slot = -1;
+          }
+        } else {
+          // User pressed any OTHER key (except 1,2,3,4)
+          // Should not do anything and exit change mode
+          in_change_mode = 0;
+          selected_slot = -1;
+        }
+      } else {
+        // --- NORMAL MODE LOGIC ---
+        if (pressed_slot != -1) {
+          // Select the video
+          selected_slot = pressed_slot;
+        } else if (ch == 'c') {
+          // Enter change mode only if something is selected
+          if (selected_slot != -1) {
+            in_change_mode = 1;
+          }
+        } else {
+          // Any other key clears selection if we aren't starting a mode
+          selected_slot = -1;
+        }
       }
     }
-    usleep(10000); // 10ms poll interval
+    usleep(10000);
   }
-  // endwin();
   return NULL;
 }
 
@@ -541,10 +587,10 @@ int main() {
     if (!running)
       break;
 
-    upload_video_frame(&videos[0], 0);
-    upload_video_frame(&videos[1], 2);
-    upload_video_frame(&videos[2], 4);
-    upload_video_frame(&videos[3], 6);
+    upload_video_frame(&videos[layout[0]], 0);
+    upload_video_frame(&videos[layout[1]], 2);
+    upload_video_frame(&videos[layout[2]], 4);
+    upload_video_frame(&videos[layout[3]], 6);
 
     glDrawArrays(GL_TRIANGLES, 0, 24);
     swap_buffers();
@@ -553,7 +599,7 @@ int main() {
     frame_count++;
     long long current_time = current_timestamp();
     if (current_time - last_time >= 1000) { // If 1 second has passed
-      printf("FPS: %d\n", frame_count);
+      printf("FPS: %d\r\n", frame_count);
       frame_count = 0;
       last_time = current_time;
     }
