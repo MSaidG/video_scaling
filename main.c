@@ -72,9 +72,48 @@ volatile int layout[4] = {0, 1, 2, 3};
 // State for the Input Machine
 volatile int selected_slot = -1; // -1 means nothing selected
 volatile int in_change_mode = 0; // 0 = false, 1 = true
+volatile int in_resize_mode = 0;
+
+// Geometry State
+typedef struct {
+  float x, y, w, h;
+} Rect;
+
+// Helper Constants for Shapes
+const Rect RECT_FULL = {-1.0f, -1.0f, 2.0f, 2.0f};
+const Rect RECT_TOP = {-1.0f, 0.0f, 2.0f, 1.0f};
+const Rect RECT_BOTTOM = {-1.0f, -1.0f, 2.0f, 1.0f};
+const Rect RECT_LEFT = {-1.0f, -1.0f, 1.0f, 2.0f};
+const Rect RECT_RIGHT = {0.0f, -1.0f, 1.0f, 2.0f};
+
+volatile Rect slot_rects[4];
+// Default positions
+const Rect default_rects[4] = {
+    {-1.0f, 0.0f, 1.0f, 1.0f},  // TL
+    {0.0f, 0.0f, 1.0f, 1.0f},   // TR
+    {-1.0f, -1.0f, 1.0f, 1.0f}, // BL
+    {0.0f, -1.0f, 1.0f, 1.0f}   // BR
+};
+
+volatile int layout_dirty = 1; // Flag to tell Main Thread to re-upload vertices
 
 // --- UTILS ---
 void handle_signal(int s) { running = 0; }
+
+// Helper: Check if two rects overlap
+int rects_overlap(Rect r1, Rect r2) {
+  if (r1.w == 0 || r1.h == 0 || r2.w == 0 || r2.h == 0)
+    return 0; // Ignore hidden
+  return r1.x < r2.x + r2.w && r1.x + r1.w > r2.x && r1.y < r2.y + r2.h &&
+         r1.y + r1.h > r2.y;
+}
+
+// Helper: Reset grid to default
+void reset_layout() {
+  for (int i = 0; i < 4; i++)
+    slot_rects[i] = default_rects[i];
+  layout_dirty = 1;
+}
 
 const char *vs_src = "attribute vec4 pos;\n"
                      "attribute vec2 tex;\n"
@@ -124,6 +163,69 @@ const char *fs_src = "precision mediump float;\n"
                      "  }\n"
                      "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
                      "}\n";
+
+// --- GEOMETRY UPDATE FUNCTION ---
+// Called by Main Thread when layout_dirty is true
+void update_geometry_buffer(GLuint vbo) {
+  // 4 quads * 6 verts/quad * 5 floats/vert (x,y, u,v, id)
+  GLfloat verts[4 * 6 * 5];
+  int idx = 0;
+
+  for (int i = 0; i < 4; i++) {
+    Rect r = slot_rects[i];
+    float id = (float)i;
+
+    // Define Quad vertices based on Rect r (x,y is bottom-left of rect in
+    // standard GL, but our logic uses Top-Left origin for convenience or BL?
+    // Let's stick to standard GL coords: -1,-1 is BL.
+
+    // Vertices: X, Y, U, V, ID
+
+    // Triangle 1
+    // TL
+    verts[idx++] = r.x;
+    verts[idx++] = r.y + r.h;
+    verts[idx++] = 0.0f;
+    verts[idx++] = 0.0f;
+    verts[idx++] = id;
+    // BL
+    verts[idx++] = r.x;
+    verts[idx++] = r.y;
+    verts[idx++] = 0.0f;
+    verts[idx++] = 1.0f;
+    verts[idx++] = id;
+    // TR
+    verts[idx++] = r.x + r.w;
+    verts[idx++] = r.y + r.h;
+    verts[idx++] = 1.0f;
+    verts[idx++] = 0.0f;
+    verts[idx++] = id;
+
+    // Triangle 2
+    // TR
+    verts[idx++] = r.x + r.w;
+    verts[idx++] = r.y + r.h;
+    verts[idx++] = 1.0f;
+    verts[idx++] = 0.0f;
+    verts[idx++] = id;
+    // BL
+    verts[idx++] = r.x;
+    verts[idx++] = r.y;
+    verts[idx++] = 0.0f;
+    verts[idx++] = 1.0f;
+    verts[idx++] = id;
+    // BR
+    verts[idx++] = r.x + r.w;
+    verts[idx++] = r.y;
+    verts[idx++] = 1.0f;
+    verts[idx++] = 1.0f;
+    verts[idx++] = id;
+  }
+
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+  layout_dirty = 0;
+}
 
 int init_kms() {
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -410,9 +512,107 @@ long long current_timestamp() {
   return milliseconds;
 }
 
-void exit_program(int id) { running = false; }
+void exit_program() { running = false; }
 
-// --- INPUT LOGIC ---
+void apply_resize(int slot, int key) {
+  // 1. First, set default layout positions so we know where everyone starts.
+  reset_layout();
+
+  int filler = -1; // Who will fill the empty space?
+
+  if (slot == 0) { // TL
+    if (key == KEY_UP) {
+      slot_rects[0] = RECT_TOP;
+    } // Safe (Covered)
+    if (key == KEY_LEFT) {
+      slot_rects[0] = RECT_LEFT;
+    } // Safe (Covered)
+    if (key == KEY_DOWN) {
+      slot_rects[0] = RECT_BOTTOM;
+      filler = 1;
+      slot_rects[filler] = RECT_TOP;
+    }
+    if (key == KEY_RIGHT) {
+      slot_rects[0] = RECT_RIGHT;
+      filler = 2;
+      slot_rects[filler] = RECT_LEFT;
+    }
+  } else if (slot == 1) { // TR
+    if (key == KEY_UP) {
+      slot_rects[1] = RECT_TOP;
+    } // Safe
+    if (key == KEY_RIGHT) {
+      slot_rects[1] = RECT_RIGHT;
+    } // Safe
+    if (key == KEY_DOWN) {
+      slot_rects[1] = RECT_BOTTOM;
+      filler = 0;
+      slot_rects[filler] = RECT_TOP;
+    }
+    if (key == KEY_LEFT) {
+      slot_rects[1] = RECT_LEFT;
+      filler = 3;
+      slot_rects[filler] = RECT_RIGHT;
+    }
+  } else if (slot == 2) { // BL
+    if (key == KEY_DOWN) {
+      slot_rects[2] = RECT_BOTTOM;
+    } // Safe
+    if (key == KEY_LEFT) {
+      slot_rects[2] = RECT_LEFT;
+    } // Safe
+    if (key == KEY_UP) {
+      slot_rects[2] = RECT_TOP;
+      filler = 3;
+      slot_rects[filler] = RECT_BOTTOM;
+    }
+    if (key == KEY_RIGHT) {
+      slot_rects[2] = RECT_RIGHT;
+      filler = 0;
+      slot_rects[filler] = RECT_LEFT;
+    }
+  } else if (slot == 3) { // BR
+    if (key == KEY_DOWN) {
+      slot_rects[3] = RECT_BOTTOM;
+    } // Safe
+    if (key == KEY_RIGHT) {
+      slot_rects[3] = RECT_RIGHT;
+    } // Safe
+    if (key == KEY_UP) {
+      slot_rects[3] = RECT_TOP;
+      filler = 2;
+      slot_rects[filler] = RECT_BOTTOM;
+    }
+    if (key == KEY_LEFT) {
+      slot_rects[3] = RECT_LEFT;
+      filler = 1;
+      slot_rects[filler] = RECT_RIGHT;
+    }
+  }
+
+  // 2. Hide Loop: Clean up overlaps
+  // Any video that overlaps the 'Selected' or the 'Filler' must be hidden.
+  for (int i = 0; i < 4; i++) {
+    if (i == slot)
+      continue; // Don't check self
+    if (filler != -1 && i == filler)
+      continue; // Don't check filler
+
+    // Check against selected
+    if (rects_overlap(slot_rects[slot], slot_rects[i])) {
+      slot_rects[i].w = 0;
+      slot_rects[i].h = 0;
+    }
+    // Check against filler (if it exists)
+    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i])) {
+      slot_rects[i].w = 0;
+      slot_rects[i].h = 0;
+    }
+  }
+
+  layout_dirty = 1;
+}
+
 void *input_thread(void *arg) {
   initscr();
   cbreak();
@@ -423,55 +623,64 @@ void *input_thread(void *arg) {
   while (running) {
     int ch = getch();
     if (ch != ERR) {
-      if (ch == 'q') {
-        exit_program(1);
-      }
+      if (ch == 'q')
+        exit_program();
 
-      // Determine if key is 1-4
       int pressed_slot = -1;
-      if (ch >= '1' && ch <= '4') {
-        pressed_slot = ch - '1'; // 0, 1, 2, or 3
-      }
+      if (ch >= '1' && ch <= '4')
+        pressed_slot = ch - '1';
 
-      if (in_change_mode) {
-        // --- CHANGE MODE LOGIC ---
+      if (ch == '0') {
+        reset_layout();
+        in_resize_mode = 0;
+        in_change_mode = 0;
+        selected_slot = -1;
+      } else if (in_resize_mode) {
         if (pressed_slot != -1) {
-          // User pressed 1, 2, 3 or 4 while in change mode
+          selected_slot = pressed_slot;
+        } else if (ch == 'f') {
+          if (selected_slot != -1) {
+            // Fullscreen is safe (hide all others)
+            for (int i = 0; i < 4; i++) {
+              slot_rects[i].w = 0;
+              slot_rects[i].h = 0;
+            }
+            slot_rects[selected_slot] = RECT_FULL;
+            layout_dirty = 1;
+          }
+        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
+                   ch == KEY_DOWN) {
+          if (selected_slot != -1) {
+            apply_resize(selected_slot, ch);
+          }
+        } else if (ch == 'r') {
+          in_resize_mode = 0;
+        }
+      } else if (in_change_mode) {
+        if (pressed_slot != -1) {
           int src = selected_slot;
           int dst = pressed_slot;
-
-          if (src == dst) {
-            // If I press 1 then c then 1 again: Nothing happens, exit mode
-            in_change_mode = 0;
-            selected_slot = -1;
-          } else {
-            // Swap videos
-            int temp_video_id = layout[src];
+          if (src != dst) {
+            int tmp = layout[src];
             layout[src] = layout[dst];
-            layout[dst] = temp_video_id;
-
-            // Reset state
-            in_change_mode = 0;
-            selected_slot = -1;
+            layout[dst] = tmp;
           }
+          in_change_mode = 0;
+          selected_slot = -1;
         } else {
-          // User pressed any OTHER key (except 1,2,3,4)
-          // Should not do anything and exit change mode
           in_change_mode = 0;
           selected_slot = -1;
         }
       } else {
-        // --- NORMAL MODE LOGIC ---
         if (pressed_slot != -1) {
-          // Select the video
           selected_slot = pressed_slot;
         } else if (ch == 'c') {
-          // Enter change mode only if something is selected
-          if (selected_slot != -1) {
+          if (selected_slot != -1)
             in_change_mode = 1;
-          }
+        } else if (ch == 'r') {
+          if (selected_slot != -1)
+            in_resize_mode = 1;
         } else {
-          // Any other key clears selection if we aren't starting a mode
           selected_slot = -1;
         }
       }
@@ -526,38 +735,25 @@ int main() {
   glUniform1i(glGetUniformLocation(p, "ty3"), 6);
   glUniform1i(glGetUniformLocation(p, "tu3"), 7);
 
-  // --- 2x2 GRID GEOMETRY ---
-  // Each quad is 2 triangles (6 verts). Total 4 quads = 24 verts.
-  // Format: X, Y, U, V, ID
-  GLfloat batch_verts[] = {
-      // --- TL (ID 0) [-1, 0] [0, 1] ---
-      -1.0f, 1.0f, 0.0f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f,
-      1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f,
-      0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f,
+  reset_layout();
 
-      // --- TR (ID 1) [0, 1] [0, 1] ---
-      0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-      1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
-      1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f,
+  // --- VBO SETUP ---
+  GLuint vbo;
+  glGenBuffers(1, &vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  // Allocate space for 4 quads * 6 verts * 5 floats
+  glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 5 * sizeof(GLfloat), NULL,
+               GL_DYNAMIC_DRAW);
 
-      // --- BL (ID 2) [-1, 0] [-1, 0] ---
-      -1.0f, 0.0f, 0.0f, 0.0f, 2.0f, -1.0f, -1.0f, 0.0f, 1.0f, 2.0f, 0.0f, 0.0f,
-      1.0f, 0.0f, 2.0f, 0.0f, 0.0f, 1.0f, 0.0f, 2.0f, -1.0f, -1.0f, 0.0f, 1.0f,
-      2.0f, 0.0f, -1.0f, 1.0f, 1.0f, 2.0f,
+  // Initial populate
+  update_geometry_buffer(vbo);
 
-      // --- BR (ID 3) [0, 1] [-1, 0] ---
-      0.0f, 0.0f, 0.0f, 0.0f, 3.0f, 0.0f, -1.0f, 0.0f, 1.0f, 3.0f, 1.0f, 0.0f,
-      1.0f, 0.0f, 3.0f, 1.0f, 0.0f, 1.0f, 0.0f, 3.0f, 0.0f, -1.0f, 0.0f, 1.0f,
-      3.0f, 1.0f, -1.0f, 1.0f, 1.0f, 3.0f};
-
-  glEnableVertexAttribArray(0); // Pos
-  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, batch_verts);
-  glEnableVertexAttribArray(1); // Tex
-  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20,
-                        batch_verts + 2); // Offset 2 floats
-  glEnableVertexAttribArray(2);           // Video ID
-  glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 20,
-                        batch_verts + 4); // Offset 4 floats
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 20, (void *)0);
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, (void *)8);
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 20, (void *)16);
 
   drmEventContext ev = {0};
   ev.version = 2;
@@ -571,9 +767,9 @@ int main() {
   // --- INPUT THREAD ---
   pthread_t tid;
   pthread_create(&tid, NULL, input_thread, NULL);
-  signal(SIGINT, handle_signal);
 
-  printf("Simulating Camera Feed (%dx%d NV12)...\n", VID_W, VID_H);
+  printf("Ready. Keys: 1-4 Select | c=Swap | r=Resize | 0=Reset\n");
+  printf("Resize: f=Full, Arrows=Halves\n");
 
   while (running) {
     while (waiting_for_flip) {
@@ -586,6 +782,11 @@ int main() {
     }
     if (!running)
       break;
+
+    // --- CHECK FOR GEOMETRY UPDATES ---
+    if (layout_dirty) {
+      update_geometry_buffer(vbo);
+    }
 
     upload_video_frame(&videos[layout[0]], 0);
     upload_video_frame(&videos[layout[1]], 2);
