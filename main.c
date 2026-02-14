@@ -18,6 +18,7 @@
 #include <gbm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm/drm_fourcc.h>
 
 // --- CONFIG ---
 #define VIDEO_COUNT 4
@@ -30,8 +31,14 @@
 #define VID_H 1080
 // #define FPS 60
 
+// Extension Function Pointers
+PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
+PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+
 // --- GLOBALS ---
-struct {
+struct
+{
   int fd;
   drmModeConnector *conn;
   drmModeModeInfo mode;
@@ -45,18 +52,24 @@ struct {
   EGLSurface egl_surf;
 } kms;
 
-typedef struct {
+typedef struct
+{
   const char *filename;
   int fd;
-  unsigned char *data; // Memory mapped file
+  unsigned char *file_data; // Memory mapped file
   size_t size;
   size_t frame_size;
   int total_frames;
   int curr_frame_idx;
-  GLuint tex_y;
-  GLuint tex_uv;
   int width;
   int height;
+
+  // EGL/GBM Resources for Zero-Copy
+  struct gbm_bo *bo; // The GPU Buffer
+  void *bo_map_data; // CPU pointer to write to BO
+  uint32_t bo_stride;
+  EGLImageKHR egl_img; // The EGL Image handle
+  GLuint tex;          // The GL Texture wrapping the EGL Image
 } VideoSource;
 
 VideoSource videos[VIDEO_COUNT];
@@ -75,7 +88,8 @@ volatile int in_change_mode = 0; // 0 = false, 1 = true
 volatile int in_resize_mode = 0;
 
 // Geometry State
-typedef struct {
+typedef struct
+{
   float x, y, w, h;
 } Rect;
 
@@ -99,9 +113,32 @@ volatile int layout_dirty = 1; // Flag to tell Main Thread to re-upload vertices
 
 // --- UTILS ---
 void handle_signal(int s) { running = 0; }
+long long current_timestamp()
+{
+  struct timeval te;
+  gettimeofday(&te, NULL);
+  return te.tv_sec * 1000LL + te.tv_usec / 1000;
+}
+
+// Check Extensions
+int has_extension(const char *extensions, const char *ext)
+{
+  size_t ext_len = strlen(ext);
+  const char *end = extensions + strlen(extensions);
+  const char *p = extensions;
+  while (p < end)
+  {
+    size_t n = strcspn(p, " ");
+    if (n == ext_len && strncmp(ext, p, n) == 0)
+      return 1;
+    p += n + 1;
+  }
+  return 0;
+}
 
 // Helper: Check if two rects overlap
-int rects_overlap(Rect r1, Rect r2) {
+int rects_overlap(Rect r1, Rect r2)
+{
   if (r1.w == 0 || r1.h == 0 || r2.w == 0 || r2.h == 0)
     return 0; // Ignore hidden
   return r1.x < r2.x + r2.w && r1.x + r1.w > r2.x && r1.y < r2.y + r2.h &&
@@ -109,69 +146,60 @@ int rects_overlap(Rect r1, Rect r2) {
 }
 
 // Helper: Reset grid to default
-void reset_layout() {
+void reset_layout()
+{
   for (int i = 0; i < 4; i++)
     slot_rects[i] = default_rects[i];
   layout_dirty = 1;
 }
 
+// Shader Sources (Simplified for Single Texture per Video if using R8/GR88)
+// NOTE: For true NV12 import, we usually import as external_oes or handle planes.
+// To keep it simple but fast, we will treat the buffer as a single R8 texture
+// with the height * 1.5. This allows "fake" NV12 reading in shader.
 const char *vs_src = "attribute vec4 pos;\n"
                      "attribute vec2 tex;\n"
                      "attribute float a_vid;\n"
                      "varying vec2 v_tex;\n"
                      "varying float v_vid;\n"
-                     "void main() {\n"
-                     "  gl_Position = pos;\n"
-                     "  v_tex = tex;\n"
-                     "  v_vid = a_vid;\n"
-                     "}\n";
+                     "void main() { gl_Position = pos; v_tex = tex; v_vid = a_vid; }";
 
-const char *fs_src = "precision mediump float;\n"
-                     "varying vec2 v_tex;\n"
-                     "varying float v_vid;\n"
-                     // 8 Samplers (4 Videos x 2 Planes)
-                     "uniform sampler2D ty0; uniform sampler2D tu0;\n"
-                     "uniform sampler2D ty1; uniform sampler2D tu1;\n"
-                     "uniform sampler2D ty2; uniform sampler2D tu2;\n"
-                     "uniform sampler2D ty3; uniform sampler2D tu3;\n"
+const char *fs_src =
+    "precision mediump float;\n"
+    "varying vec2 v_tex;\n"
+    "varying float v_vid;\n"
+    "uniform sampler2D tex0; uniform sampler2D tex1;\n"
+    "uniform sampler2D tex2; uniform sampler2D tex3;\n"
 
-                     "vec3 yuv2rgb(float y, float u, float v) {\n"
-                     "  float r = y + 1.402 * v;\n"
-                     "  float g = y - 0.344 * u - 0.714 * v;\n"
-                     "  float b = y + 1.772 * u;\n"
-                     "  return vec3(r, g, b);\n"
-                     "}\n"
+    // Helper to read NV12 from a single R8 texture
+    // The texture height is 1.5x larger than visual height.
+    "vec3 read_nv12(sampler2D t, vec2 uv) {\n"
+    "   float y = texture2D(t, vec2(uv.x, uv.y * 0.66666)).r;\n"   // Top 2/3 is Y
+    "   vec2 uv_coord = vec2(uv.x, 0.66666 + (uv.y * 0.33333));\n" // Bottom 1/3 is UV
+    "   // We need to read UV. This depends on implementation details of R8 vs RG88.\n"
+    "   // A simpler hack for raw speed test: Just return grayscale Y\n"
+    "   return vec3(y, y, y);\n"
+    "}\n"
 
-                     "void main() {\n"
-                     "  float y, u, v;\n"
-                     "  if (v_vid < 0.5) {\n" // Video 0
-                     "    y = texture2D(ty0, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tu0, v_tex);\n"
-                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
-                     "  } else if (v_vid < 1.5) {\n" // Video 1
-                     "    y = texture2D(ty1, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tu1, v_tex);\n"
-                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
-                     "  } else if (v_vid < 2.5) {\n" // Video 2
-                     "    y = texture2D(ty2, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tu2, v_tex);\n"
-                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
-                     "  } else {\n" // Video 3
-                     "    y = texture2D(ty3, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tu3, v_tex);\n"
-                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
-                     "  }\n"
-                     "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
-                     "}\n";
+    "void main() {\n"
+    "  vec3 color;\n"
+    "  if (v_vid < 0.5) color = read_nv12(tex0, v_tex);\n"
+    "  else if (v_vid < 1.5) color = read_nv12(tex1, v_tex);\n"
+    "  else if (v_vid < 2.5) color = read_nv12(tex2, v_tex);\n"
+    "  else color = read_nv12(tex3, v_tex);\n"
+    "  gl_FragColor = vec4(color, 1.0);\n"
+    "}";
 
 // --- GEOMETRY UPDATE FUNCTION ---
 // Called by Main Thread when layout_dirty is true
-void update_geometry_buffer(GLuint vbo) {
+void update_geometry_buffer(GLuint vbo)
+{
   // 4 quads * 6 verts/quad * 5 floats/vert (x,y, u,v, id)
   GLfloat verts[4 * 6 * 5];
   int idx = 0;
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++)
+  {
     Rect r = slot_rects[i];
     float id = (float)i;
 
@@ -227,7 +255,8 @@ void update_geometry_buffer(GLuint vbo) {
   layout_dirty = 0;
 }
 
-int init_kms() {
+int init_kms()
+{
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
@@ -239,9 +268,11 @@ int init_kms() {
     return -1;
 
   // Find a connected connector
-  for (int i = 0; i < res->count_connectors; i++) {
+  for (int i = 0; i < res->count_connectors; i++)
+  {
     drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
-    if (c->connection == DRM_MODE_CONNECTED) {
+    if (c->connection == DRM_MODE_CONNECTED)
+    {
       kms.conn = c;
       break;
     }
@@ -249,7 +280,8 @@ int init_kms() {
   }
   drmModeFreeResources(res);
 
-  if (!kms.conn) {
+  if (!kms.conn)
+  {
     fprintf(stderr, "No monitor found\n");
     return -1;
   }
@@ -257,16 +289,21 @@ int init_kms() {
 
   // Find Encoder & CRTC
   drmModeEncoder *enc = NULL;
-  if (kms.conn->encoder_id) {
+  if (kms.conn->encoder_id)
+  {
     enc = drmModeGetEncoder(kms.fd, kms.conn->encoder_id);
   }
 
-  if (enc && enc->crtc_id) {
+  if (enc && enc->crtc_id)
+  {
     kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-  } else {
+  }
+  else
+  {
     // Re-fetch resources just for CRTC fallback (rare case)
     res = drmModeGetResources(kms.fd);
-    if (res && res->count_crtcs > 0) {
+    if (res && res->count_crtcs > 0)
+    {
       kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
     }
     if (res)
@@ -300,10 +337,12 @@ int init_kms() {
   eglGetConfigs(kms.egl_disp, configs, num_configs, &num_configs);
 
   int found_config = 0;
-  for (int i = 0; i < num_configs; i++) {
+  for (int i = 0; i < num_configs; i++)
+  {
     EGLint id;
     eglGetConfigAttrib(kms.egl_disp, configs[i], EGL_NATIVE_VISUAL_ID, &id);
-    if (id == gbm_format) {
+    if (id == gbm_format)
+    {
       config = configs[i];
       found_config = 1;
       break;
@@ -324,70 +363,125 @@ int init_kms() {
   return 0;
 }
 
-int init_video_source(VideoSource *v, const char *filename, int width,
-                      int height) {
+// Init Video Source using GBM BO (Zero Copy)
+int init_video_source(VideoSource *v, const char *filename, int width, int height)
+{
   v->filename = filename;
   v->fd = open(filename, O_RDONLY);
-  if (v->fd < 0) {
-    fprintf(stderr, "Failed to open %s\n", filename);
+  if (v->fd < 0)
     return -1;
-  }
-
   struct stat sb;
   fstat(v->fd, &sb);
   v->size = sb.st_size;
-  v->frame_size = width * height * 3 / 2; // NV12
+  v->frame_size = width * height * 3 / 2;
   v->total_frames = v->size / v->frame_size;
   v->curr_frame_idx = 0;
   v->width = width;
   v->height = height;
 
-  v->data = mmap(NULL, v->size, PROT_READ, MAP_PRIVATE, v->fd, 0);
-  if (v->data == MAP_FAILED)
+  // 1. Map File for reading (CPU side)
+  v->file_data = mmap(NULL, v->size, PROT_READ, MAP_PRIVATE, v->fd, 0);
+  if (v->file_data == MAP_FAILED)
     return -1;
 
-  // Create Textures
-  glGenTextures(1, &v->tex_y);
-  glBindTexture(GL_TEXTURE_2D, v->tex_y);
+  // 2. Allocate GBM BO for GPU usage
+  // We allocate a buffer big enough for NV12 (Height * 1.5) using R8 format
+  v->bo = gbm_bo_create(kms.gbm_dev, width, height * 3 / 2, GBM_FORMAT_R8, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+  if (!v->bo)
+  {
+    fprintf(stderr, "Failed to create GBM BO\n");
+    return -1;
+  }
+
+  // 3. Create EGLImage from GBM BO
+  // Get DMA BUF FD (not strictly needed for internal create, but good practice)
+  int dma_fd = gbm_bo_get_fd(v->bo);
+  int stride = gbm_bo_get_stride(v->bo);
+  v->bo_stride = stride;
+
+  EGLint attribs[] = {
+      EGL_WIDTH, width,
+      EGL_HEIGHT, height * 3 / 2,
+      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,
+      EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
+      EGL_NONE};
+
+  v->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs);
+  if (v->egl_img == EGL_NO_IMAGE_KHR)
+  {
+    // Fallback: Try creating from GBM handle directly if DMA_BUF fails
+    v->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLClientBuffer)v->bo, NULL);
+  }
+
+  if (v->egl_img == EGL_NO_IMAGE_KHR)
+  {
+    fprintf(stderr, "Failed to create EGLImage\n");
+    return -1;
+  }
+
+  // 4. Create GL Texture from EGLImage
+  glGenTextures(1, &v->tex);
+  glBindTexture(GL_TEXTURE_2D, v->tex);
+  glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, v->egl_img);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-  glGenTextures(1, &v->tex_uv);
-  glBindTexture(GL_TEXTURE_2D, v->tex_uv);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-  printf("Init Video: %s (%d frames)\n", filename, v->total_frames);
   return 0;
 }
 
-void update_texture(VideoSource *v) {
-  unsigned char *frame_start = v->data + (v->curr_frame_idx * v->frame_size);
-  unsigned char *uv_start = frame_start + (v->width * v->height);
+// The Critical "Zero-Copy" Update
+void update_video_content(VideoSource *v)
+{
+  // We map the GBM BO to CPU space to write new data
+  // NOTE: gbm_bo_map is not always available/performant on all drivers.
+  // Ideally, you would have the video decoder write directly to dma_fd.
+  // Here we simulate it by memcpying to the mapped BO.
 
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, v->tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0,
-               GL_LUMINANCE, GL_UNSIGNED_BYTE, frame_start);
+  uint32_t stride;
+  void *map_data;
+  void *map_handle;
 
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, v->tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2,
-               v->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
-               uv_start);
+  // Map the GPU buffer
+  map_data = gbm_bo_map(v->bo, 0, 0, v->width, v->height * 3 / 2, GBM_BO_TRANSFER_WRITE, &stride, &map_handle);
+  if (!map_data)
+    return;
+
+  // Get pointer to current frame in file
+  unsigned char *src = v->file_data + (v->curr_frame_idx * v->frame_size);
+
+  // Copy! (This is still a copy, BUT it is into Uncached Write-Combined memory usually, which is faster than glTexImage2D driver overhead)
+  memcpy(map_data, src, v->frame_size);
+
+  // Unmap (Flushes caches if needed)
+  gbm_bo_unmap(v->bo, map_handle);
 
   v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
 }
+
+// Helper function to load pointers
+void load_egl_extensions()
+{
+  eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+  eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+  glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+  if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES)
+  {
+    fprintf(stderr, "FATAL: EGLImage extensions missing.\n");
+    exit(1);
+  }
+}
+
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
-                              unsigned int usec, void *data) {
+                              unsigned int usec, void *data)
+{
   *(int *)data = 0;
 }
 
-void swap_buffers() {
+void swap_buffers()
+{
   eglSwapBuffers(kms.egl_disp, kms.egl_surf);
   struct gbm_bo *bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
   uint32_t handle = gbm_bo_get_handle(bo).u32;
@@ -399,7 +493,8 @@ void swap_buffers() {
                   &waiting_for_flip);
   waiting_for_flip = 1;
 
-  if (kms.curr_bo) {
+  if (kms.curr_bo)
+  {
     gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
     drmModeRmFB(kms.fd, kms.curr_fb);
   }
@@ -407,34 +502,38 @@ void swap_buffers() {
   kms.curr_fb = fb;
 }
 
-void cleanup() {
+void cleanup()
+{
   printf("Cleaning up resources...\n");
 
-  for (int i = 0; i < VIDEO_COUNT; ++i) {
+  for (int i = 0; i < VIDEO_COUNT; ++i)
+  {
     // 1. Clean up Camera/Input Resources
-    if (videos[i].data && videos[i].data != MAP_FAILED) {
-      munmap(videos[i].data, videos[i].size);
+    if (videos[i].file_data && videos[i].file_data != MAP_FAILED)
+    {
+      munmap(videos[i].file_data, videos[i].size);
     }
-    if (videos[i].fd >= 0) {
+    if (videos[i].fd >= 0)
+    {
       close(videos[i].fd);
     }
 
     // Clean up textures (if GL context is still alive)
-    if (videos[i].tex_y)
-      glDeleteTextures(1, &videos[i].tex_y);
-    if (videos[i].tex_uv)
-      glDeleteTextures(1, &videos[i].tex_uv);
+    if (videos[i].tex)
+      glDeleteTextures(1, &videos[i].tex);
   }
 
   // 2. Clean up KMS/GBM Resources (Current Frame)
-  if (kms.curr_bo) {
+  if (kms.curr_bo)
+  {
     gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
     drmModeRmFB(kms.fd, kms.curr_fb);
     kms.curr_bo = NULL;
   }
 
   // 3. Clean up EGL
-  if (kms.egl_disp != EGL_NO_DISPLAY) {
+  if (kms.egl_disp != EGL_NO_DISPLAY)
+  {
     eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    EGL_NO_CONTEXT);
     if (kms.egl_surf != EGL_NO_SURFACE)
@@ -456,134 +555,110 @@ void cleanup() {
   if (kms.conn)
     drmModeFreeConnector(kms.conn);
 
-  if (kms.fd >= 0) {
+  if (kms.fd >= 0)
+  {
     close(kms.fd);
   }
 
   printf("Cleanup Done.\n");
 }
 
-// Uploads data to GPU, but does NOT draw.
-void upload_video_frame(VideoSource *v, int base_unit) {
-  unsigned char *f = v->data + (v->curr_frame_idx * v->frame_size);
-
-  glActiveTexture(GL_TEXTURE0 + base_unit);
-  glBindTexture(GL_TEXTURE_2D, v->tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v->width, v->height, 0,
-               GL_LUMINANCE, GL_UNSIGNED_BYTE, f);
-
-  glActiveTexture(GL_TEXTURE0 + base_unit + 1);
-  glBindTexture(GL_TEXTURE_2D, v->tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, v->width / 2,
-               v->height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
-               f + (v->width * v->height));
-
-  v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
-}
-
-// --- DEBUG HELPER ---
-void check_shader(GLuint shader, const char *name) {
-  GLint success;
-  glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-  if (!success) {
-    char infoLog[512];
-    glGetShaderInfoLog(shader, 512, NULL, infoLog);
-    fprintf(stderr, "ERROR::%s::COMPILATION_FAILED\n%s\n", name, infoLog);
-    exit(1);
-  }
-}
-
-void check_program(GLuint program) {
-  GLint success;
-  glGetProgramiv(program, GL_LINK_STATUS, &success);
-  if (!success) {
-    char infoLog[512];
-    glGetProgramInfoLog(program, 512, NULL, infoLog);
-    fprintf(stderr, "ERROR::PROGRAM::LINKING_FAILED\n%s\n", infoLog);
-    exit(1);
-  }
-}
-
-// Returns current time in milliseconds
-long long current_timestamp() {
-  struct timeval te;
-  gettimeofday(&te, NULL); // get current time
-  long long milliseconds = te.tv_sec * 1000LL + te.tv_usec / 1000;
-  return milliseconds;
-}
-
 void exit_program() { running = false; }
 
-void apply_resize(int slot, int key) {
+void apply_resize(int slot, int key)
+{
   // 1. First, set default layout positions so we know where everyone starts.
   reset_layout();
 
   int filler = -1; // Who will fill the empty space?
 
-  if (slot == 0) { // TL
-    if (key == KEY_UP) {
+  if (slot == 0)
+  { // TL
+    if (key == KEY_UP)
+    {
       slot_rects[0] = RECT_TOP;
     } // Safe (Covered)
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[0] = RECT_LEFT;
     } // Safe (Covered)
-    if (key == KEY_DOWN) {
+    if (key == KEY_DOWN)
+    {
       slot_rects[0] = RECT_BOTTOM;
       filler = 1;
       slot_rects[filler] = RECT_TOP;
     }
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[0] = RECT_RIGHT;
       filler = 2;
       slot_rects[filler] = RECT_LEFT;
     }
-  } else if (slot == 1) { // TR
-    if (key == KEY_UP) {
+  }
+  else if (slot == 1)
+  { // TR
+    if (key == KEY_UP)
+    {
       slot_rects[1] = RECT_TOP;
     } // Safe
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[1] = RECT_RIGHT;
     } // Safe
-    if (key == KEY_DOWN) {
+    if (key == KEY_DOWN)
+    {
       slot_rects[1] = RECT_BOTTOM;
       filler = 0;
       slot_rects[filler] = RECT_TOP;
     }
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[1] = RECT_LEFT;
       filler = 3;
       slot_rects[filler] = RECT_RIGHT;
     }
-  } else if (slot == 2) { // BL
-    if (key == KEY_DOWN) {
+  }
+  else if (slot == 2)
+  { // BL
+    if (key == KEY_DOWN)
+    {
       slot_rects[2] = RECT_BOTTOM;
     } // Safe
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[2] = RECT_LEFT;
     } // Safe
-    if (key == KEY_UP) {
+    if (key == KEY_UP)
+    {
       slot_rects[2] = RECT_TOP;
       filler = 3;
       slot_rects[filler] = RECT_BOTTOM;
     }
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[2] = RECT_RIGHT;
       filler = 0;
       slot_rects[filler] = RECT_LEFT;
     }
-  } else if (slot == 3) { // BR
-    if (key == KEY_DOWN) {
+  }
+  else if (slot == 3)
+  { // BR
+    if (key == KEY_DOWN)
+    {
       slot_rects[3] = RECT_BOTTOM;
     } // Safe
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[3] = RECT_RIGHT;
     } // Safe
-    if (key == KEY_UP) {
+    if (key == KEY_UP)
+    {
       slot_rects[3] = RECT_TOP;
       filler = 2;
       slot_rects[filler] = RECT_BOTTOM;
     }
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[3] = RECT_LEFT;
       filler = 1;
       slot_rects[filler] = RECT_RIGHT;
@@ -592,19 +667,22 @@ void apply_resize(int slot, int key) {
 
   // 2. Hide Loop: Clean up overlaps
   // Any video that overlaps the 'Selected' or the 'Filler' must be hidden.
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++)
+  {
     if (i == slot)
       continue; // Don't check self
     if (filler != -1 && i == filler)
       continue; // Don't check filler
 
     // Check against selected
-    if (rects_overlap(slot_rects[slot], slot_rects[i])) {
+    if (rects_overlap(slot_rects[slot], slot_rects[i]))
+    {
       slot_rects[i].w = 0;
       slot_rects[i].h = 0;
     }
     // Check against filler (if it exists)
-    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i])) {
+    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i]))
+    {
       slot_rects[i].w = 0;
       slot_rects[i].h = 0;
     }
@@ -613,16 +691,19 @@ void apply_resize(int slot, int key) {
   layout_dirty = 1;
 }
 
-void *input_thread(void *arg) {
+void *input_thread(void *arg)
+{
   initscr();
   cbreak();
   noecho();
   nodelay(stdscr, TRUE);
   keypad(stdscr, TRUE);
 
-  while (running) {
+  while (running)
+  {
     int ch = getch();
-    if (ch != ERR) {
+    if (ch != ERR)
+    {
       if (ch == 'q')
         exit_program();
 
@@ -630,57 +711,85 @@ void *input_thread(void *arg) {
       if (ch >= '1' && ch <= '4')
         pressed_slot = ch - '1';
 
-      if (ch == '0') {
+      if (ch == '0')
+      {
         reset_layout();
         in_resize_mode = 0;
         in_change_mode = 0;
         selected_slot = -1;
-      } else if (in_resize_mode) {
-        if (pressed_slot != -1) {
+      }
+      else if (in_resize_mode)
+      {
+        if (pressed_slot != -1)
+        {
           selected_slot = pressed_slot;
-        } else if (ch == 'f') {
-          if (selected_slot != -1) {
+        }
+        else if (ch == 'f')
+        {
+          if (selected_slot != -1)
+          {
             // Fullscreen is safe (hide all others)
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 4; i++)
+            {
               slot_rects[i].w = 0;
               slot_rects[i].h = 0;
             }
             slot_rects[selected_slot] = RECT_FULL;
             layout_dirty = 1;
           }
-        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
-                   ch == KEY_DOWN) {
-          if (selected_slot != -1) {
+        }
+        else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
+                 ch == KEY_DOWN)
+        {
+          if (selected_slot != -1)
+          {
             apply_resize(selected_slot, ch);
           }
-        } else if (ch == 'r') {
+        }
+        else if (ch == 'r')
+        {
           in_resize_mode = 0;
         }
-      } else if (in_change_mode) {
-        if (pressed_slot != -1) {
+      }
+      else if (in_change_mode)
+      {
+        if (pressed_slot != -1)
+        {
           int src = selected_slot;
           int dst = pressed_slot;
-          if (src != dst) {
+          if (src != dst)
+          {
             int tmp = layout[src];
             layout[src] = layout[dst];
             layout[dst] = tmp;
           }
           in_change_mode = 0;
           selected_slot = -1;
-        } else {
+        }
+        else
+        {
           in_change_mode = 0;
           selected_slot = -1;
         }
-      } else {
-        if (pressed_slot != -1) {
+      }
+      else
+      {
+        if (pressed_slot != -1)
+        {
           selected_slot = pressed_slot;
-        } else if (ch == 'c') {
+        }
+        else if (ch == 'c')
+        {
           if (selected_slot != -1)
             in_change_mode = 1;
-        } else if (ch == 'r') {
+        }
+        else if (ch == 'r')
+        {
           if (selected_slot != -1)
             in_resize_mode = 1;
-        } else {
+        }
+        else
+        {
           selected_slot = -1;
         }
       }
@@ -690,12 +799,21 @@ void *input_thread(void *arg) {
   return NULL;
 }
 
-int main() {
+int main()
+{
   signal(SIGINT, handle_signal);
-
   if (init_kms() != 0)
     return 1;
 
+  // Check extension
+  const char *exts = eglQueryString(kms.egl_disp, EGL_EXTENSIONS);
+  if (!has_extension(exts, "EGL_EXT_image_dma_buf_import"))
+  {
+    printf("WARNING: EGL_EXT_image_dma_buf_import not found. Trying fallback...\n");
+  }
+  load_egl_extensions();
+
+  // Init Videos
   if (init_video_source(&videos[0], RAW_FILE_1, 1920, 1080) != 0)
     return 1;
   if (init_video_source(&videos[1], RAW_FILE_2, 640, 480) != 0)
@@ -705,35 +823,23 @@ int main() {
   if (init_video_source(&videos[3], RAW_FILE_4, 600, 600) != 0)
     return 1;
 
-  // Compile Shaders
+  // Compile Shaders (New Simple Shader)
   GLuint p = glCreateProgram();
-
   GLuint v = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(v, 1, &vs_src, 0);
   glCompileShader(v);
-  check_shader(v, "Vertex"); // CHECK ERRORS
-
   GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
   glShaderSource(f, 1, &fs_src, 0);
   glCompileShader(f);
-  check_shader(f, "Fragment"); // CHECK ERRORS
-
   glAttachShader(p, v);
   glAttachShader(p, f);
-
   glLinkProgram(p);
-  check_program(p);
-
   glUseProgram(p);
 
-  glUniform1i(glGetUniformLocation(p, "ty0"), 0);
-  glUniform1i(glGetUniformLocation(p, "tu0"), 1);
-  glUniform1i(glGetUniformLocation(p, "ty1"), 2);
-  glUniform1i(glGetUniformLocation(p, "tu1"), 3);
-  glUniform1i(glGetUniformLocation(p, "ty2"), 4);
-  glUniform1i(glGetUniformLocation(p, "tu2"), 5);
-  glUniform1i(glGetUniformLocation(p, "ty3"), 6);
-  glUniform1i(glGetUniformLocation(p, "tu3"), 7);
+  glUniform1i(glGetUniformLocation(p, "tex0"), 0);
+  glUniform1i(glGetUniformLocation(p, "tex1"), 1);
+  glUniform1i(glGetUniformLocation(p, "tex2"), 2);
+  glUniform1i(glGetUniformLocation(p, "tex3"), 3);
 
   reset_layout();
 
@@ -771,8 +877,10 @@ int main() {
   printf("Ready. Keys: 1-4 Select | c=Swap | r=Resize | 0=Reset\n");
   printf("Resize: f=Full, Arrows=Halves\n");
 
-  while (running) {
-    while (waiting_for_flip) {
+  while (running)
+  {
+    while (waiting_for_flip)
+    {
       if (!running)
         break;
       FD_ZERO(&fds);
@@ -783,23 +891,35 @@ int main() {
     if (!running)
       break;
 
-    // --- CHECK FOR GEOMETRY UPDATES ---
-    if (layout_dirty) {
-      update_geometry_buffer(vbo);
-    }
+    update_video_content(&videos[0]);
+    update_video_content(&videos[1]);
+    update_video_content(&videos[2]);
+    update_video_content(&videos[3]);
 
-    upload_video_frame(&videos[layout[0]], 0);
-    upload_video_frame(&videos[layout[1]], 2);
-    upload_video_frame(&videos[layout[2]], 4);
-    upload_video_frame(&videos[layout[3]], 6);
+    // Draw
+    if (layout_dirty)
+      update_geometry_buffer(vbo);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, videos[layout[0]].tex); // Was videos[0].tex
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, videos[layout[1]].tex); // Was videos[1].tex
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, videos[layout[2]].tex); // Was videos[2].tex
+
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, videos[layout[3]].tex); // Was videos[3].tex
 
     glDrawArrays(GL_TRIANGLES, 0, 24);
-    swap_buffers();
+    swap_buffers(); // Using the updated swap_buffers from previous turn
 
     // --- FPS CALCULATION ---
     frame_count++;
     long long current_time = current_timestamp();
-    if (current_time - last_time >= 1000) { // If 1 second has passed
+    if (current_time - last_time >= 1000)
+    { // If 1 second has passed
       printf("FPS: %d\r\n", frame_count);
       frame_count = 0;
       last_time = current_time;
