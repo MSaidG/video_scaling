@@ -395,8 +395,23 @@ void swap_buffers() {
   drmModeAddFB(kms.fd, gbm_bo_get_width(bo), gbm_bo_get_height(bo), 24, 32,
                gbm_bo_get_stride(bo), handle, &fb);
 
-  drmModePageFlip(kms.fd, kms.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT,
-                  &waiting_for_flip);
+  // drmModePageFlip(kms.fd, kms.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT,
+  //                 &waiting_for_flip);
+
+  // TRY ASYNC FLIP
+  // DRM_MODE_PAGE_FLIP_ASYNC (0x02) tells the driver: "Flip immediately, don't
+  // wait for VSYNC"
+  int ret = drmModePageFlip(kms.fd, kms.crtc->crtc_id, fb,
+                            DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC,
+                            &waiting_for_flip);
+
+  // Fallback: Some drivers don't support ASYNC. If it fails, fall back to
+  // standard VSync.
+  if (ret < 0) {
+    drmModePageFlip(kms.fd, kms.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT,
+                    &waiting_for_flip);
+  }
+
   waiting_for_flip = 1;
 
   if (kms.curr_bo) {
