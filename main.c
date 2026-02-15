@@ -31,7 +31,8 @@
 // #define FPS 60
 
 // --- GLOBALS ---
-struct {
+struct
+{
   int fd;
   drmModeConnector *conn;
   drmModeModeInfo mode;
@@ -45,7 +46,8 @@ struct {
   EGLSurface egl_surf;
 } kms;
 
-typedef struct {
+typedef struct
+{
   const char *filename;
   int fd;
   unsigned char *data; // Memory mapped file
@@ -75,7 +77,8 @@ volatile int in_change_mode = 0; // 0 = false, 1 = true
 volatile int in_resize_mode = 0;
 
 // Geometry State
-typedef struct {
+typedef struct
+{
   float x, y, w, h;
 } Rect;
 
@@ -101,7 +104,8 @@ volatile int layout_dirty = 1; // Flag to tell Main Thread to re-upload vertices
 void handle_signal(int s) { running = 0; }
 
 // Helper: Check if two rects overlap
-int rects_overlap(Rect r1, Rect r2) {
+int rects_overlap(Rect r1, Rect r2)
+{
   if (r1.w == 0 || r1.h == 0 || r2.w == 0 || r2.h == 0)
     return 0; // Ignore hidden
   return r1.x < r2.x + r2.w && r1.x + r1.w > r2.x && r1.y < r2.y + r2.h &&
@@ -109,7 +113,8 @@ int rects_overlap(Rect r1, Rect r2) {
 }
 
 // Helper: Reset grid to default
-void reset_layout() {
+void reset_layout()
+{
   for (int i = 0; i < 4; i++)
     slot_rects[i] = default_rects[i];
   layout_dirty = 1;
@@ -166,12 +171,14 @@ const char *fs_src = "precision mediump float;\n"
 
 // --- GEOMETRY UPDATE FUNCTION ---
 // Called by Main Thread when layout_dirty is true
-void update_geometry_buffer(GLuint vbo) {
+void update_geometry_buffer(GLuint vbo)
+{
   // 4 quads * 6 verts/quad * 5 floats/vert (x,y, u,v, id)
   GLfloat verts[4 * 6 * 5];
   int idx = 0;
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++)
+  {
     Rect r = slot_rects[i];
     float id = (float)i;
 
@@ -227,7 +234,8 @@ void update_geometry_buffer(GLuint vbo) {
   layout_dirty = 0;
 }
 
-int init_kms() {
+int init_kms()
+{
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
@@ -239,9 +247,11 @@ int init_kms() {
     return -1;
 
   // Find a connected connector
-  for (int i = 0; i < res->count_connectors; i++) {
+  for (int i = 0; i < res->count_connectors; i++)
+  {
     drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
-    if (c->connection == DRM_MODE_CONNECTED) {
+    if (c->connection == DRM_MODE_CONNECTED)
+    {
       kms.conn = c;
       break;
     }
@@ -249,7 +259,8 @@ int init_kms() {
   }
   drmModeFreeResources(res);
 
-  if (!kms.conn) {
+  if (!kms.conn)
+  {
     fprintf(stderr, "No monitor found\n");
     return -1;
   }
@@ -257,16 +268,21 @@ int init_kms() {
 
   // Find Encoder & CRTC
   drmModeEncoder *enc = NULL;
-  if (kms.conn->encoder_id) {
+  if (kms.conn->encoder_id)
+  {
     enc = drmModeGetEncoder(kms.fd, kms.conn->encoder_id);
   }
 
-  if (enc && enc->crtc_id) {
+  if (enc && enc->crtc_id)
+  {
     kms.crtc = drmModeGetCrtc(kms.fd, enc->crtc_id);
-  } else {
+  }
+  else
+  {
     // Re-fetch resources just for CRTC fallback (rare case)
     res = drmModeGetResources(kms.fd);
-    if (res && res->count_crtcs > 0) {
+    if (res && res->count_crtcs > 0)
+    {
       kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
     }
     if (res)
@@ -300,10 +316,12 @@ int init_kms() {
   eglGetConfigs(kms.egl_disp, configs, num_configs, &num_configs);
 
   int found_config = 0;
-  for (int i = 0; i < num_configs; i++) {
+  for (int i = 0; i < num_configs; i++)
+  {
     EGLint id;
     eglGetConfigAttrib(kms.egl_disp, configs[i], EGL_NATIVE_VISUAL_ID, &id);
-    if (id == gbm_format) {
+    if (id == gbm_format)
+    {
       config = configs[i];
       found_config = 1;
       break;
@@ -325,10 +343,12 @@ int init_kms() {
 }
 
 int init_video_source(VideoSource *v, const char *filename, int width,
-                      int height) {
+                      int height)
+{
   v->filename = filename;
   v->fd = open(filename, O_RDONLY);
-  if (v->fd < 0) {
+  if (v->fd < 0)
+  {
     fprintf(stderr, "Failed to open %s\n", filename);
     return -1;
   }
@@ -365,7 +385,8 @@ int init_video_source(VideoSource *v, const char *filename, int width,
   return 0;
 }
 
-void update_texture(VideoSource *v) {
+void update_texture(VideoSource *v)
+{
   unsigned char *frame_start = v->data + (v->curr_frame_idx * v->frame_size);
   unsigned char *uv_start = frame_start + (v->width * v->height);
 
@@ -383,11 +404,13 @@ void update_texture(VideoSource *v) {
   v->curr_frame_idx = (v->curr_frame_idx + 1) % v->total_frames;
 }
 static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
-                              unsigned int usec, void *data) {
+                              unsigned int usec, void *data)
+{
   *(int *)data = 0;
 }
 
-void swap_buffers() {
+void swap_buffers()
+{
   eglSwapBuffers(kms.egl_disp, kms.egl_surf);
   struct gbm_bo *bo = gbm_surface_lock_front_buffer(kms.gbm_surf);
   uint32_t handle = gbm_bo_get_handle(bo).u32;
@@ -407,14 +430,16 @@ void swap_buffers() {
 
   // Fallback: Some drivers don't support ASYNC. If it fails, fall back to
   // standard VSync.
-  if (ret < 0) {
+  if (ret < 0)
+  {
     drmModePageFlip(kms.fd, kms.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT,
                     &waiting_for_flip);
   }
 
   waiting_for_flip = 1;
 
-  if (kms.curr_bo) {
+  if (kms.curr_bo)
+  {
     gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
     drmModeRmFB(kms.fd, kms.curr_fb);
   }
@@ -422,15 +447,19 @@ void swap_buffers() {
   kms.curr_fb = fb;
 }
 
-void cleanup() {
+void cleanup()
+{
   printf("Cleaning up resources...\n");
 
-  for (int i = 0; i < VIDEO_COUNT; ++i) {
+  for (int i = 0; i < VIDEO_COUNT; ++i)
+  {
     // 1. Clean up Camera/Input Resources
-    if (videos[i].data && videos[i].data != MAP_FAILED) {
+    if (videos[i].data && videos[i].data != MAP_FAILED)
+    {
       munmap(videos[i].data, videos[i].size);
     }
-    if (videos[i].fd >= 0) {
+    if (videos[i].fd >= 0)
+    {
       close(videos[i].fd);
     }
 
@@ -442,14 +471,16 @@ void cleanup() {
   }
 
   // 2. Clean up KMS/GBM Resources (Current Frame)
-  if (kms.curr_bo) {
+  if (kms.curr_bo)
+  {
     gbm_surface_release_buffer(kms.gbm_surf, kms.curr_bo);
     drmModeRmFB(kms.fd, kms.curr_fb);
     kms.curr_bo = NULL;
   }
 
   // 3. Clean up EGL
-  if (kms.egl_disp != EGL_NO_DISPLAY) {
+  if (kms.egl_disp != EGL_NO_DISPLAY)
+  {
     eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    EGL_NO_CONTEXT);
     if (kms.egl_surf != EGL_NO_SURFACE)
@@ -471,7 +502,8 @@ void cleanup() {
   if (kms.conn)
     drmModeFreeConnector(kms.conn);
 
-  if (kms.fd >= 0) {
+  if (kms.fd >= 0)
+  {
     close(kms.fd);
   }
 
@@ -479,7 +511,8 @@ void cleanup() {
 }
 
 // Uploads data to GPU, but does NOT draw.
-void upload_video_frame(VideoSource *v, int base_unit) {
+void upload_video_frame(VideoSource *v, int base_unit)
+{
   unsigned char *f = v->data + (v->curr_frame_idx * v->frame_size);
 
   glActiveTexture(GL_TEXTURE0 + base_unit);
@@ -497,10 +530,12 @@ void upload_video_frame(VideoSource *v, int base_unit) {
 }
 
 // --- DEBUG HELPER ---
-void check_shader(GLuint shader, const char *name) {
+void check_shader(GLuint shader, const char *name)
+{
   GLint success;
   glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-  if (!success) {
+  if (!success)
+  {
     char infoLog[512];
     glGetShaderInfoLog(shader, 512, NULL, infoLog);
     fprintf(stderr, "ERROR::%s::COMPILATION_FAILED\n%s\n", name, infoLog);
@@ -508,10 +543,12 @@ void check_shader(GLuint shader, const char *name) {
   }
 }
 
-void check_program(GLuint program) {
+void check_program(GLuint program)
+{
   GLint success;
   glGetProgramiv(program, GL_LINK_STATUS, &success);
-  if (!success) {
+  if (!success)
+  {
     char infoLog[512];
     glGetProgramInfoLog(program, 512, NULL, infoLog);
     fprintf(stderr, "ERROR::PROGRAM::LINKING_FAILED\n%s\n", infoLog);
@@ -520,7 +557,8 @@ void check_program(GLuint program) {
 }
 
 // Returns current time in milliseconds
-long long current_timestamp() {
+long long current_timestamp()
+{
   struct timeval te;
   gettimeofday(&te, NULL); // get current time
   long long milliseconds = te.tv_sec * 1000LL + te.tv_usec / 1000;
@@ -529,76 +567,100 @@ long long current_timestamp() {
 
 void exit_program() { running = false; }
 
-void apply_resize(int slot, int key) {
+void apply_resize(int slot, int key)
+{
   // 1. First, set default layout positions so we know where everyone starts.
   reset_layout();
 
   int filler = -1; // Who will fill the empty space?
 
-  if (slot == 0) { // TL
-    if (key == KEY_UP) {
+  if (slot == 0)
+  { // TL
+    if (key == KEY_UP)
+    {
       slot_rects[0] = RECT_TOP;
     } // Safe (Covered)
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[0] = RECT_LEFT;
     } // Safe (Covered)
-    if (key == KEY_DOWN) {
+    if (key == KEY_DOWN)
+    {
       slot_rects[0] = RECT_BOTTOM;
       filler = 1;
       slot_rects[filler] = RECT_TOP;
     }
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[0] = RECT_RIGHT;
       filler = 2;
       slot_rects[filler] = RECT_LEFT;
     }
-  } else if (slot == 1) { // TR
-    if (key == KEY_UP) {
+  }
+  else if (slot == 1)
+  { // TR
+    if (key == KEY_UP)
+    {
       slot_rects[1] = RECT_TOP;
     } // Safe
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[1] = RECT_RIGHT;
     } // Safe
-    if (key == KEY_DOWN) {
+    if (key == KEY_DOWN)
+    {
       slot_rects[1] = RECT_BOTTOM;
       filler = 0;
       slot_rects[filler] = RECT_TOP;
     }
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[1] = RECT_LEFT;
       filler = 3;
       slot_rects[filler] = RECT_RIGHT;
     }
-  } else if (slot == 2) { // BL
-    if (key == KEY_DOWN) {
+  }
+  else if (slot == 2)
+  { // BL
+    if (key == KEY_DOWN)
+    {
       slot_rects[2] = RECT_BOTTOM;
     } // Safe
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[2] = RECT_LEFT;
     } // Safe
-    if (key == KEY_UP) {
+    if (key == KEY_UP)
+    {
       slot_rects[2] = RECT_TOP;
       filler = 3;
       slot_rects[filler] = RECT_BOTTOM;
     }
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[2] = RECT_RIGHT;
       filler = 0;
       slot_rects[filler] = RECT_LEFT;
     }
-  } else if (slot == 3) { // BR
-    if (key == KEY_DOWN) {
+  }
+  else if (slot == 3)
+  { // BR
+    if (key == KEY_DOWN)
+    {
       slot_rects[3] = RECT_BOTTOM;
     } // Safe
-    if (key == KEY_RIGHT) {
+    if (key == KEY_RIGHT)
+    {
       slot_rects[3] = RECT_RIGHT;
     } // Safe
-    if (key == KEY_UP) {
+    if (key == KEY_UP)
+    {
       slot_rects[3] = RECT_TOP;
       filler = 2;
       slot_rects[filler] = RECT_BOTTOM;
     }
-    if (key == KEY_LEFT) {
+    if (key == KEY_LEFT)
+    {
       slot_rects[3] = RECT_LEFT;
       filler = 1;
       slot_rects[filler] = RECT_RIGHT;
@@ -607,19 +669,22 @@ void apply_resize(int slot, int key) {
 
   // 2. Hide Loop: Clean up overlaps
   // Any video that overlaps the 'Selected' or the 'Filler' must be hidden.
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++)
+  {
     if (i == slot)
       continue; // Don't check self
     if (filler != -1 && i == filler)
       continue; // Don't check filler
 
     // Check against selected
-    if (rects_overlap(slot_rects[slot], slot_rects[i])) {
+    if (rects_overlap(slot_rects[slot], slot_rects[i]))
+    {
       slot_rects[i].w = 0;
       slot_rects[i].h = 0;
     }
     // Check against filler (if it exists)
-    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i])) {
+    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i]))
+    {
       slot_rects[i].w = 0;
       slot_rects[i].h = 0;
     }
@@ -628,16 +693,19 @@ void apply_resize(int slot, int key) {
   layout_dirty = 1;
 }
 
-void *input_thread(void *arg) {
+void *input_thread(void *arg)
+{
   initscr();
   cbreak();
   noecho();
   nodelay(stdscr, TRUE);
   keypad(stdscr, TRUE);
 
-  while (running) {
+  while (running)
+  {
     int ch = getch();
-    if (ch != ERR) {
+    if (ch != ERR)
+    {
       if (ch == 'q')
         exit_program();
 
@@ -645,57 +713,85 @@ void *input_thread(void *arg) {
       if (ch >= '1' && ch <= '4')
         pressed_slot = ch - '1';
 
-      if (ch == '0') {
+      if (ch == '0')
+      {
         reset_layout();
         in_resize_mode = 0;
         in_change_mode = 0;
         selected_slot = -1;
-      } else if (in_resize_mode) {
-        if (pressed_slot != -1) {
+      }
+      else if (in_resize_mode)
+      {
+        if (pressed_slot != -1)
+        {
           selected_slot = pressed_slot;
-        } else if (ch == 'f') {
-          if (selected_slot != -1) {
+        }
+        else if (ch == 'f')
+        {
+          if (selected_slot != -1)
+          {
             // Fullscreen is safe (hide all others)
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 4; i++)
+            {
               slot_rects[i].w = 0;
               slot_rects[i].h = 0;
             }
             slot_rects[selected_slot] = RECT_FULL;
             layout_dirty = 1;
           }
-        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
-                   ch == KEY_DOWN) {
-          if (selected_slot != -1) {
+        }
+        else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
+                 ch == KEY_DOWN)
+        {
+          if (selected_slot != -1)
+          {
             apply_resize(selected_slot, ch);
           }
-        } else if (ch == 'r') {
+        }
+        else if (ch == 'r')
+        {
           in_resize_mode = 0;
         }
-      } else if (in_change_mode) {
-        if (pressed_slot != -1) {
+      }
+      else if (in_change_mode)
+      {
+        if (pressed_slot != -1)
+        {
           int src = selected_slot;
           int dst = pressed_slot;
-          if (src != dst) {
+          if (src != dst)
+          {
             int tmp = layout[src];
             layout[src] = layout[dst];
             layout[dst] = tmp;
           }
           in_change_mode = 0;
           selected_slot = -1;
-        } else {
+        }
+        else
+        {
           in_change_mode = 0;
           selected_slot = -1;
         }
-      } else {
-        if (pressed_slot != -1) {
+      }
+      else
+      {
+        if (pressed_slot != -1)
+        {
           selected_slot = pressed_slot;
-        } else if (ch == 'c') {
+        }
+        else if (ch == 'c')
+        {
           if (selected_slot != -1)
             in_change_mode = 1;
-        } else if (ch == 'r') {
+        }
+        else if (ch == 'r')
+        {
           if (selected_slot != -1)
             in_resize_mode = 1;
-        } else {
+        }
+        else
+        {
           selected_slot = -1;
         }
       }
@@ -705,7 +801,14 @@ void *input_thread(void *arg) {
   return NULL;
 }
 
-int main() {
+// Helper to calculate time difference in microseconds (us)
+long get_diff_us(struct timespec start, struct timespec end)
+{
+  return (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+}
+
+int main()
+{
   signal(SIGINT, handle_signal);
 
   if (init_kms() != 0)
@@ -783,11 +886,38 @@ int main() {
   pthread_t tid;
   pthread_create(&tid, NULL, input_thread, NULL);
 
+  // --- PROFILERS ---
+  struct timespec t0, t1, t2, t3, t4;
+
+  // Accumulators for profiling (in microseconds)
+  long acc_wait = 0;
+  long acc_upload = 0;
+  long acc_draw = 0;
+  long acc_swap = 0;
+  long acc_total = 0;
+
+  int profile_frame_count = 0;
+
+  FILE *log_file = fopen("output_log.csv", "w");
+  if (log_file)
+  {
+    fprintf(log_file, "Timestamp_ms,Wait_us,Upload_us,Draw_us,Swap_us,Total_us,FPS\n");
+  }
+  else
+  {
+    printf("Warning: Could not open log file!\n");
+  }
+
   printf("Ready. Keys: 1-4 Select | c=Swap | r=Resize | 0=Reset\n");
   printf("Resize: f=Full, Arrows=Halves\n");
 
-  while (running) {
-    while (waiting_for_flip) {
+  while (running)
+  {
+    // --- MEASURE WAIT TIME (VSync Idle) ---
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    while (waiting_for_flip)
+    {
       if (!running)
         break;
       FD_ZERO(&fds);
@@ -795,11 +925,16 @@ int main() {
       if (select(kms.fd + 1, &fds, 0, 0, 0) > 0)
         drmHandleEvent(kms.fd, &ev);
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1); // End Wait
     if (!running)
+    {
       break;
+    }
 
     // --- CHECK FOR GEOMETRY UPDATES ---
-    if (layout_dirty) {
+    if (layout_dirty)
+    {
       update_geometry_buffer(vbo);
     }
 
@@ -807,18 +942,66 @@ int main() {
     upload_video_frame(&videos[layout[1]], 2);
     upload_video_frame(&videos[layout[2]], 4);
     upload_video_frame(&videos[layout[3]], 6);
+    clock_gettime(CLOCK_MONOTONIC, &t2); // End Upload
 
     glDrawArrays(GL_TRIANGLES, 0, 24);
-    swap_buffers();
+    clock_gettime(CLOCK_MONOTONIC, &t3); // End Draw
 
-    // --- FPS CALCULATION ---
-    frame_count++;
-    long long current_time = current_timestamp();
-    if (current_time - last_time >= 1000) { // If 1 second has passed
-      printf("FPS: %d\r\n", frame_count);
-      frame_count = 0;
-      last_time = current_time;
+    swap_buffers();
+    clock_gettime(CLOCK_MONOTONIC, &t4); // End Swap
+
+    // --- ACCUMULATE TIMES ---
+    acc_wait += get_diff_us(t0, t1);
+    acc_upload += get_diff_us(t1, t2);
+    acc_draw += get_diff_us(t2, t3);
+    acc_swap += get_diff_us(t3, t4);
+    acc_total += get_diff_us(t0, t4); // Total loop time
+
+    // --- REPORT EVERY 60 FRAMES ---
+    profile_frame_count++;
+    if (profile_frame_count >= 60)
+    {
+      // Calculate Averages
+      long avg_wait = acc_wait / 60;
+      long avg_upload = acc_upload / 60;
+      long avg_draw = acc_draw / 60;
+      long avg_swap = acc_swap / 60;
+      long avg_total = acc_total / 60;
+      long fps_est = 1000000 / (avg_total > 0 ? avg_total : 1); // Avoid div by zero
+
+      // 1. Print to Console (So you can still see it live)
+      printf("FPS: %ld | Total: %ld us | Wait: %ld | Upload: %ld | Draw: %ld | Swap: %ld\n",
+             fps_est, avg_total, avg_wait, avg_upload, avg_draw, avg_swap);
+
+      // 2. Write to CSV File
+      if (log_file)
+      {
+        fprintf(log_file, "%lld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+                current_timestamp(), // Uses your existing timestamp function
+                avg_wait,
+                avg_upload,
+                avg_draw,
+                avg_swap,
+                avg_total,
+                fps_est);
+
+        fflush(log_file); // IMPORTANT: Force write to disk immediately
+      }
+
+      // Reset accumulators
+      acc_wait = acc_upload = acc_draw = acc_swap = acc_total = 0;
+      profile_frame_count = 0;
     }
+
+    // // --- FPS CALCULATION ---
+    // frame_count++;
+    // long long current_time = current_timestamp();
+    // if (current_time - last_time >= 1000)
+    // { // If 1 second has passed
+    //   printf("FPS: %d\r\n", frame_count);
+    //   frame_count = 0;
+    //   last_time = current_time;
+    // }
   }
 
   glDeleteProgram(p);
