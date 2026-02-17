@@ -253,6 +253,10 @@ int init_raw_input() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+  // ALLOCATE STORAGE ONCE (Pass NULL as data)
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
+               GL_UNSIGNED_BYTE, NULL);
+
   // UV Texture
   glGenTextures(1, &kms.tex_uv);
   glActiveTexture(GL_TEXTURE1);
@@ -261,6 +265,10 @@ int init_raw_input() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  // ALLOCATE STORAGE ONCE (Pass NULL as data)
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
+               GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
 
   return 0;
 }
@@ -273,14 +281,21 @@ void update_input_textures() {
   // Upload Y
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, kms.tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
-               GL_UNSIGNED_BYTE, frame_start);
+  // Note: xoffset=0, yoffset=0
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VID_W, VID_H, GL_LUMINANCE,
+                  GL_UNSIGNED_BYTE, frame_start);
+
+  // glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
+  //              GL_UNSIGNED_BYTE, frame_start);
 
   // Upload UV
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, kms.tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
-               GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VID_W / 2, VID_H / 2,
+                  GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
+
+  // glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
+  //  GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
 
   frame_idx++;
   if (frame_idx >= 900)
@@ -392,6 +407,20 @@ int init_egl() {
   return load_egl_extensions();
 }
 
+// Helper to calculate time difference in microseconds (us)
+long get_diff_us(struct timespec start, struct timespec end) {
+  return (end.tv_sec - start.tv_sec) * 1000000 +
+         (end.tv_nsec - start.tv_nsec) / 1000;
+}
+
+// Returns current time in milliseconds
+long long current_timestamp() {
+  struct timeval te;
+  gettimeofday(&te, NULL); // get current time
+  long long milliseconds = te.tv_sec * 1000LL + te.tv_usec / 1000;
+  return milliseconds;
+}
+
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
 
@@ -423,20 +452,45 @@ int main(int argc, char **argv) {
 
   int back_buf_idx = 0;
 
-  // FPS Stats
-  double last_time = get_time_sec();
-  int frames = 0;
+  // // FPS Stats
+  // double last_time = get_time_sec();
+  // int frames = 0;
+
+  // --- PROFILERS ---
+  struct timespec t0, t1, t2, t3, t4;
+
+  // Accumulators for profiling (in microseconds)
+  long acc_bind = 0;
+  long acc_upload = 0;
+  long acc_draw = 0;
+  long acc_swap = 0;
+  long acc_total = 0;
+
+  int profile_frame_count = 0;
+
+  FILE *log_file = fopen("output_log_gles.csv", "w");
+  if (log_file) {
+    fprintf(log_file,
+            "Timestamp_ms,Wait_us,Upload_us,Draw_us,Swap_us,Total_us,FPS\n");
+  } else {
+    printf("Warning: Could not open log file!\n");
+  }
 
   while (running) {
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     // 1. Upload YUV Data (CPU -> GPU Texture)
     update_input_textures();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
     // 2. Bind the FBO (Render directly to the Dumb Buffer)
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf_idx].fbo_id);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
 
     // 3. Render
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    clock_gettime(CLOCK_MONOTONIC, &t3);
 
     // 4. Finish (Ensure GPU is done writing before Display reads it)
     glFinish();
@@ -451,15 +505,54 @@ int main(int argc, char **argv) {
       perror("Flip failed");
 
     back_buf_idx = (back_buf_idx + 1) % 2;
+    clock_gettime(CLOCK_MONOTONIC, &t4);
 
-    // FPS
-    frames++;
-    double current_time = get_time_sec();
-    if (current_time - last_time >= 1.0) {
-      printf("FPS: %d\n", frames);
-      frames = 0;
-      last_time = current_time;
+    // --- ACCUMULATE TIMES ---
+    acc_upload += get_diff_us(t0, t1);
+    acc_bind += get_diff_us(t1, t2);
+    acc_draw += get_diff_us(t2, t3);
+    acc_swap += get_diff_us(t3, t4);
+    acc_total += get_diff_us(t0, t4); // Total loop time
+
+    // --- REPORT EVERY 60 FRAMES ---
+    profile_frame_count++;
+    if (profile_frame_count >= 60) {
+      // Calculate Averages
+      long avg_upload = acc_upload / 60;
+      long avg_bind = acc_bind / 60;
+      long avg_draw = acc_draw / 60;
+      long avg_swap = acc_swap / 60;
+      long avg_total = acc_total / 60;
+      long fps_est =
+          1000000 / (avg_total > 0 ? avg_total : 1); // Avoid div by zero
+
+      // 1. Print to Console (So you can still see it live)
+      printf("FPS: %ld | Total: %ld us | upload: %ld | bind: %ld | Draw: %ld | "
+             "Swap: %ld\n",
+             fps_est, avg_total, avg_upload, avg_bind, avg_draw, avg_swap);
+
+      // 2. Write to CSV File
+      if (log_file) {
+        fprintf(log_file, "%lld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+                current_timestamp(), // Uses your existing timestamp function
+                avg_upload, avg_bind, avg_draw, avg_swap, avg_total, fps_est);
+
+        fflush(log_file); // IMPORTANT: Force write to disk immediately
+      }
+
+      // Reset accumulators
+      acc_upload = acc_bind = acc_draw = acc_swap = acc_total = 0;
+      profile_frame_count = 0;
     }
+
+    // // FPS
+    // frames++;
+    // double current_time = get_time_sec();
+    // if (current_time - last_time >= 1.0) {
+    //   printf("FPS: %d\n", frames);
+    //   frames = 0;
+    //   last_time = current_time;
+    // }
   }
 
   cleanup();
