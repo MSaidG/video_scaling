@@ -101,7 +101,7 @@ struct {
 VideoSource videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
 
-// --- LAYOUT SYSTEM (From Your Original Code) ---
+// --- LAYOUT SYSTEM (Corrected) ---
 volatile int layout[4] = {0, 1, 2, 3}; // Maps Screen Slot -> Video Index
 volatile int selected_slot = -1;
 volatile int in_change_mode = 0;
@@ -113,18 +113,22 @@ typedef struct {
 } Rect;
 
 // Defaults (2x2 Grid)
+// Y-Coordinates flipped: -1.0 is TOP, 0.0 is BOTTOM for your display mapping
 const Rect default_rects[4] = {
-    {-1.0f, 0.0f, 1.0f, 1.0f},  // TL
-    {0.0f, 0.0f, 1.0f, 1.0f},   // TR
-    {-1.0f, -1.0f, 1.0f, 1.0f}, // BL
-    {0.0f, -1.0f, 1.0f, 1.0f}   // BR
+    {-1.0f, -1.0f, 1.0f, 1.0f}, // TL (Slot 0) -> Starts at -1.0 (Top)
+    {0.0f, -1.0f, 1.0f, 1.0f},  // TR (Slot 1) -> Starts at -1.0 (Top)
+    {-1.0f, 0.0f, 1.0f, 1.0f},  // BL (Slot 2) -> Starts at 0.0 (Bottom)
+    {0.0f, 0.0f, 1.0f, 1.0f}    // BR (Slot 3) -> Starts at 0.0 (Bottom)
 };
 volatile Rect slot_rects[4];
 
 // Shapes
 const Rect RECT_FULL = {-1.0f, -1.0f, 2.0f, 2.0f};
-const Rect RECT_TOP = {-1.0f, 0.0f, 2.0f, 1.0f};
-const Rect RECT_BOTTOM = {-1.0f, -1.0f, 2.0f, 1.0f};
+
+// UPDATED: Top starts at -1.0, Bottom starts at 0.0
+const Rect RECT_TOP = {-1.0f, -1.0f, 2.0f, 1.0f};
+const Rect RECT_BOTTOM = {-1.0f, 0.0f, 2.0f, 1.0f};
+
 const Rect RECT_LEFT = {-1.0f, -1.0f, 1.0f, 2.0f};
 const Rect RECT_RIGHT = {0.0f, -1.0f, 1.0f, 2.0f};
 
@@ -198,86 +202,101 @@ void reset_layout() {
   layout_dirty = 1;
 }
 
-// --- LOGIC FROM YOUR ORIGINAL CODE ---
+// --- RESIZE LOGIC ---
 void apply_resize(int slot, int key) {
+  // 1. Reset to default grid first
   reset_layout();
+
   int filler = -1;
 
-  if (slot == 0) { // TL
-    if (key == KEY_UP)
-      slot_rects[0] = RECT_TOP;
-    if (key == KEY_LEFT)
-      slot_rects[0] = RECT_LEFT;
-    if (key == KEY_DOWN) {
+  if (slot == 0) { // TOP LEFT (Video 1)
+    if (key == KEY_UP) {
+      slot_rects[0] = RECT_TOP; // Expands Up. Safe.
+    } else if (key == KEY_LEFT) {
+      slot_rects[0] = RECT_LEFT; // Expands Left. Safe.
+    } else if (key == KEY_DOWN) {
+      // Move to BOTTOM. Top is empty.
       slot_rects[0] = RECT_BOTTOM;
-      filler = 1;
+      filler = 1; // Slot 1 (TR/Video 2) fills TOP
       slot_rects[filler] = RECT_TOP;
-    }
-    if (key == KEY_RIGHT) {
+    } else if (key == KEY_RIGHT) {
+      // Move to RIGHT. Left is empty.
       slot_rects[0] = RECT_RIGHT;
-      filler = 2;
+      filler = 2; // Slot 2 (BL/Video 3) fills LEFT
       slot_rects[filler] = RECT_LEFT;
     }
-  } else if (slot == 1) { // TR
+  } else if (slot == 1) { // TOP RIGHT (Video 2)
     if (key == KEY_UP)
       slot_rects[1] = RECT_TOP;
     if (key == KEY_RIGHT)
       slot_rects[1] = RECT_RIGHT;
     if (key == KEY_DOWN) {
+      // Move to BOTTOM. Top is empty.
       slot_rects[1] = RECT_BOTTOM;
-      filler = 0;
+      filler = 0; // Slot 0 (TL/Video 1) fills TOP
       slot_rects[filler] = RECT_TOP;
     }
     if (key == KEY_LEFT) {
+      // Move to LEFT. Right is empty.
       slot_rects[1] = RECT_LEFT;
-      filler = 3;
+      filler = 3; // Slot 3 (BR/Video 4) fills RIGHT
       slot_rects[filler] = RECT_RIGHT;
     }
-  } else if (slot == 2) { // BL
+  } else if (slot == 2) { // BOTTOM LEFT (Video 3)
     if (key == KEY_DOWN)
       slot_rects[2] = RECT_BOTTOM;
     if (key == KEY_LEFT)
       slot_rects[2] = RECT_LEFT;
     if (key == KEY_UP) {
+      // Move to TOP. Bottom is empty.
       slot_rects[2] = RECT_TOP;
-      filler = 3;
+      filler = 3; // Slot 3 (BR/Video 4) fills BOTTOM
       slot_rects[filler] = RECT_BOTTOM;
     }
     if (key == KEY_RIGHT) {
+      // Move to RIGHT. Left is empty.
       slot_rects[2] = RECT_RIGHT;
-      filler = 0;
+      filler = 0; // Slot 0 (TL/Video 1) fills LEFT
       slot_rects[filler] = RECT_LEFT;
     }
-  } else if (slot == 3) { // BR
+  } else if (slot == 3) { // BOTTOM RIGHT (Video 4)
     if (key == KEY_DOWN)
       slot_rects[3] = RECT_BOTTOM;
     if (key == KEY_RIGHT)
       slot_rects[3] = RECT_RIGHT;
     if (key == KEY_UP) {
+      // Move to TOP. Bottom is empty.
       slot_rects[3] = RECT_TOP;
-      filler = 2;
+      filler = 2; // Slot 2 (BL/Video 3) fills BOTTOM
       slot_rects[filler] = RECT_BOTTOM;
     }
     if (key == KEY_LEFT) {
+      // Move to LEFT. Right is empty.
       slot_rects[3] = RECT_LEFT;
-      filler = 1;
+      filler = 1; // Slot 1 (TR/Video 2) fills RIGHT
       slot_rects[filler] = RECT_RIGHT;
     }
   }
 
-  // Hide Overlaps
+  // 2. Hide Loop: Clean up overlaps
   for (int i = 0; i < 4; i++) {
-    if (i == slot || (filler != -1 && i == filler))
+    if (i == slot)
       continue;
+    if (filler != -1 && i == filler)
+      continue;
+
+    // If I overlap the main mover, hide me
     if (rects_overlap(slot_rects[slot], slot_rects[i])) {
       slot_rects[i].w = 0;
       slot_rects[i].h = 0;
     }
+    // If I overlap the filler, hide me
     if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i])) {
       slot_rects[i].w = 0;
       slot_rects[i].h = 0;
     }
   }
+
   layout_dirty = 1;
 }
 
@@ -368,10 +387,12 @@ void *input_thread(void *arg) {
           in_resize_mode = 0;
       } else if (in_change_mode) {
         if (pressed_slot != -1) {
-          if (selected_slot != -1) {
-            int tmp = layout[selected_slot];
-            layout[selected_slot] = layout[pressed_slot];
-            layout[pressed_slot] = tmp;
+          int src = selected_slot;
+          int dst = pressed_slot;
+          if (src != dst) {
+            int tmp = layout[src];
+            layout[src] = layout[dst];
+            layout[dst] = tmp;
           }
           in_change_mode = 0;
           selected_slot = -1;
@@ -535,33 +556,38 @@ void update_geometry() {
     verts[idx++] = r.x;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 0.0f;
-    verts[idx++] = 0.0f;
+    verts[idx++] = 1.0f; // Was 0.0f -> Flip to 1.0f
     verts[idx++] = id;
+
     verts[idx++] = r.x;
     verts[idx++] = r.y;
     verts[idx++] = 0.0f;
-    verts[idx++] = 1.0f;
+    verts[idx++] = 0.0f; // Was 1.0f -> Flip to 0.0f
     verts[idx++] = id;
+
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
-    verts[idx++] = 0.0f;
+    verts[idx++] = 1.0f; // Was 0.0f -> Flip to 1.0f
     verts[idx++] = id;
+
     // Tri 2
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
-    verts[idx++] = 0.0f;
+    verts[idx++] = 1.0f; // Was 0.0f -> Flip to 1.0f
     verts[idx++] = id;
+
     verts[idx++] = r.x;
     verts[idx++] = r.y;
     verts[idx++] = 0.0f;
-    verts[idx++] = 1.0f;
+    verts[idx++] = 0.0f; // Was 1.0f -> Flip to 0.0f
     verts[idx++] = id;
+
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y;
     verts[idx++] = 1.0f;
-    verts[idx++] = 1.0f;
+    verts[idx++] = 0.0f; // Was 1.0f -> Flip to 0.0f
     verts[idx++] = id;
   }
 
@@ -701,10 +727,10 @@ int main(int argc, char **argv) {
       update_geometry();
 
     // Upload 4 Videos
-    upload_video_frame(&videos[0], 0);
-    upload_video_frame(&videos[1], 2);
-    upload_video_frame(&videos[2], 4);
-    upload_video_frame(&videos[3], 6);
+    upload_video_frame(&videos[layout[0]], 0);
+    upload_video_frame(&videos[layout[1]], 2);
+    upload_video_frame(&videos[layout[2]], 4);
+    upload_video_frame(&videos[layout[3]], 6);
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
