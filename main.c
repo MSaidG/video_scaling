@@ -32,9 +32,13 @@ PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = NULL;
 PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = NULL;
 PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
 
-#define VID_W 1920
-#define VID_H 1080
-#define RAW_FILE "nv12_1080p60.yuv"
+#define VID_W 640 //1920
+#define VID_H 480 //1080
+#define RAW_FILE "nv12_480p60.yuv"
+
+#define NUM_TEST_FRAMES 100 // Cache 1 second of video
+// Add to your global kms struct or as a global variable:
+unsigned char *ram_cache = NULL;
 
 // --- YUV TO RGB SHADER (Same as before) ---
 const char *vs_src = "attribute vec4 a_pos;    \n"
@@ -224,7 +228,6 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   return 0;
 }
 
-// --- VIDEO INPUT (MMAP) ---
 int init_raw_input() {
   kms.cam_fd = open(RAW_FILE, O_RDONLY);
   if (kms.cam_fd < 0) {
@@ -232,19 +235,27 @@ int init_raw_input() {
     return -1;
   }
 
-  struct stat sb;
-  fstat(kms.cam_fd, &sb);
-  size_t file_size = sb.st_size;
   kms.frame_size = VID_W * VID_H * 3 / 2;
+  size_t cache_size = kms.frame_size * NUM_TEST_FRAMES;
 
-  kms.frame_buffer =
-      mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, kms.cam_fd, 0);
-  if (kms.frame_buffer == MAP_FAILED)
+  // Allocate standard RAM
+  ram_cache = (unsigned char *)malloc(cache_size);
+  if (!ram_cache) {
+    fprintf(stderr, "Failed to allocate RAM cache\n");
     return -1;
+  }
 
-  printf("Mapped Raw File: %zu MB\n", file_size / 1024 / 1024);
+  // Read exactly NUM_TEST_FRAMES into RAM once during setup
+  printf("Loading %d frames into RAM (approx %zu MB)...\n", NUM_TEST_FRAMES,
+         cache_size / 1024 / 1024);
 
-  // Y Texture
+  ssize_t bytes_read = read(kms.cam_fd, ram_cache, cache_size);
+  if (bytes_read < cache_size) {
+    printf("Warning: Could only read %zd bytes\n", bytes_read);
+  }
+  close(kms.cam_fd); // We don't need the file anymore!
+
+  // --- Texture Setup (From the previous fix) ---
   glGenTextures(1, &kms.tex_y);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, kms.tex_y);
@@ -252,12 +263,9 @@ int init_raw_input() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-  // ALLOCATE STORAGE ONCE (Pass NULL as data)
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
                GL_UNSIGNED_BYTE, NULL);
 
-  // UV Texture
   glGenTextures(1, &kms.tex_uv);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, kms.tex_uv);
@@ -265,8 +273,6 @@ int init_raw_input() {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-  // ALLOCATE STORAGE ONCE (Pass NULL as data)
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
                GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
 
@@ -275,31 +281,24 @@ int init_raw_input() {
 
 void update_input_textures() {
   static int frame_idx = 0;
-  unsigned char *frame_start = kms.frame_buffer + (frame_idx * kms.frame_size);
+
+  // Read from the RAM cache instead of the mmap
+  unsigned char *frame_start = ram_cache + (frame_idx * kms.frame_size);
   unsigned char *uv_start = frame_start + (VID_W * VID_H);
 
-  // Upload Y
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, kms.tex_y);
-  // Note: xoffset=0, yoffset=0
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VID_W, VID_H, GL_LUMINANCE,
                   GL_UNSIGNED_BYTE, frame_start);
 
-  // glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, VID_W, VID_H, 0, GL_LUMINANCE,
-  //              GL_UNSIGNED_BYTE, frame_start);
-
-  // Upload UV
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, kms.tex_uv);
   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VID_W / 2, VID_H / 2,
                   GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
 
-  // glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, VID_W / 2, VID_H / 2, 0,
-  //  GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_start);
-
   frame_idx++;
-  if (frame_idx >= 900)
-    frame_idx = 0;
+  if (frame_idx >= NUM_TEST_FRAMES)
+    frame_idx = 0; // Loop the 60 frames
 }
 
 // --- INIT FUNCTIONS ---
@@ -493,7 +492,7 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t3);
 
     // 4. Finish (Ensure GPU is done writing before Display reads it)
-    glFinish();
+    // glFinish();
 
     // 5. Flip (Display Controller reads the new buffer)
     int ret = drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
