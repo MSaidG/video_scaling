@@ -21,19 +21,30 @@
 #include <xf86drmMode.h>
 
 // --- CONFIG ---
-#define VIDEO_COUNT 2
+#define VIDEO_COUNT 4
 #define NUM_TEST_FRAMES 100
 
-// Video Configs
+// Video 1 (TL)
 #define RAW_FILE_1 "nv12_480p60.yuv"
 #define VID_1_W 640
 #define VID_1_H 480
 
+// Video 2 (TR)
 #define RAW_FILE_2 "nv12_1080p60.yuv"
 #define VID_2_W 1920
 #define VID_2_H 1080
 
-// --- EXTENSION DEFINITIONS ---
+// Video 3 (BL)
+#define RAW_FILE_3 "nv12_720p30.yuv"
+#define VID_3_W 1280
+#define VID_3_H 720
+
+// Video 4 (BR)
+#define RAW_FILE_4 "nv12_300x300p30.yuv"
+#define VID_4_W 300
+#define VID_4_H 300
+
+// --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
     EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer,
     const EGLint *attrib_list);
@@ -60,7 +71,7 @@ typedef struct {
 
 typedef struct {
   const char *filename;
-  unsigned char *data; // RAM Cache
+  unsigned char *data;
   size_t frame_size;
   size_t total_size;
   int total_frames;
@@ -78,11 +89,10 @@ struct {
   drmModeCrtc *crtc;
   uint32_t plane_primary_id;
   uint32_t plane_overlay_id;
-  DumbBuffer bufs[2]; // Double Buffering
+  DumbBuffer bufs[2];
   EGLDisplay egl_disp;
   EGLContext egl_ctx;
   EGLSurface egl_surf;
-
   GLuint prog;
   GLuint vbo;
 } kms;
@@ -91,11 +101,34 @@ struct {
 VideoSource videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
 
-// Layout State: 0 = Horizontal, 1 = Vertical
-volatile int current_layout = 0;
+// --- LAYOUT SYSTEM (From Your Original Code) ---
+volatile int layout[4] = {0, 1, 2, 3}; // Maps Screen Slot -> Video Index
+volatile int selected_slot = -1;
+volatile int in_change_mode = 0;
+volatile int in_resize_mode = 0;
 volatile int layout_dirty = 1;
 
-// --- SHADERS ---
+typedef struct {
+  float x, y, w, h;
+} Rect;
+
+// Defaults (2x2 Grid)
+const Rect default_rects[4] = {
+    {-1.0f, 0.0f, 1.0f, 1.0f},  // TL
+    {0.0f, 0.0f, 1.0f, 1.0f},   // TR
+    {-1.0f, -1.0f, 1.0f, 1.0f}, // BL
+    {0.0f, -1.0f, 1.0f, 1.0f}   // BR
+};
+volatile Rect slot_rects[4];
+
+// Shapes
+const Rect RECT_FULL = {-1.0f, -1.0f, 2.0f, 2.0f};
+const Rect RECT_TOP = {-1.0f, 0.0f, 2.0f, 1.0f};
+const Rect RECT_BOTTOM = {-1.0f, -1.0f, 2.0f, 1.0f};
+const Rect RECT_LEFT = {-1.0f, -1.0f, 1.0f, 2.0f};
+const Rect RECT_RIGHT = {0.0f, -1.0f, 1.0f, 2.0f};
+
+// --- SHADERS (4 Video Support) ---
 const char *vs_src = "attribute vec4 a_pos;\n"
                      "attribute vec2 a_tex;\n"
                      "attribute float a_vid;\n"
@@ -107,40 +140,145 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "   v_vid = a_vid;\n"
                      "}\n";
 
-const char *fs_src =
-    "precision mediump float;\n"
-    "varying vec2 v_tex;\n"
-    "varying float v_vid;\n"
-    "uniform sampler2D ty0; uniform sampler2D tu0;\n" // Video 0
-    "uniform sampler2D ty1; uniform sampler2D tu1;\n" // Video 1
+const char *fs_src = "precision mediump float;\n"
+                     "varying vec2 v_tex;\n"
+                     "varying float v_vid;\n"
+                     "uniform sampler2D ty0; uniform sampler2D tu0;\n"
+                     "uniform sampler2D ty1; uniform sampler2D tu1;\n"
+                     "uniform sampler2D ty2; uniform sampler2D tu2;\n"
+                     "uniform sampler2D ty3; uniform sampler2D tu3;\n"
 
-    "vec3 yuv2rgb(float y, float u, float v) {\n"
-    "  float r = y + 1.402 * v;\n"
-    "  float g = y - 0.344 * u - 0.714 * v;\n"
-    "  float b = y + 1.772 * u;\n"
-    "  return vec3(r, g, b);\n"
-    "}\n"
+                     "vec3 yuv2rgb(float y, float u, float v) {\n"
+                     "  float r = y + 1.402 * v;\n"
+                     "  float g = y - 0.344 * u - 0.714 * v;\n"
+                     "  float b = y + 1.772 * u;\n"
+                     "  return vec3(r, g, b);\n"
+                     "}\n"
 
-    "void main() {\n"
-    "  float y, u, v;\n"
-    "  if (v_vid < 0.5) {\n" // Video 0
-    "    y = texture2D(ty0, v_tex).r;\n"
-    "    vec4 uv = texture2D(tu0, v_tex);\n"
-    "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
-    "  } else {\n" // Video 1
-    "    y = texture2D(ty1, v_tex).r;\n"
-    "    vec4 uv = texture2D(tu1, v_tex);\n"
-    "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
-    "  }\n"
-    "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
-    "}\n";
+                     "void main() {\n"
+                     "  float y, u, v;\n"
+                     "  if (v_vid < 0.5) {\n"
+                     "    y = texture2D(ty0, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu0, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  } else if (v_vid < 1.5) {\n"
+                     "    y = texture2D(ty1, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu1, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  } else if (v_vid < 2.5) {\n"
+                     "    y = texture2D(ty2, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu2, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  } else {\n"
+                     "    y = texture2D(ty3, v_tex).r;\n"
+                     "    vec4 uv = texture2D(tu3, v_tex);\n"
+                     "    u = uv.r - 0.5; v = uv.a - 0.5;\n"
+                     "  }\n"
+                     "  gl_FragColor = vec4(yuv2rgb(y, u, v), 1.0);\n"
+                     "}\n";
 
-// --- UTILS ---
+// --- HELPERS ---
 void handle_sigint(int sig) { running = 0; }
 
 long get_diff_us(struct timespec start, struct timespec end) {
   return (end.tv_sec - start.tv_sec) * 1000000 +
          (end.tv_nsec - start.tv_nsec) / 1000;
+}
+
+int rects_overlap(Rect r1, Rect r2) {
+  if (r1.w == 0 || r1.h == 0 || r2.w == 0 || r2.h == 0)
+    return 0;
+  return r1.x < r2.x + r2.w && r1.x + r1.w > r2.x && r1.y < r2.y + r2.h &&
+         r1.y + r1.h > r2.y;
+}
+
+void reset_layout() {
+  for (int i = 0; i < 4; i++)
+    slot_rects[i] = default_rects[i];
+  layout_dirty = 1;
+}
+
+// --- LOGIC FROM YOUR ORIGINAL CODE ---
+void apply_resize(int slot, int key) {
+  reset_layout();
+  int filler = -1;
+
+  if (slot == 0) { // TL
+    if (key == KEY_UP)
+      slot_rects[0] = RECT_TOP;
+    if (key == KEY_LEFT)
+      slot_rects[0] = RECT_LEFT;
+    if (key == KEY_DOWN) {
+      slot_rects[0] = RECT_BOTTOM;
+      filler = 1;
+      slot_rects[filler] = RECT_TOP;
+    }
+    if (key == KEY_RIGHT) {
+      slot_rects[0] = RECT_RIGHT;
+      filler = 2;
+      slot_rects[filler] = RECT_LEFT;
+    }
+  } else if (slot == 1) { // TR
+    if (key == KEY_UP)
+      slot_rects[1] = RECT_TOP;
+    if (key == KEY_RIGHT)
+      slot_rects[1] = RECT_RIGHT;
+    if (key == KEY_DOWN) {
+      slot_rects[1] = RECT_BOTTOM;
+      filler = 0;
+      slot_rects[filler] = RECT_TOP;
+    }
+    if (key == KEY_LEFT) {
+      slot_rects[1] = RECT_LEFT;
+      filler = 3;
+      slot_rects[filler] = RECT_RIGHT;
+    }
+  } else if (slot == 2) { // BL
+    if (key == KEY_DOWN)
+      slot_rects[2] = RECT_BOTTOM;
+    if (key == KEY_LEFT)
+      slot_rects[2] = RECT_LEFT;
+    if (key == KEY_UP) {
+      slot_rects[2] = RECT_TOP;
+      filler = 3;
+      slot_rects[filler] = RECT_BOTTOM;
+    }
+    if (key == KEY_RIGHT) {
+      slot_rects[2] = RECT_RIGHT;
+      filler = 0;
+      slot_rects[filler] = RECT_LEFT;
+    }
+  } else if (slot == 3) { // BR
+    if (key == KEY_DOWN)
+      slot_rects[3] = RECT_BOTTOM;
+    if (key == KEY_RIGHT)
+      slot_rects[3] = RECT_RIGHT;
+    if (key == KEY_UP) {
+      slot_rects[3] = RECT_TOP;
+      filler = 2;
+      slot_rects[filler] = RECT_BOTTOM;
+    }
+    if (key == KEY_LEFT) {
+      slot_rects[3] = RECT_LEFT;
+      filler = 1;
+      slot_rects[filler] = RECT_RIGHT;
+    }
+  }
+
+  // Hide Overlaps
+  for (int i = 0; i < 4; i++) {
+    if (i == slot || (filler != -1 && i == filler))
+      continue;
+    if (rects_overlap(slot_rects[slot], slot_rects[i])) {
+      slot_rects[i].w = 0;
+      slot_rects[i].h = 0;
+    }
+    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i])) {
+      slot_rects[i].w = 0;
+      slot_rects[i].h = 0;
+    }
+  }
+  layout_dirty = 1;
 }
 
 // --- CLEANUP ---
@@ -189,7 +327,7 @@ void cleanup() {
   printf("Done.\n");
 }
 
-// --- INPUT THREAD ---
+// --- INPUT THREAD (Restored Your Exact System) ---
 void *input_thread(void *arg) {
   initscr();
   cbreak();
@@ -198,14 +336,61 @@ void *input_thread(void *arg) {
   keypad(stdscr, TRUE);
   while (running) {
     int ch = getch();
-    if (ch == 'q')
-      running = 0;
-    else if (ch == 'h') {
-      current_layout = 0;
-      layout_dirty = 1;
-    } else if (ch == 'v') {
-      current_layout = 1;
-      layout_dirty = 1;
+    if (ch != ERR) {
+      if (ch == 'q')
+        running = 0;
+      int pressed_slot = -1;
+      if (ch >= '1' && ch <= '4')
+        pressed_slot = ch - '1';
+
+      if (ch == '0') {
+        reset_layout();
+        in_resize_mode = 0;
+        in_change_mode = 0;
+        selected_slot = -1;
+      } else if (in_resize_mode) {
+        if (pressed_slot != -1)
+          selected_slot = pressed_slot;
+        else if (ch == 'f') {
+          if (selected_slot != -1) {
+            for (int i = 0; i < 4; i++) {
+              slot_rects[i].w = 0;
+              slot_rects[i].h = 0;
+            }
+            slot_rects[selected_slot] = RECT_FULL;
+            layout_dirty = 1;
+          }
+        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
+                   ch == KEY_DOWN) {
+          if (selected_slot != -1)
+            apply_resize(selected_slot, ch);
+        } else if (ch == 'r')
+          in_resize_mode = 0;
+      } else if (in_change_mode) {
+        if (pressed_slot != -1) {
+          if (selected_slot != -1) {
+            int tmp = layout[selected_slot];
+            layout[selected_slot] = layout[pressed_slot];
+            layout[pressed_slot] = tmp;
+          }
+          in_change_mode = 0;
+          selected_slot = -1;
+        } else {
+          in_change_mode = 0;
+          selected_slot = -1;
+        }
+      } else {
+        if (pressed_slot != -1)
+          selected_slot = pressed_slot;
+        else if (ch == 'c') {
+          if (selected_slot != -1)
+            in_change_mode = 1;
+        } else if (ch == 'r') {
+          if (selected_slot != -1)
+            in_resize_mode = 1;
+        } else
+          selected_slot = -1;
+      }
     }
     usleep(10000);
   }
@@ -275,7 +460,7 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   return 0;
 }
 
-// Init Video (Proper sizing logic)
+// Init Video
 int init_video_source(VideoSource *v, const char *filename, int width,
                       int height) {
   v->filename = filename;
@@ -287,7 +472,6 @@ int init_video_source(VideoSource *v, const char *filename, int width,
   v->frame_size = width * height * 3 / 2;
   v->total_size = v->frame_size * NUM_TEST_FRAMES;
 
-  // Allocate RAM Cache
   v->data = malloc(v->total_size);
   if (!v->data) {
     fprintf(stderr, "Failed to allocate memory for %s\n", filename);
@@ -301,11 +485,10 @@ int init_video_source(VideoSource *v, const char *filename, int width,
   }
 
   printf("Loading %s (%zu MB)... ", filename, v->total_size / 1024 / 1024);
-  read(fd, v->data, v->total_size); // Load all frames
+  read(fd, v->data, v->total_size);
   close(fd);
   printf("Done.\n");
 
-  // Create Textures
   glGenTextures(1, &v->tex_y);
   glBindTexture(GL_TEXTURE_2D, v->tex_y);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -323,7 +506,6 @@ int init_video_source(VideoSource *v, const char *filename, int width,
   return 0;
 }
 
-// Upload Frame (Respects individual video sizes)
 void upload_video_frame(VideoSource *v, int base_unit) {
   unsigned char *f = v->data + (v->curr_frame_idx * v->frame_size);
   unsigned char *uv = f + (v->width * v->height);
@@ -342,25 +524,13 @@ void upload_video_frame(VideoSource *v, int base_unit) {
 }
 
 void update_geometry() {
-  GLfloat verts[2 * 6 * 5];
+  GLfloat verts[4 * 6 * 5];
   int idx = 0;
-  typedef struct {
-    float x, y, w, h;
-  } Rect;
-  Rect r1, r2;
 
-  if (current_layout == 0) {               // Horizontal
-    r1 = (Rect){-1.0f, -1.0f, 1.0f, 2.0f}; // Left
-    r2 = (Rect){0.0f, -1.0f, 1.0f, 2.0f};  // Right
-  } else {                                 // Vertical
-    r1 = (Rect){-1.0f, 0.0f, 2.0f, 1.0f};  // Top
-    r2 = (Rect){-1.0f, -1.0f, 2.0f, 1.0f}; // Bottom
-  }
-  Rect rects[2] = {r1, r2};
+  for (int i = 0; i < 4; i++) {
+    Rect r = slot_rects[i];
+    float id = (float)layout[i]; // USE LAYOUT MAPPING HERE!
 
-  for (int i = 0; i < 2; i++) {
-    Rect r = rects[i];
-    float id = (float)i;
     // Tri 1
     verts[idx++] = r.x;
     verts[idx++] = r.y + r.h;
@@ -403,7 +573,6 @@ void update_geometry() {
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
 
-  // --- INIT DRM ---
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
@@ -414,11 +583,10 @@ int main(int argc, char **argv) {
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
   drmModeFreeResources(res);
 
-  // STATIC PLANES (As requested)
+  // STATIC PLANES (YOUR REQUIREMENT)
   kms.plane_primary_id = 39;
   kms.plane_overlay_id = 41;
 
-  // --- INIT EGL ---
   kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
     kms.egl_disp = eglGetDisplay((EGLNativeDisplayType)kms.fd);
@@ -451,12 +619,20 @@ int main(int argc, char **argv) {
   create_dumb_buffer_fbo(&kms.bufs[0]);
   create_dumb_buffer_fbo(&kms.bufs[1]);
 
-  // --- INIT VIDEOS & GRAPHICS ---
+  // --- INIT 4 VIDEOS ---
   if (init_video_source(&videos[0], RAW_FILE_1, VID_1_W, VID_1_H) < 0) {
     cleanup();
     return -1;
   }
   if (init_video_source(&videos[1], RAW_FILE_2, VID_2_W, VID_2_H) < 0) {
+    cleanup();
+    return -1;
+  }
+  if (init_video_source(&videos[2], RAW_FILE_3, VID_3_W, VID_3_H) < 0) {
+    cleanup();
+    return -1;
+  }
+  if (init_video_source(&videos[3], RAW_FILE_4, VID_4_W, VID_4_H) < 0) {
     cleanup();
     return -1;
   }
@@ -476,8 +652,9 @@ int main(int argc, char **argv) {
 
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
-  glBufferData(GL_ARRAY_BUFFER, 2 * 6 * 5 * sizeof(float), NULL,
+  glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 5 * sizeof(float), NULL,
                GL_DYNAMIC_DRAW);
+  reset_layout();
   update_geometry();
 
   GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
@@ -493,10 +670,15 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(loc_vid, 1, GL_FLOAT, GL_FALSE, stride,
                         (void *)(4 * sizeof(float)));
 
+  // Bind all 8 Texture Units (4 Videos x 2 Planes)
   glUniform1i(glGetUniformLocation(kms.prog, "ty0"), 0);
   glUniform1i(glGetUniformLocation(kms.prog, "tu0"), 1);
   glUniform1i(glGetUniformLocation(kms.prog, "ty1"), 2);
   glUniform1i(glGetUniformLocation(kms.prog, "tu1"), 3);
+  glUniform1i(glGetUniformLocation(kms.prog, "ty2"), 4);
+  glUniform1i(glGetUniformLocation(kms.prog, "tu2"), 5);
+  glUniform1i(glGetUniformLocation(kms.prog, "ty3"), 6);
+  glUniform1i(glGetUniformLocation(kms.prog, "tu3"), 7);
 
   pthread_t tid;
   pthread_create(&tid, NULL, input_thread, NULL);
@@ -510,7 +692,7 @@ int main(int argc, char **argv) {
   long total_us = 0;
   int count = 0;
 
-  printf("Running... Press 'h', 'v', 'q'.\n");
+  printf("Running 4 Videos... Press 1-4, c, r, f, Arrows, q.\n");
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -518,20 +700,22 @@ int main(int argc, char **argv) {
     if (layout_dirty)
       update_geometry();
 
-    // UPLOAD: Each video uploaded with its own size
-    upload_video_frame(&videos[0], 0); // Video 0 -> Texture Unit 0 & 1
-    upload_video_frame(&videos[1], 2); // Video 1 -> Texture Unit 2 & 3
+    // Upload 4 Videos
+    upload_video_frame(&videos[0], 0);
+    upload_video_frame(&videos[1], 2);
+    upload_video_frame(&videos[2], 4);
+    upload_video_frame(&videos[3], 6);
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
-    // Debug Color: Red
-    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f); // Red Debug
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glDrawArrays(GL_TRIANGLES, 0, 12);
+    glDrawArrays(GL_TRIANGLES, 0, 24); // 4 Quads
 
-    // FLIP
+    // NO GL FINISH (As requested)
+
     drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
                     kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
