@@ -1,6 +1,4 @@
 #include <fcntl.h>
-#include <ncurses.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,22 +22,40 @@
 #define VIDEO_COUNT 4
 #define NUM_TEST_FRAMES 100
 
-// Video 1 (TL)
+// Screen / Grid Config
+#define SCREEN_W 1920.0f
+#define SCREEN_H 1080.0f
+
+// --- ANIMATION STEPS (6 Steps) ---
+// Video 1 (TL Slot) - Scales both width and height proportionally
+const float VID1_W[6] = {160.0f, 320.0f, 480.0f, 640.0f, 800.0f, 960.0f};
+const float VID1_H[6] = {90.0f, 180.0f, 270.0f, 360.0f, 450.0f, 540.0f};
+
+// Video 2 (TR Slot) - Width is static, height scales
+const float VID2_W[6] = {960.0f, 960.0f, 960.0f, 960.0f, 960.0f, 960.0f};
+const float VID2_H[6] = {90.0f, 180.0f, 270.0f, 360.0f, 450.0f, 540.0f};
+
+// Video 3 (BL Slot) - Width scales, height is static
+const float VID3_W[6] = {160.0f, 320.0f, 480.0f, 640.0f, 800.0f, 960.0f};
+const float VID3_H[6] = {540.0f, 540.0f, 540.0f, 540.0f, 540.0f, 540.0f};
+
+// Video 4 (BR Slot) - Completely static
+const float VID4_W = 960.0f;
+const float VID4_H = 540.0f;
+
+// Video Sources
 #define RAW_FILE_1 "nv12_480p60.yuv"
 #define VID_1_W 640
 #define VID_1_H 480
 
-// Video 2 (TR)
 #define RAW_FILE_2 "nv12_1080p60.yuv"
 #define VID_2_W 1920
 #define VID_2_H 1080
 
-// Video 3 (BL)
 #define RAW_FILE_3 "nv12_720p30.yuv"
 #define VID_3_W 1280
 #define VID_3_H 720
 
-// Video 4 (BR)
 #define RAW_FILE_4 "nv12_300x300p30.yuv"
 #define VID_4_W 300
 #define VID_4_H 300
@@ -101,36 +117,14 @@ struct {
 VideoSource videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
 
-// --- LAYOUT SYSTEM (Corrected) ---
+// --- LAYOUT SYSTEM ---
 volatile int layout[4] = {0, 1, 2, 3}; // Maps Screen Slot -> Video Index
-volatile int selected_slot = -1;
-volatile int in_change_mode = 0;
-volatile int in_resize_mode = 0;
-volatile int layout_dirty = 1;
 
 typedef struct {
   float x, y, w, h;
 } Rect;
 
-// Defaults (2x2 Grid)
-// Y-Coordinates flipped: -1.0 is TOP, 0.0 is BOTTOM for your display mapping
-const Rect default_rects[4] = {
-    {-1.0f, -1.0f, 1.0f, 1.0f}, // TL (Slot 0) -> Starts at -1.0 (Top)
-    {0.0f, -1.0f, 1.0f, 1.0f},  // TR (Slot 1) -> Starts at -1.0 (Top)
-    {-1.0f, 0.0f, 1.0f, 1.0f},  // BL (Slot 2) -> Starts at 0.0 (Bottom)
-    {0.0f, 0.0f, 1.0f, 1.0f}    // BR (Slot 3) -> Starts at 0.0 (Bottom)
-};
 volatile Rect slot_rects[4];
-
-// Shapes
-const Rect RECT_FULL = {-1.0f, -1.0f, 2.0f, 2.0f};
-
-// UPDATED: Top starts at -1.0, Bottom starts at 0.0
-const Rect RECT_TOP = {-1.0f, -1.0f, 2.0f, 1.0f};
-const Rect RECT_BOTTOM = {-1.0f, 0.0f, 2.0f, 1.0f};
-
-const Rect RECT_LEFT = {-1.0f, -1.0f, 1.0f, 2.0f};
-const Rect RECT_RIGHT = {0.0f, -1.0f, 1.0f, 2.0f};
 
 // --- SHADERS (4 Video Support) ---
 const char *vs_src = "attribute vec4 a_pos;\n"
@@ -189,115 +183,33 @@ long get_diff_us(struct timespec start, struct timespec end) {
          (end.tv_nsec - start.tv_nsec) / 1000;
 }
 
-int rects_overlap(Rect r1, Rect r2) {
-  if (r1.w == 0 || r1.h == 0 || r2.w == 0 || r2.h == 0)
-    return 0;
-  return r1.x < r2.x + r2.w && r1.x + r1.w > r2.x && r1.y < r2.y + r2.h &&
-         r1.y + r1.h > r2.y;
-}
+void set_layout_step(int step) {
+  // Prevent out of bounds (0 to 5)
+  step = step % 6;
 
-void reset_layout() {
-  for (int i = 0; i < 4; i++)
-    slot_rects[i] = default_rects[i];
-  layout_dirty = 1;
-}
+  // TL Slot (Slot 0): Pinned to Top-Left corner (-1.0, -1.0)
+  slot_rects[0].x = -1.0f;
+  slot_rects[0].y = -1.0f;
+  slot_rects[0].w = (VID1_W[step] / SCREEN_W) * 2.0f;
+  slot_rects[0].h = (VID1_H[step] / SCREEN_H) * 2.0f;
 
-// --- RESIZE LOGIC ---
-void apply_resize(int slot, int key) {
-  // 1. Reset to default grid first
-  reset_layout();
+  // TR Slot (Slot 1): Pinned to Top-Mid edge (0.0, -1.0)
+  slot_rects[1].x = 0.0f;
+  slot_rects[1].y = -1.0f;
+  slot_rects[1].w = (VID2_W[step] / SCREEN_W) * 2.0f;
+  slot_rects[1].h = (VID2_H[step] / SCREEN_H) * 2.0f;
 
-  int filler = -1;
+  // BL Slot (Slot 2): Pinned to Mid-Left edge (-1.0, 0.0)
+  slot_rects[2].x = -1.0f;
+  slot_rects[2].y = 0.0f;
+  slot_rects[2].w = (VID3_W[step] / SCREEN_W) * 2.0f;
+  slot_rects[2].h = (VID3_H[step] / SCREEN_H) * 2.0f;
 
-  if (slot == 0) { // TOP LEFT (Video 1)
-    if (key == KEY_UP) {
-      slot_rects[0] = RECT_TOP; // Expands Up. Safe.
-    } else if (key == KEY_LEFT) {
-      slot_rects[0] = RECT_LEFT; // Expands Left. Safe.
-    } else if (key == KEY_DOWN) {
-      // Move to BOTTOM. Top is empty.
-      slot_rects[0] = RECT_BOTTOM;
-      filler = 1; // Slot 1 (TR/Video 2) fills TOP
-      slot_rects[filler] = RECT_TOP;
-    } else if (key == KEY_RIGHT) {
-      // Move to RIGHT. Left is empty.
-      slot_rects[0] = RECT_RIGHT;
-      filler = 2; // Slot 2 (BL/Video 3) fills LEFT
-      slot_rects[filler] = RECT_LEFT;
-    }
-  } else if (slot == 1) { // TOP RIGHT (Video 2)
-    if (key == KEY_UP)
-      slot_rects[1] = RECT_TOP;
-    if (key == KEY_RIGHT)
-      slot_rects[1] = RECT_RIGHT;
-    if (key == KEY_DOWN) {
-      // Move to BOTTOM. Top is empty.
-      slot_rects[1] = RECT_BOTTOM;
-      filler = 0; // Slot 0 (TL/Video 1) fills TOP
-      slot_rects[filler] = RECT_TOP;
-    }
-    if (key == KEY_LEFT) {
-      // Move to LEFT. Right is empty.
-      slot_rects[1] = RECT_LEFT;
-      filler = 3; // Slot 3 (BR/Video 4) fills RIGHT
-      slot_rects[filler] = RECT_RIGHT;
-    }
-  } else if (slot == 2) { // BOTTOM LEFT (Video 3)
-    if (key == KEY_DOWN)
-      slot_rects[2] = RECT_BOTTOM;
-    if (key == KEY_LEFT)
-      slot_rects[2] = RECT_LEFT;
-    if (key == KEY_UP) {
-      // Move to TOP. Bottom is empty.
-      slot_rects[2] = RECT_TOP;
-      filler = 3; // Slot 3 (BR/Video 4) fills BOTTOM
-      slot_rects[filler] = RECT_BOTTOM;
-    }
-    if (key == KEY_RIGHT) {
-      // Move to RIGHT. Left is empty.
-      slot_rects[2] = RECT_RIGHT;
-      filler = 0; // Slot 0 (TL/Video 1) fills LEFT
-      slot_rects[filler] = RECT_LEFT;
-    }
-  } else if (slot == 3) { // BOTTOM RIGHT (Video 4)
-    if (key == KEY_DOWN)
-      slot_rects[3] = RECT_BOTTOM;
-    if (key == KEY_RIGHT)
-      slot_rects[3] = RECT_RIGHT;
-    if (key == KEY_UP) {
-      // Move to TOP. Bottom is empty.
-      slot_rects[3] = RECT_TOP;
-      filler = 2; // Slot 2 (BL/Video 3) fills BOTTOM
-      slot_rects[filler] = RECT_BOTTOM;
-    }
-    if (key == KEY_LEFT) {
-      // Move to LEFT. Right is empty.
-      slot_rects[3] = RECT_LEFT;
-      filler = 1; // Slot 1 (TR/Video 2) fills RIGHT
-      slot_rects[filler] = RECT_RIGHT;
-    }
-  }
-
-  // 2. Hide Loop: Clean up overlaps
-  for (int i = 0; i < 4; i++) {
-    if (i == slot)
-      continue;
-    if (filler != -1 && i == filler)
-      continue;
-
-    // If I overlap the main mover, hide me
-    if (rects_overlap(slot_rects[slot], slot_rects[i])) {
-      slot_rects[i].w = 0;
-      slot_rects[i].h = 0;
-    }
-    // If I overlap the filler, hide me
-    if (filler != -1 && rects_overlap(slot_rects[filler], slot_rects[i])) {
-      slot_rects[i].w = 0;
-      slot_rects[i].h = 0;
-    }
-  }
-
-  layout_dirty = 1;
+  // BR Slot (Slot 3): Static, Pinned to Center (0.0, 0.0)
+  slot_rects[3].x = 0.0f;
+  slot_rects[3].y = 0.0f;
+  slot_rects[3].w = (VID4_W / SCREEN_W) * 2.0f;
+  slot_rects[3].h = (VID4_H / SCREEN_H) * 2.0f;
 }
 
 // --- CLEANUP ---
@@ -344,79 +256,6 @@ void cleanup() {
   if (kms.fd >= 0)
     close(kms.fd);
   printf("Done.\n");
-}
-
-// --- INPUT THREAD (Restored Your Exact System) ---
-void *input_thread(void *arg) {
-  initscr();
-  cbreak();
-  noecho();
-  nodelay(stdscr, TRUE);
-  keypad(stdscr, TRUE);
-  while (running) {
-    int ch = getch();
-    if (ch != ERR) {
-      if (ch == 'q')
-        running = 0;
-      int pressed_slot = -1;
-      if (ch >= '1' && ch <= '4')
-        pressed_slot = ch - '1';
-
-      if (ch == '0') {
-        reset_layout();
-        in_resize_mode = 0;
-        in_change_mode = 0;
-        selected_slot = -1;
-      } else if (in_resize_mode) {
-        if (pressed_slot != -1)
-          selected_slot = pressed_slot;
-        else if (ch == 'f') {
-          if (selected_slot != -1) {
-            for (int i = 0; i < 4; i++) {
-              slot_rects[i].w = 0;
-              slot_rects[i].h = 0;
-            }
-            slot_rects[selected_slot] = RECT_FULL;
-            layout_dirty = 1;
-          }
-        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP ||
-                   ch == KEY_DOWN) {
-          if (selected_slot != -1)
-            apply_resize(selected_slot, ch);
-        } else if (ch == 'r')
-          in_resize_mode = 0;
-      } else if (in_change_mode) {
-        if (pressed_slot != -1) {
-          int src = selected_slot;
-          int dst = pressed_slot;
-          if (src != dst) {
-            int tmp = layout[src];
-            layout[src] = layout[dst];
-            layout[dst] = tmp;
-          }
-          in_change_mode = 0;
-          selected_slot = -1;
-        } else {
-          in_change_mode = 0;
-          selected_slot = -1;
-        }
-      } else {
-        if (pressed_slot != -1)
-          selected_slot = pressed_slot;
-        else if (ch == 'c') {
-          if (selected_slot != -1)
-            in_change_mode = 1;
-        } else if (ch == 'r') {
-          if (selected_slot != -1)
-            in_resize_mode = 1;
-        } else
-          selected_slot = -1;
-      }
-    }
-    usleep(10000);
-  }
-  endwin();
-  return NULL;
 }
 
 // --- SETUP FUNCTIONS ---
@@ -550,50 +389,49 @@ void update_geometry() {
 
   for (int i = 0; i < 4; i++) {
     Rect r = slot_rects[i];
-    float id = (float)layout[i]; // USE LAYOUT MAPPING HERE!
+    float id = (float)layout[i]; 
 
     // Tri 1
     verts[idx++] = r.x;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 0.0f;
-    verts[idx++] = 1.0f; // Was 0.0f -> Flip to 1.0f
+    verts[idx++] = 1.0f;
     verts[idx++] = id;
 
     verts[idx++] = r.x;
     verts[idx++] = r.y;
     verts[idx++] = 0.0f;
-    verts[idx++] = 0.0f; // Was 1.0f -> Flip to 0.0f
+    verts[idx++] = 0.0f; 
     verts[idx++] = id;
 
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
-    verts[idx++] = 1.0f; // Was 0.0f -> Flip to 1.0f
+    verts[idx++] = 1.0f;
     verts[idx++] = id;
 
     // Tri 2
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
-    verts[idx++] = 1.0f; // Was 0.0f -> Flip to 1.0f
+    verts[idx++] = 1.0f; 
     verts[idx++] = id;
 
     verts[idx++] = r.x;
     verts[idx++] = r.y;
     verts[idx++] = 0.0f;
-    verts[idx++] = 0.0f; // Was 1.0f -> Flip to 0.0f
+    verts[idx++] = 0.0f; 
     verts[idx++] = id;
 
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y;
     verts[idx++] = 1.0f;
-    verts[idx++] = 0.0f; // Was 1.0f -> Flip to 0.0f
+    verts[idx++] = 0.0f; 
     verts[idx++] = id;
   }
 
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-  layout_dirty = 0;
 }
 
 int main(int argc, char **argv) {
@@ -609,7 +447,7 @@ int main(int argc, char **argv) {
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
   drmModeFreeResources(res);
 
-  // STATIC PLANES (YOUR REQUIREMENT)
+  // STATIC PLANES 
   kms.plane_primary_id = 39;
   kms.plane_overlay_id = 41;
 
@@ -680,7 +518,9 @@ int main(int argc, char **argv) {
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 5 * sizeof(float), NULL,
                GL_DYNAMIC_DRAW);
-  reset_layout();
+               
+  // Start on step 0
+  set_layout_step(0);
   update_geometry();
 
   GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
@@ -706,9 +546,6 @@ int main(int argc, char **argv) {
   glUniform1i(glGetUniformLocation(kms.prog, "ty3"), 6);
   glUniform1i(glGetUniformLocation(kms.prog, "tu3"), 7);
 
-  pthread_t tid;
-  pthread_create(&tid, NULL, input_thread, NULL);
-
   // Disable Console
   drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
                   0, 0, 0, 0, 0, 0);
@@ -717,14 +554,20 @@ int main(int argc, char **argv) {
   struct timespec t0, t1;
   long total_us = 0;
   int count = 0;
+  int current_step = -1;
 
-  printf("Running 4 Videos... Press 1-4, c, r, f, Arrows, q.\n");
+  printf("Running 6-Step Animated Layout... Press Ctrl+C to exit.\n");
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    if (layout_dirty)
+    // --- Check if we need to advance to the next step ---
+    int step = (t0.tv_sec / 3) % 6; // This will cycle 0, 1, 2, 3, 4, 5 every second
+    if (step != current_step) {
+      current_step = step;
+      set_layout_step(current_step);
       update_geometry();
+    }
 
     // Upload 4 Videos
     upload_video_frame(&videos[layout[0]], 0);
@@ -735,12 +578,10 @@ int main(int argc, char **argv) {
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
-    glClearColor(1.0f, 0.0f, 0.0f, 1.0f); // Red Debug
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Clear to Black
     glClear(GL_COLOR_BUFFER_BIT);
 
     glDrawArrays(GL_TRIANGLES, 0, 24); // 4 Quads
-
-    // NO GL FINISH (As requested)
 
     drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
@@ -752,13 +593,12 @@ int main(int argc, char **argv) {
     total_us += get_diff_us(t0, t1);
     count++;
     if (count >= 60) {
-      printf("FPS: %ld\r\n", 1000000 / (total_us / 60));
+      printf("FPS: %ld (Step %d/6)\r\n", 1000000 / (total_us / 60), current_step + 1);
       total_us = 0;
       count = 0;
     }
   }
 
-  pthread_join(tid, NULL);
   cleanup();
   return 0;
 }
