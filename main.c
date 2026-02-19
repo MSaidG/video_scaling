@@ -470,8 +470,8 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
 
   glGenTextures(1, &buf->tex_id);
   glBindTexture(GL_TEXTURE_2D, buf->tex_id);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, buf->egl_img);
 
   glGenFramebuffers(1, &buf->fbo_id);
