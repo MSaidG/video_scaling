@@ -1,8 +1,11 @@
+#include "gst/gstbin.h"
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -22,9 +25,11 @@
 #include <gst/video/video.h>
 
 // --- CONFIG ---
-#define VIDEO_FILE "earth1.mp4"
+#define VIDEO_COUNT 4
+const char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
+                                        "world.mp4"};
 
-// --- EXTENSIONS (Needed for DRM Dumb Buffers) ---
+// --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
     EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer,
     const EGLint *attrib_list);
@@ -52,10 +57,10 @@ typedef struct {
 typedef struct {
   GstElement *pipeline;
   GstElement *appsink;
+  GstBus *bus;
 
   pthread_mutex_t lock;
   GstSample *new_sample;
-  GstSample *active_sample;
 
   int width;
   int height;
@@ -81,7 +86,7 @@ struct {
 } kms;
 
 // --- GLOBALS ---
-GstVid gst_vid = {0};
+GstVid videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
 
 // --- LAYOUT SYSTEM ---
@@ -90,10 +95,10 @@ typedef struct {
 } Rect;
 
 const Rect default_rects[4] = {
-    {-1.0f, -1.0f, 1.0f, 1.0f}, // TL
-    {0.0f, -1.0f, 1.0f, 1.0f},  // TR
-    {-1.0f, 0.0f, 1.0f, 1.0f},  // BL
-    {0.0f, 0.0f, 1.0f, 1.0f}    // BR
+    {-1.0f, -1.0f, 1.0f, 1.0f}, // TL (Video 0)
+    {0.0f, -1.0f, 1.0f, 1.0f},  // TR (Video 1)
+    {-1.0f, 0.0f, 1.0f, 1.0f},  // BL (Video 2)
+    {0.0f, 0.0f, 1.0f, 1.0f}    // BR (Video 3)
 };
 
 // --- SHADERS ---
@@ -211,9 +216,12 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   return 0;
 }
 
-int init_gstreamer_pipeline(const char *filename) {
-  gst_init(NULL, NULL);
-  pthread_mutex_init(&gst_vid.lock, NULL);
+int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
+  pthread_mutex_init(&vid->lock, NULL);
+  vid->tex_y = 0;
+  vid->tex_uv = 0;
+  vid->new_sample = NULL;
+  vid->is_new_frame_ready = 0;
 
   char pipeline_str[512];
   snprintf(pipeline_str, sizeof(pipeline_str),
@@ -223,64 +231,68 @@ int init_gstreamer_pipeline(const char *filename) {
            filename);
 
   GError *err = NULL;
-  gst_vid.pipeline = gst_parse_launch(pipeline_str, &err);
+  vid->pipeline = gst_parse_launch(pipeline_str, &err);
   if (err) {
-    fprintf(stderr, "GStreamer Error: %s\n", err->message);
+    fprintf(stderr, "GStreamer Error for %s: %s\n", filename, err->message);
     g_error_free(err);
     return -1;
   }
 
-  gst_vid.appsink = gst_bin_get_by_name(GST_BIN(gst_vid.pipeline), "mysink");
+  vid->appsink = gst_bin_get_by_name(GST_BIN(vid->pipeline), "mysink");
 
   GstAppSinkCallbacks callbacks = {0};
   callbacks.new_sample = on_new_sample;
-  gst_app_sink_set_callbacks(GST_APP_SINK(gst_vid.appsink), &callbacks,
-                             &gst_vid, NULL);
+  gst_app_sink_set_callbacks(GST_APP_SINK(vid->appsink), &callbacks, vid, NULL);
 
-  gst_element_set_state(gst_vid.pipeline, GST_STATE_PLAYING);
+  gst_element_set_state(vid->pipeline, GST_STATE_PLAYING);
+  vid->bus = gst_element_get_bus(vid->pipeline);
+
   return 0;
 }
 
-void update_texture_cpu() {
-  pthread_mutex_lock(&gst_vid.lock);
-  if (!gst_vid.is_new_frame_ready) {
-    pthread_mutex_unlock(&gst_vid.lock);
+void update_texture_cpu(GstVid *vid) {
+  pthread_mutex_lock(&vid->lock);
+  if (!vid->is_new_frame_ready) {
+    pthread_mutex_unlock(&vid->lock);
+    return; // No new frame, keep drawing the existing GPU texture
+  }
+
+  // Grab the new sample and clear the flag
+  GstSample *sample = vid->new_sample;
+  vid->new_sample = NULL;
+  vid->is_new_frame_ready = 0;
+  pthread_mutex_unlock(&vid->lock);
+
+  if (!sample)
     return;
-  }
 
-  if (gst_vid.active_sample) {
-    gst_sample_unref(gst_vid.active_sample);
-  }
-  gst_vid.active_sample = gst_vid.new_sample;
-  gst_vid.new_sample = NULL;
-  gst_vid.is_new_frame_ready = 0;
-  pthread_mutex_unlock(&gst_vid.lock);
-
-  GstBuffer *buffer = gst_sample_get_buffer(gst_vid.active_sample);
-  GstCaps *caps = gst_sample_get_caps(gst_vid.active_sample);
+  // Extract Buffer and Metadata
+  GstBuffer *buffer = gst_sample_get_buffer(sample);
+  GstCaps *caps = gst_sample_get_caps(sample);
   GstVideoInfo vinfo;
   gst_video_info_from_caps(&vinfo, caps);
 
-  gst_vid.width = vinfo.width;
-  gst_vid.height = vinfo.height;
+  vid->width = vinfo.width;
+  vid->height = vinfo.height;
 
   // Map the GStreamer memory to CPU space
   GstMapInfo map;
   if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+    gst_sample_unref(sample);
     return;
   }
 
   // Generate textures on first run
-  if (!gst_vid.tex_y) {
-    glGenTextures(1, &gst_vid.tex_y);
-    glBindTexture(GL_TEXTURE_2D, gst_vid.tex_y);
+  if (!vid->tex_y) {
+    glGenTextures(1, &vid->tex_y);
+    glBindTexture(GL_TEXTURE_2D, vid->tex_y);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glGenTextures(1, &gst_vid.tex_uv);
-    glBindTexture(GL_TEXTURE_2D, gst_vid.tex_uv);
+    glGenTextures(1, &vid->tex_uv);
+    glBindTexture(GL_TEXTURE_2D, vid->tex_uv);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -290,27 +302,29 @@ void update_texture_cpu() {
   int pitch = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
   int uv_offset = GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 1);
 
-  // Upload Y Plane
+  // Upload Y Plane to GPU VRAM
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, gst_vid.tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, pitch, gst_vid.height, 0,
+  glBindTexture(GL_TEXTURE_2D, vid->tex_y);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, pitch, vid->height, 0,
                GL_LUMINANCE, GL_UNSIGNED_BYTE, map.data);
 
-  // Upload UV Plane
+  // Upload UV Plane to GPU VRAM
   glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, gst_vid.tex_uv);
-  // NV12 packs U and V together, so width and height are halved
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, pitch / 2,
-               gst_vid.height / 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
-               map.data + uv_offset);
+  glBindTexture(GL_TEXTURE_2D, vid->tex_uv);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, pitch / 2, vid->height / 2,
+               0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, map.data + uv_offset);
 
+  // Clean up
   gst_buffer_unmap(buffer, &map);
-}
 
+  // THE FIX: Immediately return the sample to the GStreamer pool!
+  gst_sample_unref(sample);
+}
 void update_geometry() {
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
 
+  // We load the coordinates for all 4 quads into the VBO at once
   for (int i = 0; i < 4; i++) {
     Rect r = default_rects[i];
 
@@ -350,20 +364,21 @@ void update_geometry() {
 void cleanup() {
   printf("\n--- Cleaning Up ---\n");
 
-  if (gst_vid.pipeline) {
-    gst_element_set_state(gst_vid.pipeline, GST_STATE_NULL);
-    gst_object_unref(gst_vid.pipeline);
+  for (int i = 0; i < VIDEO_COUNT; i++) {
+    if (videos[i].pipeline) {
+      gst_element_set_state(videos[i].pipeline, GST_STATE_NULL);
+      gst_object_unref(videos[i].pipeline);
+    }
+    if (videos[i].bus)
+      gst_object_unref(videos[i].bus);
+    if (videos[i].new_sample)
+      gst_sample_unref(videos[i].new_sample);
+    if (videos[i].tex_y)
+      glDeleteTextures(1, &videos[i].tex_y);
+    if (videos[i].tex_uv)
+      glDeleteTextures(1, &videos[i].tex_uv);
+    pthread_mutex_destroy(&videos[i].lock);
   }
-  if (gst_vid.active_sample)
-    gst_sample_unref(gst_vid.active_sample);
-  if (gst_vid.new_sample)
-    gst_sample_unref(gst_vid.new_sample);
-  if (gst_vid.tex_y)
-    glDeleteTextures(1, &gst_vid.tex_y);
-  if (gst_vid.tex_uv)
-    glDeleteTextures(1, &gst_vid.tex_uv);
-
-  pthread_mutex_destroy(&gst_vid.lock);
 
   if (kms.prog)
     glDeleteProgram(kms.prog);
@@ -402,6 +417,8 @@ void cleanup() {
 
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
+
+  gst_init(&argc, &argv);
 
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
@@ -448,9 +465,12 @@ int main(int argc, char **argv) {
   create_dumb_buffer_fbo(&kms.bufs[0]);
   create_dumb_buffer_fbo(&kms.bufs[1]);
 
-  if (init_gstreamer_pipeline(VIDEO_FILE) < 0) {
-    cleanup();
-    return -1;
+  // Init all 4 GStreamer pipelines
+  for (int i = 0; i < VIDEO_COUNT; i++) {
+    if (init_gstreamer_pipeline(&videos[i], VIDEO_FILES[i]) < 0) {
+      cleanup();
+      return -1;
+    }
   }
 
   kms.prog = glCreateProgram();
@@ -480,7 +500,6 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
                         (void *)(2 * sizeof(float)));
 
-  // Bind uniform samplers to texture units 0 and 1
   glUniform1i(glGetUniformLocation(kms.prog, "tex_y"), 0);
   glUniform1i(glGetUniformLocation(kms.prog, "tex_uv"), 1);
 
@@ -492,26 +511,43 @@ int main(int argc, char **argv) {
   long total_us = 0;
   int count = 0;
 
-  printf("Running GStreamer CPU Copy... Press Ctrl+C to exit.\n");
+  printf("Running 4x GStreamer CPU Copy... Press Ctrl+C to exit.\n");
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    update_texture_cpu();
-
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
-    // Blue background so we know the DRM layer is drawing
     glClearColor(0.2f, 0.2f, 0.8f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (gst_vid.tex_y) {
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, gst_vid.tex_y);
-      glActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, gst_vid.tex_uv);
-      glDrawArrays(GL_TRIANGLES, 0, 24);
+    // Draw each video in its respective quadrant
+    for (int i = 0; i < VIDEO_COUNT; i++) {
+
+      // --- ADD THESE 6 LINES TO LOOP THE VIDEO ---
+      GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
+      if (msg) {
+        // Rewind to 0 nanoseconds
+        gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
+                                GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
+                                0);
+        gst_message_unref(msg);
+      }
+      // -------------------------------------------
+
+      update_texture_cpu(&videos[i]);
+
+      if (videos[i].tex_y) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, videos[i].tex_y);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
+
+        // Draw 6 vertices (2 triangles) per quadrant.
+        // 0 offset for Video 0, 6 offset for Video 1, etc.
+        glDrawArrays(GL_TRIANGLES, i * 6, 6);
+      }
     }
 
     drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
