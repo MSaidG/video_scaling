@@ -5,3 +5,5 @@ videos
 .cache
 err*
 vgcore*
+commands
+decode_app
