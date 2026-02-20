@@ -320,13 +320,31 @@ void update_texture_cpu(GstVid *vid) {
   // THE FIX: Immediately return the sample to the GStreamer pool!
   gst_sample_unref(sample);
 }
-void update_geometry() {
+
+void update_geometry(int step) {
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
 
-  // We load the coordinates for all 4 quads into the VBO at once
+  // step is 0, 1, 2, or 3.
+  // This creates our multipliers: 0.25, 0.50, 0.75, 1.00
+  float m = (step + 1) / 6.0f;
+
+  Rect rects[4];
+
+  // TL (Video 0): Both Width and Height scale
+  rects[0] = (Rect){-1.0f, -1.0f, m, m};
+
+  // TR (Video 1): Width is constant 1.0 (960px), Height scales
+  rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
+
+  // BL (Video 2): Width scales, Height is constant 1.0 (540px)
+  rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
+
+  // BR (Video 3): Stays completely static
+  rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+
   for (int i = 0; i < 4; i++) {
-    Rect r = default_rects[i];
+    Rect r = rects[i];
 
     // Tri 1
     verts[idx++] = r.x;
@@ -357,6 +375,7 @@ void update_geometry() {
     verts[idx++] = 0.0f;
   }
 
+  // Push the new coordinates to the GPU
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
 }
@@ -488,8 +507,10 @@ int main(int argc, char **argv) {
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
-               GL_DYNAMIC_DRAW);
-  update_geometry();
+   GL_DYNAMIC_DRAW);
+
+  int current_anim_step = 0;
+  update_geometry(current_anim_step);
 
   GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
   GLint loc_tex = glGetAttribLocation(kms.prog, "a_tex");
@@ -513,13 +534,29 @@ int main(int argc, char **argv) {
 
   printf("Running 4x GStreamer CPU Copy... Press Ctrl+C to exit.\n");
 
+  struct timespec anim_t0, anim_t1;
+  clock_gettime(CLOCK_MONOTONIC, &anim_t0);
+  const double ANIM_STEP_SEC = 2.0; 
+
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    // --- ANIMATION CHECK ---
+    clock_gettime(CLOCK_MONOTONIC, &anim_t1);
+    double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) +
+                     (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
+
+    if (elapsed >= ANIM_STEP_SEC) {
+      current_anim_step = (current_anim_step + 1) % 6; // Loop: 0, 1, 2, 3, 0...
+      update_geometry(current_anim_step);
+      anim_t0 = anim_t1; // Reset the animation timer
+    }
+    // ---------------------------------
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
-    glClearColor(0.2f, 0.2f, 0.8f, 1.0f);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     // Draw each video in its respective quadrant
