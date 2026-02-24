@@ -1,3 +1,4 @@
+#include "glib.h"
 #include "gst/gstbin.h"
 #include <fcntl.h>
 #include <pthread.h>
@@ -29,19 +30,6 @@
 const char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
                                         "world.mp4"};
 
-// --- EXTENSIONS ---
-typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
-    EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer,
-    const EGLint *attrib_list);
-typedef EGLBoolean(EGLAPIENTRYP PFNEGLDESTROYIMAGEKHRPROC)(EGLDisplay dpy,
-                                                           EGLImageKHR image);
-typedef void(GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(
-    GLenum target, GLeglImageOES image);
-
-PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = NULL;
-PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = NULL;
-PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = NULL;
-
 // --- STRUCTURES ---
 typedef struct {
   uint32_t handle;
@@ -49,9 +37,9 @@ typedef struct {
   uint32_t size;
   uint32_t fb_id;
   int prime_fd;
-  EGLImageKHR egl_img;
   GLuint tex_id;
   GLuint fbo_id;
+  void *cpu_map; // CPU pointer to the DRM 24-bit memory
 } DumbBuffer;
 
 typedef struct {
@@ -75,8 +63,7 @@ struct {
   drmModeConnector *connector;
   drmModeModeInfo mode;
   drmModeCrtc *crtc;
-  uint32_t plane_primary_id;
-  uint32_t plane_overlay_id;
+  uint32_t plane_id;
   DumbBuffer bufs[2];
   EGLDisplay egl_disp;
   EGLContext egl_ctx;
@@ -93,13 +80,6 @@ volatile sig_atomic_t running = 1;
 typedef struct {
   float x, y, w, h;
 } Rect;
-
-const Rect default_rects[4] = {
-    {-1.0f, -1.0f, 1.0f, 1.0f}, // TL (Video 0)
-    {0.0f, -1.0f, 1.0f, 1.0f},  // TR (Video 1)
-    {-1.0f, 0.0f, 1.0f, 1.0f},  // BL (Video 2)
-    {0.0f, 0.0f, 1.0f, 1.0f}    // BR (Video 3)
-};
 
 // --- SHADERS ---
 const char *vs_src = "attribute vec4 a_pos;\n"
@@ -155,64 +135,56 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
 }
 
 // --- SETUP FUNCTIONS ---
-int load_egl_extensions() {
-  eglCreateImageKHR =
-      (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
-  eglDestroyImageKHR =
-      (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-  glEGLImageTargetTexture2DOES =
-      (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
-          "glEGLImageTargetTexture2DOES");
-  return (eglCreateImageKHR && glEGLImageTargetTexture2DOES) ? 0 : -1;
-}
-
 int create_dumb_buffer_fbo(DumbBuffer *buf) {
+  // --- 1. DRM: 24-bit HDMI Hardware Buffer ---
   struct drm_mode_create_dumb create_req = {0};
   create_req.width = kms.mode.hdisplay;
   create_req.height = kms.mode.vdisplay;
-  create_req.bpp = 32;
+  create_req.bpp = 24; // Strict 24-bit for Ambarella HDMI
   ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req);
 
   buf->handle = create_req.handle;
   buf->stride = create_req.pitch;
   buf->size = create_req.size;
 
-  drmModeAddFB(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay, 24, 32,
-               buf->stride, buf->handle, &buf->fb_id);
+  uint32_t handles[4] = {buf->handle};
+  uint32_t pitches[4] = {buf->stride};
+  uint32_t offsets[4] = {0};
 
-  struct drm_prime_handle prime = {0};
-  prime.handle = buf->handle;
-  prime.flags = DRM_CLOEXEC | DRM_RDWR;
-  ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
-  buf->prime_fd = prime.fd;
+  drmModeAddFB2(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay,
+                DRM_FORMAT_RGB888, handles, pitches, offsets, &buf->fb_id, 0);
 
-  EGLint attribs[] = {EGL_WIDTH,
-                      kms.mode.hdisplay,
-                      EGL_HEIGHT,
-                      kms.mode.vdisplay,
-                      EGL_LINUX_DRM_FOURCC_EXT,
-                      DRM_FORMAT_ARGB8888,
-                      EGL_DMA_BUF_PLANE0_FD_EXT,
-                      buf->prime_fd,
-                      EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-                      0,
-                      EGL_DMA_BUF_PLANE0_PITCH_EXT,
-                      buf->stride,
-                      EGL_NONE};
+  // Map the 24-bit DRM buffer to CPU memory
+  struct drm_mode_map_dumb map_req = {.handle = buf->handle};
+  ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req);
+  buf->cpu_map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, kms.fd,
+                      map_req.offset);
 
-  buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
-                                   EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+  if (buf->cpu_map == MAP_FAILED) {
+      printf("Failed to map DRM buffer!\n");
+      return -1;
+  }
 
+  // --- 2. EGL: Standard 32-bit Off-screen FBO ---
   glGenTextures(1, &buf->tex_id);
   glBindTexture(GL_TEXTURE_2D, buf->tex_id);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, buf->egl_img);
+  // Standard RGBA texture for the GPU to render into
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kms.mode.hdisplay, kms.mode.vdisplay,
+               0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
   glGenFramebuffers(1, &buf->fbo_id);
   glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo_id);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                          buf->tex_id, 0);
+
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    printf("FBO incomplete!\n");
+    return -1;
+  } else {
+    printf("FBO & DRM Buffers perfectly decoupled and created!\n");
+  }
   return 0;
 }
 
@@ -254,10 +226,9 @@ void update_texture_cpu(GstVid *vid) {
   pthread_mutex_lock(&vid->lock);
   if (!vid->is_new_frame_ready) {
     pthread_mutex_unlock(&vid->lock);
-    return; // No new frame, keep drawing the existing GPU texture
+    return; 
   }
 
-  // Grab the new sample and clear the flag
   GstSample *sample = vid->new_sample;
   vid->new_sample = NULL;
   vid->is_new_frame_ready = 0;
@@ -266,7 +237,6 @@ void update_texture_cpu(GstVid *vid) {
   if (!sample)
     return;
 
-  // Extract Buffer and Metadata
   GstBuffer *buffer = gst_sample_get_buffer(sample);
   GstCaps *caps = gst_sample_get_caps(sample);
   GstVideoInfo vinfo;
@@ -275,14 +245,12 @@ void update_texture_cpu(GstVid *vid) {
   vid->width = vinfo.width;
   vid->height = vinfo.height;
 
-  // Map the GStreamer memory to CPU space
   GstMapInfo map;
   if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
     gst_sample_unref(sample);
     return;
   }
 
-  // Generate textures on first run
   if (!vid->tex_y) {
     glGenTextures(1, &vid->tex_y);
     glBindTexture(GL_TEXTURE_2D, vid->tex_y);
@@ -302,22 +270,17 @@ void update_texture_cpu(GstVid *vid) {
   int pitch = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
   int uv_offset = GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 1);
 
-  // Upload Y Plane to GPU VRAM
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, vid->tex_y);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, pitch, vid->height, 0,
                GL_LUMINANCE, GL_UNSIGNED_BYTE, map.data);
 
-  // Upload UV Plane to GPU VRAM
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, vid->tex_uv);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, pitch / 2, vid->height / 2,
                0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, map.data + uv_offset);
 
-  // Clean up
   gst_buffer_unmap(buffer, &map);
-
-  // THE FIX: Immediately return the sample to the GStreamer pool!
   gst_sample_unref(sample);
 }
 
@@ -325,28 +288,17 @@ void update_geometry(int step) {
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
 
-  // step is 0, 1, 2, or 3.
-  // This creates our multipliers: 0.25, 0.50, 0.75, 1.00
   float m = (step + 1) / 6.0f;
 
   Rect rects[4];
-
-  // TL (Video 0): Both Width and Height scale
   rects[0] = (Rect){-1.0f, -1.0f, m, m};
-
-  // TR (Video 1): Width is constant 1.0 (960px), Height scales
   rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
-
-  // BL (Video 2): Width scales, Height is constant 1.0 (540px)
   rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
-
-  // BR (Video 3): Stays completely static
   rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
 
   for (int i = 0; i < 4; i++) {
     Rect r = rects[i];
 
-    // Tri 1
     verts[idx++] = r.x;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 0.0f;
@@ -360,7 +312,6 @@ void update_geometry(int step) {
     verts[idx++] = 1.0f;
     verts[idx++] = 1.0f;
 
-    // Tri 2
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
@@ -375,7 +326,6 @@ void update_geometry(int step) {
     verts[idx++] = 0.0f;
   }
 
-  // Push the new coordinates to the GPU
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
 }
@@ -409,10 +359,8 @@ void cleanup() {
       glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
     if (kms.bufs[i].tex_id)
       glDeleteTextures(1, &kms.bufs[i].tex_id);
-    if (kms.bufs[i].egl_img && eglDestroyImageKHR)
-      eglDestroyImageKHR(kms.egl_disp, kms.bufs[i].egl_img);
-    if (kms.bufs[i].prime_fd >= 0)
-      close(kms.bufs[i].prime_fd);
+    if (kms.bufs[i].cpu_map && kms.bufs[i].cpu_map != MAP_FAILED)
+      munmap(kms.bufs[i].cpu_map, kms.bufs[i].size);
     if (kms.bufs[i].fb_id)
       drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
     if (kms.bufs[i].handle) {
@@ -439,18 +387,51 @@ int main(int argc, char **argv) {
 
   gst_init(&argc, &argv);
 
-  kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+  kms.fd = open("/dev/dri/by-path/platform-amba_pl@0:drm_hdmi-card",
+                O_RDWR | O_CLOEXEC);
   if (kms.fd < 0)
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
 
   drmModeRes *res = drmModeGetResources(kms.fd);
-  kms.connector = drmModeGetConnector(kms.fd, res->connectors[0]);
+
+  // Find HDMI Connector (ID 38)
+  kms.connector = NULL;
+  for (int i = 0; i < res->count_connectors; i++) {
+    drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
+    if (c->connector_id == 38) { 
+      kms.connector = c;
+      break;
+    }
+    drmModeFreeConnector(c);
+  }
+
+  if (!kms.connector) {
+    printf("Error: Could not find HDMI Connector (ID 38)!\n");
+    return -1;
+  }
+
   kms.mode = kms.connector->modes[0];
-  kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
+
+  // Find HDMI CRTC (ID 34)
+  kms.crtc = NULL;
+  for (int i = 0; i < res->count_crtcs; i++) {
+    if (res->crtcs[i] == 34) { 
+      kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[i]);
+      break;
+    }
+  }
+
+  if (!kms.crtc) {
+    printf("Error: Could not find HDMI CRTC (ID 34)!\n");
+    return -1;
+  }
+
   drmModeFreeResources(res);
 
-  kms.plane_primary_id = 39;
-  kms.plane_overlay_id = 41;
+  kms.plane_id = 32; // HDMI Primary Plane
+
+  printf("Successfully bound to HDMI -> Connector: %d, CRTC: %d, Plane: %d\n",
+         kms.connector->connector_id, kms.crtc->crtc_id, kms.plane_id);
 
   kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
@@ -461,30 +442,34 @@ int main(int argc, char **argv) {
 
   EGLConfig config;
   EGLint num;
-  EGLint attribs[] = {EGL_SURFACE_TYPE,
-                      EGL_PBUFFER_BIT,
-                      EGL_RED_SIZE,
-                      8,
-                      EGL_GREEN_SIZE,
-                      8,
-                      EGL_BLUE_SIZE,
-                      8,
-                      EGL_RENDERABLE_TYPE,
-                      EGL_OPENGL_ES2_BIT,
+  EGLint attribs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+                      EGL_RED_SIZE, 8,
+                      EGL_GREEN_SIZE, 8,
+                      EGL_BLUE_SIZE, 8,
+                      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
                       EGL_NONE};
   eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num);
   kms.egl_surf = eglCreatePbufferSurface(
       kms.egl_disp, config, (EGLint[]){EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE});
-  kms.egl_ctx =
-      eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
+  kms.egl_ctx = eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
                        (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
   eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
-  load_egl_extensions();
 
   create_dumb_buffer_fbo(&kms.bufs[0]);
   create_dumb_buffer_fbo(&kms.bufs[1]);
 
-  // Init all 4 GStreamer pipelines
+  // Turn on the display with Buffer 0
+  int ret = drmModeSetCrtc(kms.fd, kms.crtc->crtc_id, kms.bufs[0].fb_id, 0, 0,
+                           &kms.connector->connector_id, 1, &kms.mode);
+
+  if (ret) {
+    fprintf(stderr, "failed to set mode: %s\n", strerror(errno));
+    cleanup();
+    return -1;
+  }
+
+  printf("Display Mode Set! Entering render loop...\n");
+
   for (int i = 0; i < VIDEO_COUNT; i++) {
     if (init_gstreamer_pipeline(&videos[i], VIDEO_FILES[i]) < 0) {
       cleanup();
@@ -507,7 +492,7 @@ int main(int argc, char **argv) {
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
-   GL_DYNAMIC_DRAW);
+               GL_DYNAMIC_DRAW);
 
   int current_anim_step = 0;
   update_geometry(current_anim_step);
@@ -524,19 +509,19 @@ int main(int argc, char **argv) {
   glUniform1i(glGetUniformLocation(kms.prog, "tex_y"), 0);
   glUniform1i(glGetUniformLocation(kms.prog, "tex_uv"), 1);
 
-  drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
-                  0, 0, 0, 0, 0, 0);
-
   int back_buf = 0;
   struct timespec t0, t1;
   long total_us = 0;
   int count = 0;
 
-  printf("Running 4x GStreamer CPU Copy... Press Ctrl+C to exit.\n");
+  // Allocate temporary memory for extracting the GPU 32-bit FBO
+  uint8_t *temp_rgba = malloc(kms.mode.hdisplay * kms.mode.vdisplay * 4);
+
+  printf("Running 4x GStreamer CPU Bridge Copy... Press Ctrl+C to exit.\n");
 
   struct timespec anim_t0, anim_t1;
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
-  const double ANIM_STEP_SEC = 2.0; 
+  const double ANIM_STEP_SEC = 2.0;
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -547,31 +532,26 @@ int main(int argc, char **argv) {
                      (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
 
     if (elapsed >= ANIM_STEP_SEC) {
-      current_anim_step = (current_anim_step + 1) % 6; // Loop: 0, 1, 2, 3, 0...
+      current_anim_step = (current_anim_step + 1) % 6; 
       update_geometry(current_anim_step);
-      anim_t0 = anim_t1; // Reset the animation timer
+      anim_t0 = anim_t1; 
     }
-    // ---------------------------------
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
+    // Bright Red background to verify it draws correctly
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Draw each video in its respective quadrant
     for (int i = 0; i < VIDEO_COUNT; i++) {
-
-      // --- ADD THESE 6 LINES TO LOOP THE VIDEO ---
       GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
       if (msg) {
-        // Rewind to 0 nanoseconds
         gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
                                 GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
                                 0);
         gst_message_unref(msg);
       }
-      // -------------------------------------------
 
       update_texture_cpu(&videos[i]);
 
@@ -581,16 +561,43 @@ int main(int argc, char **argv) {
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
 
-        // Draw 6 vertices (2 triangles) per quadrant.
-        // 0 offset for Video 0, 6 offset for Video 1, etc.
         glDrawArrays(GL_TRIANGLES, i * 6, 6);
       }
     }
 
-    drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
-                    kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
-                    kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
-                    kms.mode.vdisplay << 16);
+    glFinish(); // Wait for the GPU to completely finish drawing the FBO
+
+    // --- THE BRIDGE ---
+    // 1. Extract 32-bit RGBA from the GPU
+    glReadPixels(0, 0, kms.mode.hdisplay, kms.mode.vdisplay, GL_RGBA,
+                 GL_UNSIGNED_BYTE, temp_rgba);
+
+    int width = kms.mode.hdisplay;
+    int height = kms.mode.vdisplay;
+    int stride_24 = kms.bufs[back_buf].stride;
+    uint8_t *dest = (uint8_t *)kms.bufs[back_buf].cpu_map;
+
+    // 2. Flip vertically and pack into 24-bit RGB memory for DRM
+    for (int y = 0; y < height; y++) {
+      int gl_y = height - 1 - y; // OpenGL is bottom-up
+      uint8_t *src_row = temp_rgba + (gl_y * width * 4);
+      uint8_t *dst_row = dest + (y * stride_24);
+
+      for (int x = 0; x < width; x++) {
+        dst_row[x * 3 + 0] = src_row[x * 4 + 2]; // B
+        dst_row[x * 3 + 1] = src_row[x * 4 + 1]; // G
+        dst_row[x * 3 + 2] = src_row[x * 4 + 0]; // R
+      }
+    }
+
+    // 3. Scan out the perfectly formatted 24-bit memory to HDMI
+    int r = drmModeSetPlane(kms.fd, kms.plane_id, kms.crtc->crtc_id,
+                            kms.bufs[back_buf].fb_id, 0, 0, 0,
+                            kms.mode.hdisplay, kms.mode.vdisplay, 0, 0,
+                            kms.mode.hdisplay << 16, kms.mode.vdisplay << 16);
+    if (r) {
+      fprintf(stderr, "drmModeSetPlane failed: %s\n", strerror(errno));
+    }
 
     back_buf = !back_buf;
 
@@ -604,6 +611,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  free(temp_rgba);
   cleanup();
   return 0;
 }
