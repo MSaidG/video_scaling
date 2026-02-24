@@ -541,7 +541,7 @@ int main(int argc, char **argv) {
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
     // Bright Red background to verify it draws correctly
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     for (int i = 0; i < VIDEO_COUNT; i++) {
@@ -568,7 +568,7 @@ int main(int argc, char **argv) {
     glFinish(); // Wait for the GPU to completely finish drawing the FBO
 
     // --- THE BRIDGE ---
-    // 1. Extract 32-bit RGBA from the GPU
+    // 1. Extract 32-bit RGBA from the GPU (Bottom-up)
     glReadPixels(0, 0, kms.mode.hdisplay, kms.mode.vdisplay, GL_RGBA,
                  GL_UNSIGNED_BYTE, temp_rgba);
 
@@ -577,10 +577,10 @@ int main(int argc, char **argv) {
     int stride_24 = kms.bufs[back_buf].stride;
     uint8_t *dest = (uint8_t *)kms.bufs[back_buf].cpu_map;
 
-    // 2. Flip vertically and pack into 24-bit RGB memory for DRM
+    // 2. Pack into 24-bit RGB memory for DRM (No vertical flip needed)
     for (int y = 0; y < height; y++) {
-      int gl_y = height - 1 - y; // OpenGL is bottom-up
-      uint8_t *src_row = temp_rgba + (gl_y * width * 4);
+      // int gl_y = height - 1 - y; // Removed flip mechanic
+      uint8_t *src_row = temp_rgba + (y * width * 4); // Source iterates top-down along with dest
       uint8_t *dst_row = dest + (y * stride_24);
 
       for (int x = 0; x < width; x++) {
