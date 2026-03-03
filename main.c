@@ -439,14 +439,61 @@ int main(int argc, char **argv) {
 
   gst_init(&argc, &argv);
 
+  // Find and open DRM device
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0)
+  if (kms.fd < 0) {
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  }
+  if (kms.fd < 0) {
+    fprintf(stderr, "Failed to open DRM device\n");
+    return -1;
+  }
 
+  // Get DRM resources
   drmModeRes *res = drmModeGetResources(kms.fd);
-  kms.connector = drmModeGetConnector(kms.fd, res->connectors[0]);
+  if (!res) {
+    fprintf(stderr, "Failed to get DRM resources\n");
+    close(kms.fd);
+    return -1;
+  }
+
+  // Find a connected connector
+  kms.connector = NULL;
+  for (int i = 0; i < res->count_connectors; i++) {
+    drmModeConnector *conn = drmModeGetConnector(kms.fd, res->connectors[i]);
+    if (conn && conn->connection == DRM_MODE_CONNECTED &&
+        conn->count_modes > 0) {
+      kms.connector = conn;
+      printf("Found connected connector %d with %d modes\n", i,
+             conn->count_modes);
+      break;
+    }
+    if (conn)
+      drmModeFreeConnector(conn);
+  }
+
+  if (!kms.connector) {
+    fprintf(stderr, "No connected display found!\n");
+    drmModeFreeResources(res);
+    close(kms.fd);
+    return -1;
+  }
+
+  // Use the first mode
   kms.mode = kms.connector->modes[0];
+  printf("Selected mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay,
+         kms.mode.vrefresh);
+
+  // Get CRTC
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
+  if (!kms.crtc) {
+    fprintf(stderr, "Failed to get CRTC\n");
+    drmModeFreeConnector(kms.connector);
+    drmModeFreeResources(res);
+    close(kms.fd);
+    return -1;
+  }
+
   drmModeFreeResources(res);
 
   kms.plane_primary_id = 39;
@@ -507,7 +554,7 @@ int main(int argc, char **argv) {
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
-   GL_DYNAMIC_DRAW);
+               GL_DYNAMIC_DRAW);
 
   int current_anim_step = 0;
   update_geometry(current_anim_step);
@@ -536,7 +583,7 @@ int main(int argc, char **argv) {
 
   struct timespec anim_t0, anim_t1;
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
-  const double ANIM_STEP_SEC = 2.0; 
+  const double ANIM_STEP_SEC = 2.0;
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
