@@ -68,6 +68,14 @@ typedef struct {
 
   GLuint tex_y;
   GLuint tex_uv;
+
+  // Per-video performance stats
+  struct {
+    long total_upload_us;
+    int frame_count;
+    long min_us;
+    long max_us;
+  } perf;
 } GstVid;
 
 struct {
@@ -84,6 +92,42 @@ struct {
   GLuint prog;
   GLuint vbo;
 } kms;
+
+typedef struct {
+  // Frame timing breakdown
+  long frame_start_us;
+  long eos_check_us;
+  long texture_upload_us[VIDEO_COUNT];
+  long gl_draw_us[VIDEO_COUNT];
+  long total_upload_us;
+  long total_draw_us;
+  long plane_set_us;
+  long flip_us;
+  long total_frame_us;
+
+  // Per-frame tracking
+  int frame_count;
+  int video_upload_counts[VIDEO_COUNT];
+
+  // Rolling averages
+  long avg_frame_us;
+  long avg_upload_us;
+  long avg_draw_us;
+  long avg_plane_us;
+  long avg_flip_us;
+
+  // Min/Max tracking
+  long min_frame_us;
+  long max_frame_us;
+  long min_upload_us;
+  long max_upload_us;
+  long min_draw_us;
+  long max_draw_us;
+  long min_plane_us;
+  long max_plane_us;
+} PerfStats;
+
+PerfStats perf = {0};
 
 // --- GLOBALS ---
 GstVid videos[VIDEO_COUNT];
@@ -134,6 +178,60 @@ void handle_sigint(int sig) { running = 0; }
 long get_diff_us(struct timespec start, struct timespec end) {
   return (end.tv_sec - start.tv_sec) * 1000000 +
          (end.tv_nsec - start.tv_nsec) / 1000;
+}
+
+void init_perf_stats() {
+  perf.min_frame_us = 999999;
+  perf.max_frame_us = 0;
+  perf.min_upload_us = 999999;
+  perf.max_upload_us = 0;
+  perf.min_draw_us = 999999;
+  perf.max_draw_us = 0;
+  perf.min_plane_us = 999999;
+  perf.max_plane_us = 0;
+
+  for (int i = 0; i < VIDEO_COUNT; i++) {
+    videos[i].perf.min_us = 999999;
+    videos[i].perf.max_us = 0;
+  }
+}
+
+void print_perf_summary() {
+  printf("\n\n=== PERFORMANCE SUMMARY ===\n");
+  printf("Frame timing (averaged over %d frames):\n", perf.frame_count);
+  printf("  Total frame:    %5ld us (min: %ld, max: %ld)\n", perf.avg_frame_us,
+         perf.min_frame_us, perf.max_frame_us);
+  printf("  EOS check:      %5ld us\n", perf.eos_check_us);
+  printf("  Texture upload: %5ld us (min: %ld, max: %ld)\n", perf.avg_upload_us,
+         perf.min_upload_us, perf.max_upload_us);
+  printf("  GL drawing:     %5ld us (min: %ld, max: %ld)\n", perf.avg_draw_us,
+         perf.min_draw_us, perf.max_draw_us);
+  printf("  Plane set:      %5ld us (min: %ld, max: %ld)\n", perf.avg_plane_us,
+         perf.min_plane_us, perf.max_plane_us);
+  printf("  Buffer flip:    %5ld us\n", perf.avg_flip_us);
+
+  printf("\nPer-video texture upload times:\n");
+  for (int i = 0; i < VIDEO_COUNT; i++) {
+    if (videos[i].perf.frame_count > 0) {
+      long avg = videos[i].perf.total_upload_us / videos[i].perf.frame_count;
+      printf("  Video %d: avg=%5ld us, min=%ld, max=%ld (frames: %d)\n", i, avg,
+             videos[i].perf.min_us, videos[i].perf.max_us,
+             videos[i].perf.frame_count);
+    } else {
+      printf("  Video %d: no frames processed\n", i);
+    }
+  }
+
+  printf("\nBreakdown by operation:\n");
+  printf("  Texture upload: %.1f%% of frame time\n",
+         (perf.avg_upload_us * 100.0) / perf.avg_frame_us);
+  printf("  GL drawing:     %.1f%% of frame time\n",
+         (perf.avg_draw_us * 100.0) / perf.avg_frame_us);
+  printf("  Plane set:      %.1f%% of frame time\n",
+         (perf.avg_plane_us * 100.0) / perf.avg_frame_us);
+  printf("  Buffer flip:    %.1f%% of frame time\n",
+         (perf.avg_flip_us * 100.0) / perf.avg_frame_us);
+  printf("===========================\n\n");
 }
 
 // --- GSTREAMER CALLBACKS ---
@@ -223,6 +321,12 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
   vid->new_sample = NULL;
   vid->is_new_frame_ready = 0;
 
+  // Initialize per-video perf stats
+  vid->perf.total_upload_us = 0;
+  vid->perf.frame_count = 0;
+  vid->perf.min_us = 999999;
+  vid->perf.max_us = 0;
+
   char pipeline_str[512];
   snprintf(pipeline_str, sizeof(pipeline_str),
            "filesrc location=%s ! qtdemux ! h264parse ! omxh264dec ! "
@@ -250,7 +354,10 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
   return 0;
 }
 
-void update_texture_cpu(GstVid *vid) {
+void update_texture_cpu(GstVid *vid, int video_idx) {
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
   pthread_mutex_lock(&vid->lock);
   if (!vid->is_new_frame_ready) {
     pthread_mutex_unlock(&vid->lock);
@@ -316,9 +423,22 @@ void update_texture_cpu(GstVid *vid) {
 
   // Clean up
   gst_buffer_unmap(buffer, &map);
-
-  // THE FIX: Immediately return the sample to the GStreamer pool!
   gst_sample_unref(sample);
+
+  // Update per-video performance stats
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  long upload_us = get_diff_us(t0, t1);
+
+  vid->perf.total_upload_us += upload_us;
+  vid->perf.frame_count++;
+  if (upload_us < vid->perf.min_us)
+    vid->perf.min_us = upload_us;
+  if (upload_us > vid->perf.max_us)
+    vid->perf.max_us = upload_us;
+
+  // Update global texture upload time for this video
+  perf.texture_upload_us[video_idx] = upload_us;
+  perf.video_upload_counts[video_idx]++;
 }
 
 void update_geometry(int step) {
@@ -383,6 +503,9 @@ void update_geometry(int step) {
 void cleanup() {
   printf("\n--- Cleaning Up ---\n");
 
+  // Print performance summary before cleanup
+  print_perf_summary();
+
   for (int i = 0; i < VIDEO_COUNT; i++) {
     if (videos[i].pipeline) {
       gst_element_set_state(videos[i].pipeline, GST_STATE_NULL);
@@ -432,6 +555,34 @@ void cleanup() {
   if (kms.fd >= 0)
     close(kms.fd);
   printf("Done.\n");
+}
+
+void print_second_stats(struct timespec second_start,
+                        struct timespec second_end, int frames_this_second,
+                        long total_upload_us, long total_draw_us,
+                        long total_plane_us, long upload_counts[VIDEO_COUNT],
+                        long draw_counts[VIDEO_COUNT]) {
+  long second_duration = get_diff_us(second_start, second_end);
+  float fps = (frames_this_second * 1000000.0f) / second_duration;
+
+  printf("\n=== Stats for last 1 second ===\n");
+  printf("Frames: %d  |  FPS: %.1f\n", frames_this_second, fps);
+  printf("Frame time breakdown (avg per frame):\n");
+  printf("  Texture Upload: %5ld us\n",
+         frames_this_second ? total_upload_us / frames_this_second : 0);
+  printf("  GL Drawing:     %5ld us\n",
+         frames_this_second ? total_draw_us / frames_this_second : 0);
+  printf("  Plane Set:      %5ld us\n",
+         frames_this_second ? total_plane_us / frames_this_second : 0);
+
+  printf("\nPer-video uploads (avg per frame):\n");
+  for (int i = 0; i < VIDEO_COUNT; i++) {
+    if (upload_counts[i] > 0) {
+      printf("  Video %d: %5ld us (drawn %ld times)\n", i,
+             upload_counts[i] / frames_this_second, draw_counts[i]);
+    }
+  }
+  printf("================================\n");
 }
 
 int main(int argc, char **argv) {
@@ -575,18 +726,34 @@ int main(int argc, char **argv) {
                   0, 0, 0, 0, 0, 0);
 
   int back_buf = 0;
-  struct timespec t0, t1;
-  long total_us = 0;
-  int count = 0;
+  init_perf_stats();
 
-  printf("Running 4x GStreamer CPU Copy... Press Ctrl+C to exit.\n");
+  printf("Running 4x GStreamer CPU Copy with detailed performance logging... "
+         "Press Ctrl+C to exit.\n");
 
   struct timespec anim_t0, anim_t1;
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
   const double ANIM_STEP_SEC = 2.0;
 
+  struct timespec second_start, second_end, frame_start, eos_done, upload_done,
+      draw_done, plane_done, flip_done;
+  clock_gettime(CLOCK_MONOTONIC, &second_start);
+
+  int frames_this_second = 0;
+  long second_total_upload = 0;
+  long second_total_draw = 0;
+  long second_total_plane = 0;
+  long second_upload_counts[VIDEO_COUNT] = {0};
+  long second_draw_counts[VIDEO_COUNT] = {0};
+
   while (running) {
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_MONOTONIC, &frame_start);
+
+    // Reset per-frame timing arrays
+    for (int i = 0; i < VIDEO_COUNT; i++) {
+      perf.texture_upload_us[i] = 0;
+      perf.gl_draw_us[i] = 0;
+    }
 
     // --- ANIMATION CHECK ---
     clock_gettime(CLOCK_MONOTONIC, &anim_t1);
@@ -606,21 +773,34 @@ int main(int argc, char **argv) {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Draw each video in its respective quadrant
+    // Check EOS and rewind
     for (int i = 0; i < VIDEO_COUNT; i++) {
-
-      // --- ADD THESE 6 LINES TO LOOP THE VIDEO ---
       GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
       if (msg) {
-        // Rewind to 0 nanoseconds
         gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
                                 GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
                                 0);
         gst_message_unref(msg);
       }
-      // -------------------------------------------
+    }
+    clock_gettime(CLOCK_MONOTONIC, &eos_done);
 
-      update_texture_cpu(&videos[i]);
+    // Texture upload phase
+    for (int i = 0; i < VIDEO_COUNT; i++) {
+      struct timespec upload_start, upload_end;
+      clock_gettime(CLOCK_MONOTONIC, &upload_start);
+
+      update_texture_cpu(&videos[i], i);
+
+      clock_gettime(CLOCK_MONOTONIC, &upload_end);
+      perf.texture_upload_us[i] = get_diff_us(upload_start, upload_end);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &upload_done);
+
+    // Draw phase
+    for (int i = 0; i < VIDEO_COUNT; i++) {
+      struct timespec draw_start, draw_end;
+      clock_gettime(CLOCK_MONOTONIC, &draw_start);
 
       if (videos[i].tex_y) {
         glActiveTexture(GL_TEXTURE0);
@@ -628,27 +808,58 @@ int main(int argc, char **argv) {
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
 
-        // Draw 6 vertices (2 triangles) per quadrant.
-        // 0 offset for Video 0, 6 offset for Video 1, etc.
         glDrawArrays(GL_TRIANGLES, i * 6, 6);
       }
-    }
 
+      clock_gettime(CLOCK_MONOTONIC, &draw_end);
+      perf.gl_draw_us[i] = get_diff_us(draw_start, draw_end);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &draw_done);
+
+    // Plane set
     drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
                     kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
                     kms.mode.vdisplay << 16);
+    clock_gettime(CLOCK_MONOTONIC, &plane_done);
 
+    // Flip buffer
     back_buf = !back_buf;
+    clock_gettime(CLOCK_MONOTONIC, &flip_done);
 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    total_us += get_diff_us(t0, t1);
-    count++;
-    if (count >= 60) {
-      printf("FPS: %ld\r\n", 1000000 / (total_us / 60));
-      total_us = 0;
-      count = 0;
+    // Update frame count and print stats
+    perf.frame_count++;
+    frames_this_second++;
+    second_total_upload += get_diff_us(eos_done, upload_done);
+    second_total_draw += get_diff_us(upload_done, draw_done);
+    second_total_plane += get_diff_us(draw_done, plane_done);
+
+    for (int i = 0; i < VIDEO_COUNT; i++) {
+      second_upload_counts[i] += perf.texture_upload_us[i];
+      second_draw_counts[i] += (perf.gl_draw_us[i] > 0) ? 1 : 0;
     }
+
+    // Check if 1 second has passed
+    clock_gettime(CLOCK_MONOTONIC, &second_end);
+    if (get_diff_us(second_start, second_end) >=
+        1000000) { // 1 second in microseconds
+      print_second_stats(second_start, second_end, frames_this_second,
+                         second_total_upload, second_total_draw,
+                         second_total_plane, second_upload_counts,
+                         second_draw_counts);
+
+      // Reset for next second
+      clock_gettime(CLOCK_MONOTONIC, &second_start);
+      frames_this_second = 0;
+      second_total_upload = 0;
+      second_total_draw = 0;
+      second_total_plane = 0;
+      memset(second_upload_counts, 0, sizeof(second_upload_counts));
+      memset(second_draw_counts, 0, sizeof(second_draw_counts));
+    }
+
+    // Optional: Add a small delay to make output readable
+    // usleep(10000); // 10ms delay between frames
   }
 
   cleanup();
