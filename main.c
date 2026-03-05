@@ -4,7 +4,6 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -87,9 +86,6 @@ struct {
   GLuint vbo;
 
   // Shader locations
-  GLint loc_pos;
-  GLint loc_tex;
-  GLint debug_loc;
   int stride;
 
   // Debug
@@ -99,11 +95,6 @@ struct {
   // CRTC saved state for restoration
   drmModeCrtc *saved_crtc;
 
-  // Which buffer is currently being displayed
-  int front_buf;
-
-  // For debugging
-  int set_plane_failures;
 } kms;
 
 // --- GLOBALS ---
@@ -280,11 +271,11 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   // Map for CPU access (debugging)
   struct drm_mode_map_dumb map_req = {.handle = buf->handle};
   if (ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) == 0) {
-    buf->cpu_map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                        kms.fd, map_req.offset);
-    if (buf->cpu_map == MAP_FAILED) {
-      buf->cpu_map = NULL;
-    }
+    // buf->cpu_map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        // kms.fd, map_req.offset);
+    // if (buf->cpu_map == MAP_FAILED) {
+      // buf->cpu_map = NULL;
+    // }
   }
 
   // Try different formats - from your modetest output, the plane supports:
@@ -458,7 +449,7 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename, int index) {
   return 0;
 }
 
-void update_texture_cpu(GstVid *vid, int index) {
+void update_texture_cpu(GstVid *vid) {
   pthread_mutex_lock(&vid->lock);
   if (!vid->is_new_frame_ready) {
     pthread_mutex_unlock(&vid->lock);
@@ -501,8 +492,6 @@ void update_texture_cpu(GstVid *vid, int index) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    printf("Video %d: Created textures\n", index);
   }
 
   int pitch = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
@@ -570,60 +559,6 @@ void update_geometry(int step) {
 
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
-}
-
-void verify_fbo_content(int buf_index) {
-  glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[buf_index].fbo_id);
-
-  uint8_t pixel[4];
-  glReadPixels(kms.mode.hdisplay * 0.7, kms.mode.vdisplay * 0.7, 1, 1, GL_RGBA,
-               GL_UNSIGNED_BYTE, pixel);
-  check_gl_error("glReadPixels");
-
-  printf("Buffer %d a pixel: R=%d G=%d B=%d A=%d\n", buf_index, pixel[0],
-         pixel[1], pixel[2], pixel[3]);
-
-  if (kms.bufs[buf_index].cpu_map) {
-    uint32_t *ptr = (uint32_t *)kms.bufs[buf_index].cpu_map;
-    printf("Buffer %d first pixel from CPU: 0x%08x\n", buf_index, ptr[0]);
-  }
-}
-
-void test_display_update() {
-  printf("\n=== Testing Display Update ===\n");
-  for (int i = 0; i < 6; i++) {
-    int test_buf = i % 2;
-    glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[test_buf].fbo_id);
-
-    if (test_buf == 0) {
-      glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-    } else {
-      glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
-    }
-    glClear(GL_COLOR_BUFFER_BIT);
-    glFinish();
-
-    if (drmModeSetCrtc(kms.fd, kms.crtc->crtc_id, kms.bufs[test_buf].fb_id, 0,
-                       0, &kms.connector->connector_id, 1, &kms.mode) < 0) {
-      perror("drmModeSetCrtc");
-    } else {
-      printf("Buffer %d set, should be %s\n", test_buf,
-             test_buf == 0 ? "RED" : "GREEN");
-      kms.front_buf = test_buf;
-    }
-    usleep(500000); // 0.5 second
-  }
-  printf("=== Display Test Complete ===\n\n");
-}
-
-void setup_vertex_attributes() {
-  glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
-  glEnableVertexAttribArray(kms.loc_pos);
-  glEnableVertexAttribArray(kms.loc_tex);
-  glVertexAttribPointer(kms.loc_pos, 2, GL_FLOAT, GL_FALSE, kms.stride,
-                        (void *)0);
-  glVertexAttribPointer(kms.loc_tex, 2, GL_FLOAT, GL_FALSE, kms.stride,
-                        (void *)(2 * sizeof(float)));
 }
 
 void cleanup() {
@@ -695,9 +630,6 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
 
   gst_init(&argc, &argv);
-
-  // Initialize failure counter
-  kms.set_plane_failures = 0;
 
   kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0) {
@@ -844,12 +776,6 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  // printf("\nTesting rendering to buffer 0...\n");
-  // glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[0].fbo_id);
-  // glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-  // glClear(GL_COLOR_BUFFER_BIT);
-  // glFinish();
-  // verify_fbo_content(0);
   printf("\nSetting CRTC with buffer 0...\n");
   if (drmModeSetCrtc(kms.fd, kms.crtc->crtc_id, kms.bufs[0].fb_id, 0, 0,
                      &kms.connector->connector_id, 1, &kms.mode) < 0) {
@@ -857,10 +783,6 @@ int main(int argc, char **argv) {
     cleanup();
     return -1;
   }
-  kms.front_buf = 0;
-  // printf("CRTC set, should see RED screen for 10 seconds...\n");
-  // sleep(10);
-  // test_display_update();
 
   printf("\nInitializing GStreamer pipelines...\n");
   for (int i = 0; i < VIDEO_COUNT; i++) {
@@ -910,15 +832,6 @@ int main(int argc, char **argv) {
 
   glUseProgram(kms.prog);
 
-  // Get shader locations
-  kms.loc_pos = glGetAttribLocation(kms.prog, "a_pos");
-  kms.loc_tex = glGetAttribLocation(kms.prog, "a_tex");
-  kms.debug_loc = glGetUniformLocation(kms.prog, "debug_mode");
-  kms.stride = 4 * sizeof(float);
-
-  printf("Shader locations: pos=%d, tex=%d, debug=%d\n", kms.loc_pos,
-         kms.loc_tex, kms.debug_loc);
-
   // Create VBO
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
@@ -932,8 +845,14 @@ int main(int argc, char **argv) {
   int current_anim_step = 0;
   update_geometry(current_anim_step);
 
-  // Setup initial vertex attributes
-  setup_vertex_attributes();
+  GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
+  GLint loc_tex = glGetAttribLocation(kms.prog, "a_tex");
+  int stride = 4 * sizeof(float);
+  glEnableVertexAttribArray(loc_pos);
+  glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
+  glEnableVertexAttribArray(loc_tex);
+  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
+                        (void *)(2 * sizeof(float)));
 
   int back_buf = 1; // Start rendering to buffer 1 (buffer 0 is on screen)
   struct timespec t0, t1, anim_t0, anim_t1;
@@ -942,7 +861,6 @@ int main(int argc, char **argv) {
 
   printf("\nStarting main loop...\n");
   printf("First 60 frames will show test pattern, then videos\n");
-  printf("Front buffer: %d, Back buffer: %d\n", kms.front_buf, back_buf);
 
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
   const double ANIM_STEP_SEC = 2.0;
@@ -972,117 +890,48 @@ int main(int argc, char **argv) {
     // Render to back buffer
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
+
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (kms.frame_count < 60) {
-      // Draw test pattern
-      glUseProgram(kms.prog);
-      glUniform1i(kms.debug_loc, 1); // Enable debug mode in shader
-
-      // Setup vertex attributes
-      setup_vertex_attributes();
-
-      // Draw a full-screen quad with the test pattern
-      glDrawArrays(GL_TRIANGLES, 0, 6);
-
-    } else {
-      // Draw videos
-      glUseProgram(kms.prog);
-      glUniform1i(kms.debug_loc, 0); // Disable debug mode
-
-      // Setup vertex attributes
-      setup_vertex_attributes();
-
-      int videos_rendered = 0;
-      for (int i = 0; i < VIDEO_COUNT; i++) {
-        // Check for EOS and restart
-        GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
-        if (msg) {
-          printf("Video %d reached EOS, restarting\n", i);
-          gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
-                                  GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
-                                  0);
-          gst_message_unref(msg);
-        }
-
-        // Update video texture
-        update_texture_cpu(&videos[i], i);
-
-        // Render video if texture is ready
-        if (videos[i].tex_y) {
-          glActiveTexture(GL_TEXTURE0);
-          glBindTexture(GL_TEXTURE_2D, videos[i].tex_y);
-          glActiveTexture(GL_TEXTURE1);
-          glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
-
-          // Draw this video's quad
-          glDrawArrays(GL_TRIANGLES, i * 6, 6);
-          videos_rendered++;
-        }
+    for (int i = 0; i < VIDEO_COUNT; i++) {
+      // Check for EOS and restart
+      GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
+      if (msg) {
+        printf("Video %d reached EOS, restarting\n", i);
+        gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
+                                GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
+                                0);
+        gst_message_unref(msg);
       }
 
-      if (kms.frame_count == 60) {
-        printf("Switched to video mode, rendering %d videos\n",
-               videos_rendered);
+      // Update video texture
+      update_texture_cpu(&videos[i]);
+
+      // Render video if texture is ready
+      if (videos[i].tex_y) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, videos[i].tex_y);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
+
+        // Draw this video's quad
+        glDrawArrays(GL_TRIANGLES, i * 6, 6);
       }
     }
 
-    glFinish();
+    drmModeSetPlane(kms.fd, kms.plane_id, kms.crtc->crtc_id,
+                    kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
+                    kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
+                    kms.mode.vdisplay << 16);
 
-    // Debug output every 60 frames
-    if (kms.frame_count % 60 == 0) {
-      verify_fbo_content(back_buf);
-    }
+    back_buf = !back_buf;
 
-    // Try to use drmModeSetPlane if available, otherwise just keep the current
-    // buffer
-    if (kms.plane_id) {
-      // Try to set the plane to show the back buffer
-      int ret = drmModeSetPlane(
-          kms.fd, kms.plane_id, kms.crtc->crtc_id, kms.bufs[back_buf].fb_id, 0,
-          0, 0, kms.mode.hdisplay, kms.mode.vdisplay, 0, 0,
-          kms.mode.hdisplay << 16, kms.mode.vdisplay << 16);
-
-      if (ret == 0) {
-        // Success - update front buffer
-        kms.front_buf = back_buf;
-        kms.set_plane_failures = 0;
-      } else {
-        kms.set_plane_failures++;
-        if (kms.set_plane_failures == 1) {
-          // Only print first failure to avoid spam
-          printf("drmModeSetPlane failed (continuing): %s\n", strerror(errno));
-        }
-      }
-    } else {
-      // No plane available - just keep showing buffer 0
-      // This means we won't see updates, but at least we see something
-      if (kms.frame_count == 60) {
-        printf("No plane available - display will not update (showing static "
-               "buffer)\n");
-      }
-    }
-
-    // Switch back buffer for next frame
-    back_buf = (back_buf == 0) ? 1 : 0;
-    kms.frame_count++;
-
-    // Fixed framerate (target 30fps)
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    long frame_us = get_diff_us(t0, t1);
-    if (frame_us < 33000) { // 30fps = 33.33ms
-      usleep(33000 - frame_us);
-    }
-
-    // FPS calculation
-    total_us += frame_us;
+    total_us += get_diff_us(t0, t1);
     count++;
-    if (count >= 30) {
-      printf("FPS: %ld, Frame: %d (front buf: %d, back buf: %d, plane "
-             "failures: %d)\n",
-             1000000 / (total_us / 30), kms.frame_count, kms.front_buf,
-             back_buf, kms.set_plane_failures);
+    if (count >= 60) {
+      printf("FPS: %ld\r\n", 1000000 / (total_us / 60));
       total_us = 0;
       count = 0;
     }
