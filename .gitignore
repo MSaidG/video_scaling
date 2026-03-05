@@ -7,3 +7,5 @@ err*
 vgcore*
 commands
 decode_app*
+main
+main_hdmi
