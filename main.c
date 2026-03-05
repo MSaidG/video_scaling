@@ -387,10 +387,15 @@ int main(int argc, char **argv) {
 
   gst_init(&argc, &argv);
 
-  kms.fd = open("/dev/dri/by-path/platform-amba_pl@0:drm_hdmi-card",
+  kms.fd = open("/dev/dri/card1",
                 O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0)
-    kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  if (kms.fd < 0) {
+    kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    printf("Connected to HDMI driver.");
+
+  } else {
+    printf("Connected to HDMI driver.");
+  }
 
   drmModeRes *res = drmModeGetResources(kms.fd);
 
