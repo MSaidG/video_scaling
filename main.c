@@ -100,40 +100,12 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "   v_tex = a_tex;\n"
                      "}\n";
 
-// The Magic Shader: Unpacks 10-bit XVUY memory mapped as 8-bit ARGB bytes
 const char *fs_src = "#extension GL_OES_EGL_image_external : require\n"
-                     "precision highp float;\n"
+                     "precision mediump float;\n"
                      "varying vec2 v_tex;\n"
                      "uniform samplerExternalOES tex_cam;\n"
                      "void main() {\n"
-                     "  vec4 raw = texture2D(tex_cam, v_tex) * 255.0;\n"
-                     "  float r = raw.r; float g = raw.g; float b = raw.b; float a = raw.a;\n"
-                     
-                     // Decode 10-bit Y (bits 0-9)
-                     "  float y_upper = mod(g, 4.0);\n"
-                     "  float Y = r + (y_upper * 256.0);\n"
-                     "  float y_norm = Y / 1023.0;\n"
-                     
-                     // Decode 10-bit U (bits 10-19)
-                     "  float u_lower = floor(g / 4.0);\n"
-                     "  float u_upper = mod(b, 16.0);\n"
-                     "  float U = u_lower + (u_upper * 64.0);\n"
-                     "  float u_norm = U / 1023.0;\n"
-                     
-                     // Decode 10-bit V (bits 20-29)
-                     "  float v_lower = floor(b / 16.0);\n"
-                     "  float v_upper = mod(a, 64.0);\n"
-                     "  float V = v_lower + (v_upper * 16.0);\n"
-                     "  float v_norm = V / 1023.0;\n"
-
-                     // Convert to RGB
-                     "  float d = u_norm - 0.5;\n"
-                     "  float e = v_norm - 0.5;\n"
-                     "  float red = y_norm + 1.402 * e;\n"
-                     "  float green = y_norm - 0.344 * d - 0.714 * e;\n"
-                     "  float blue = y_norm + 1.772 * d;\n"
-                     
-                     "  gl_FragColor = vec4(red, green, blue, 1.0);\n"
+                     "  gl_FragColor = texture2D(tex_cam, v_tex);\n"
                      "}\n";
 
 // --- HELPERS ---
