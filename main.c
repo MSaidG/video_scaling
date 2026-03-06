@@ -102,7 +102,6 @@ typedef struct {
   long total_upload_us;
   long total_draw_us;
   long plane_set_us;
-  long flip_us;
   long total_frame_us;
 
   // Per-frame tracking
@@ -114,7 +113,7 @@ typedef struct {
   long avg_upload_us;
   long avg_draw_us;
   long avg_plane_us;
-  long avg_flip_us;
+  long avg_eos_us;
 
   // Min/Max tracking
   long min_frame_us;
@@ -199,38 +198,50 @@ void init_perf_stats() {
 void print_perf_summary() {
   printf("\n\n=== PERFORMANCE SUMMARY ===\n");
   printf("Frame timing (averaged over %d frames):\n", perf.frame_count);
-  printf("  Total frame:    %5ld us (min: %ld, max: %ld)\n", perf.avg_frame_us,
-         perf.min_frame_us, perf.max_frame_us);
-  printf("  EOS check:      %5ld us\n", perf.eos_check_us);
-  printf("  Texture upload: %5ld us (min: %ld, max: %ld)\n", perf.avg_upload_us,
-         perf.min_upload_us, perf.max_upload_us);
-  printf("  GL drawing:     %5ld us (min: %ld, max: %ld)\n", perf.avg_draw_us,
-         perf.min_draw_us, perf.max_draw_us);
-  printf("  Plane set:      %5ld us (min: %ld, max: %ld)\n", perf.avg_plane_us,
-         perf.min_plane_us, perf.max_plane_us);
-  printf("  Buffer flip:    %5ld us\n", perf.avg_flip_us);
+
+  // Calculate averages properly
+  long avg_frame_us = perf.frame_count > 0 ? perf.avg_frame_us : 0;
+  long avg_eos_us = perf.frame_count > 0 ? perf.avg_eos_us : 0;
+  long avg_upload_us = perf.frame_count > 0 ? perf.avg_upload_us : 0;
+  long avg_draw_us = perf.frame_count > 0 ? perf.avg_draw_us : 0;
+  long avg_plane_us = perf.frame_count > 0 ? perf.avg_plane_us : 0;
+
+  printf("  Total frame:    %5ld us (min: %ld, max: %ld)\n", avg_frame_us,
+         perf.min_frame_us < 999999 ? perf.min_frame_us : 0, perf.max_frame_us);
+  printf("  EOS check:      %5ld us\n", avg_eos_us);
+  printf("  Texture upload: %5ld us (min: %ld, max: %ld)\n", avg_upload_us,
+         perf.min_upload_us < 999999 ? perf.min_upload_us : 0,
+         perf.max_upload_us);
+  printf("  GL drawing:     %5ld us (min: %ld, max: %ld)\n", avg_draw_us,
+         perf.min_draw_us < 999999 ? perf.min_draw_us : 0, perf.max_draw_us);
+  printf("  Plane set:      %5ld us (min: %ld, max: %ld)\n", avg_plane_us,
+         perf.min_plane_us < 999999 ? perf.min_plane_us : 0, perf.max_plane_us);
 
   printf("\nPer-video texture upload times:\n");
   for (int i = 0; i < VIDEO_COUNT; i++) {
     if (videos[i].perf.frame_count > 0) {
       long avg = videos[i].perf.total_upload_us / videos[i].perf.frame_count;
       printf("  Video %d: avg=%5ld us, min=%ld, max=%ld (frames: %d)\n", i, avg,
-             videos[i].perf.min_us, videos[i].perf.max_us,
-             videos[i].perf.frame_count);
+             videos[i].perf.min_us < 999999 ? videos[i].perf.min_us : 0,
+             videos[i].perf.max_us, videos[i].perf.frame_count);
     } else {
       printf("  Video %d: no frames processed\n", i);
     }
   }
 
   printf("\nBreakdown by operation:\n");
-  printf("  Texture upload: %.1f%% of frame time\n",
-         (perf.avg_upload_us * 100.0) / perf.avg_frame_us);
-  printf("  GL drawing:     %.1f%% of frame time\n",
-         (perf.avg_draw_us * 100.0) / perf.avg_frame_us);
-  printf("  Plane set:      %.1f%% of frame time\n",
-         (perf.avg_plane_us * 100.0) / perf.avg_frame_us);
-  printf("  Buffer flip:    %.1f%% of frame time\n",
-         (perf.avg_flip_us * 100.0) / perf.avg_frame_us);
+  if (avg_frame_us > 0) {
+    printf("  EOS check:      %.1f%% of frame time\n",
+           (avg_eos_us * 100.0) / avg_frame_us);
+    printf("  Texture upload: %.1f%% of frame time\n",
+           (avg_upload_us * 100.0) / avg_frame_us);
+    printf("  GL drawing:     %.1f%% of frame time\n",
+           (avg_draw_us * 100.0) / avg_frame_us);
+    printf("  Plane set:      %.1f%% of frame time\n",
+           (avg_plane_us * 100.0) / avg_frame_us);
+  } else {
+    printf("  No frame data available\n");
+  }
   printf("===========================\n\n");
 }
 
@@ -740,6 +751,7 @@ int main(int argc, char **argv) {
   clock_gettime(CLOCK_MONOTONIC, &second_start);
 
   int frames_this_second = 0;
+  long second_total_eos = 0;
   long second_total_upload = 0;
   long second_total_draw = 0;
   long second_total_plane = 0;
@@ -830,6 +842,7 @@ int main(int argc, char **argv) {
     // Update frame count and print stats
     perf.frame_count++;
     frames_this_second++;
+    second_total_eos += get_diff_us(frame_start, eos_done);
     second_total_upload += get_diff_us(eos_done, upload_done);
     second_total_draw += get_diff_us(upload_done, draw_done);
     second_total_plane += get_diff_us(draw_done, plane_done);
@@ -848,9 +861,33 @@ int main(int argc, char **argv) {
                          second_total_plane, second_upload_counts,
                          second_draw_counts);
 
+      // Update rolling averages
+      perf.avg_frame_us =
+          (perf.avg_frame_us * (perf.frame_count - frames_this_second) +
+           (second_total_eos + second_total_upload + second_total_draw +
+            second_total_plane)) /
+          perf.frame_count;
+      perf.avg_eos_us =
+          (perf.avg_eos_us * (perf.frame_count - frames_this_second) +
+           second_total_eos) /
+          perf.frame_count;
+      perf.avg_upload_us =
+          (perf.avg_upload_us * (perf.frame_count - frames_this_second) +
+           second_total_upload) /
+          perf.frame_count;
+      perf.avg_draw_us =
+          (perf.avg_draw_us * (perf.frame_count - frames_this_second) +
+           second_total_draw) /
+          perf.frame_count;
+      perf.avg_plane_us =
+          (perf.avg_plane_us * (perf.frame_count - frames_this_second) +
+           second_total_plane) /
+          perf.frame_count;
+
       // Reset for next second
       clock_gettime(CLOCK_MONOTONIC, &second_start);
       frames_this_second = 0;
+      second_total_eos = 0;
       second_total_upload = 0;
       second_total_draw = 0;
       second_total_plane = 0;
