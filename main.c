@@ -1063,8 +1063,8 @@ int main(int argc, char **argv) {
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    // glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    // glClear(GL_COLOR_BUFFER_BIT);
 
     // EOS check phase
     for (int i = 0; i < VIDEO_COUNT; i++) {
@@ -1114,6 +1114,8 @@ int main(int argc, char **argv) {
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
                     kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
                     kms.mode.vdisplay << 16);
+    drmModePageFlip(kms.fd, kms.crtc->crtc_id, kms.bufs[back_buf].fb_id,
+                    DRM_MODE_PAGE_FLIP_EVENT, NULL);
     clock_gettime(CLOCK_MONOTONIC, &plane_done);
 
     back_buf = !back_buf;
@@ -1140,12 +1142,27 @@ int main(int argc, char **argv) {
                          second_upload_counts, second_draw_counts);
 
       // Update rolling averages
-      perf.avg_frame_us = (perf.avg_frame_us * (perf.frame_count - frames_this_second) +
-                          (second_total_eos + second_total_upload + second_total_draw + second_total_plane)) / perf.frame_count;
-      perf.avg_eos_us = (perf.avg_eos_us * (perf.frame_count - frames_this_second) + second_total_eos) / perf.frame_count;
-      perf.avg_upload_us = (perf.avg_upload_us * (perf.frame_count - frames_this_second) + second_total_upload) / perf.frame_count;
-      perf.avg_draw_us = (perf.avg_draw_us * (perf.frame_count - frames_this_second) + second_total_draw) / perf.frame_count;
-      perf.avg_plane_us = (perf.avg_plane_us * (perf.frame_count - frames_this_second) + second_total_plane) / perf.frame_count;
+      perf.avg_frame_us =
+          (perf.avg_frame_us * (perf.frame_count - frames_this_second) +
+           (second_total_eos + second_total_upload + second_total_draw +
+            second_total_plane)) /
+          perf.frame_count;
+      perf.avg_eos_us =
+          (perf.avg_eos_us * (perf.frame_count - frames_this_second) +
+           second_total_eos) /
+          perf.frame_count;
+      perf.avg_upload_us =
+          (perf.avg_upload_us * (perf.frame_count - frames_this_second) +
+           second_total_upload) /
+          perf.frame_count;
+      perf.avg_draw_us =
+          (perf.avg_draw_us * (perf.frame_count - frames_this_second) +
+           second_total_draw) /
+          perf.frame_count;
+      perf.avg_plane_us =
+          (perf.avg_plane_us * (perf.frame_count - frames_this_second) +
+           second_total_plane) /
+          perf.frame_count;
 
       // Reset for next second
       clock_gettime(CLOCK_MONOTONIC, &second_start);
