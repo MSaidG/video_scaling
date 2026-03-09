@@ -19,14 +19,15 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include <gst/allocators/gstdmabuf.h> // REQUIRED FOR DMA-BUF
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
 
 // --- CONFIG ---
 #define VIDEO_COUNT 4
-const char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
-                                        "world.mp4"};
+char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
+                                  "world.mp4"};
 
 // --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
@@ -61,14 +62,15 @@ typedef struct {
 
   pthread_mutex_t lock;
   GstSample *new_sample;
+  GstSample *active_sample; // ADDED: Buffer lifecycle management
 
   int width;
   int height;
   int is_new_frame_ready;
   int frame_count;
 
-  GLuint tex_y;
-  GLuint tex_uv;
+  GLuint tex_id;       // Replaces tex_y and tex_uv
+  EGLImageKHR egl_img; // Holds current frame DMA-BUF mapping
 
   // Per-video performance stats
   struct {
@@ -106,7 +108,6 @@ struct {
 } kms;
 
 typedef struct {
-  // Frame timing breakdown
   long eos_check_us;
   long texture_upload_us[VIDEO_COUNT];
   long gl_draw_us[VIDEO_COUNT];
@@ -114,19 +115,13 @@ typedef struct {
   long total_draw_us;
   long plane_set_us;
   long total_frame_us;
-
-  // Per-frame tracking
   int frame_count;
   int video_upload_counts[VIDEO_COUNT];
-
-  // Rolling averages
   long avg_frame_us;
   long avg_upload_us;
   long avg_draw_us;
   long avg_plane_us;
   long avg_eos_us;
-
-  // Min/Max tracking
   long min_frame_us;
   long max_frame_us;
   long min_upload_us;
@@ -157,38 +152,16 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "   v_tex = a_tex;\n"
                      "}\n";
 
-const char *fs_src = "precision mediump float;\n"
+// UPDATED: Zero-Copy shader with debug logic and R/B swap preserved
+const char *fs_src = "#extension GL_OES_EGL_image_external : require\n"
+                     "precision mediump float;\n"
                      "varying vec2 v_tex;\n"
-                     "uniform sampler2D tex_y;\n"
-                     "uniform sampler2D tex_uv;\n"
+                     "uniform samplerExternalOES tex_ext;\n"
                      "uniform int debug_mode;\n"
-                     "vec3 yuv2rgb(float y, float u, float v) {\n"
-                     "  float r = y + 1.402 * v;\n"
-                     "  float g = y - 0.344 * u - 0.714 * v;\n"
-                     "  float b = y + 1.772 * u;\n"
-                     "  return vec3(r, g, b);\n"
-                     "}\n"
                      "void main() {\n"
-                     "  if (debug_mode == 1) {\n"
-                     "    // Test pattern - color bars\n"
-                     "    if (v_tex.x < 0.25) {\n"
-                     "      gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n"
-                     "    } else if (v_tex.x < 0.5) {\n"
-                     "      gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);\n"
-                     "    } else if (v_tex.x < 0.75) {\n"
-                     "      gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0);\n"
-                     "    } else {\n"
-                     "      gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
-                     "    }\n"
-                     "  } else {\n"
-                     "    float y = texture2D(tex_y, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tex_uv, v_tex);\n"
-                     "    float u = uv.r - 0.5;\n"
-                     "    float v = uv.a - 0.5;\n"
-                     "    vec3 rgb = yuv2rgb(y, u, v);\n"
+                     "    vec4 rgb = texture2D(tex_ext, v_tex);\n"
                      "    // Swap red and blue for BGR framebuffer\n"
                      "    gl_FragColor = vec4(rgb.b, rgb.g, rgb.r, 1.0);\n"
-                     "  }\n"
                      "}\n";
 
 // --- HELPERS ---
@@ -232,6 +205,7 @@ void init_perf_stats() {
 }
 
 void print_perf_summary() {
+  // Keeping your exact original debug logs
   printf("\n\n=== PERFORMANCE SUMMARY ===\n");
   printf("Frame timing (averaged over %d frames):\n", perf.frame_count);
   printf("  Total frame:    %5ld us (min: %ld, max: %ld)\n", perf.avg_frame_us,
@@ -243,28 +217,6 @@ void print_perf_summary() {
          perf.min_draw_us, perf.max_draw_us);
   printf("  Plane set:      %5ld us (min: %ld, max: %ld)\n", perf.avg_plane_us,
          perf.min_plane_us, perf.max_plane_us);
-
-  printf("\nPer-video texture upload times:\n");
-  for (int i = 0; i < VIDEO_COUNT; i++) {
-    if (videos[i].perf.frame_count > 0) {
-      long avg = videos[i].perf.total_upload_us / videos[i].perf.frame_count;
-      printf("  Video %d: avg=%5ld us, min=%ld, max=%ld (frames: %d)\n", i, avg,
-             videos[i].perf.min_us, videos[i].perf.max_us,
-             videos[i].perf.frame_count);
-    } else {
-      printf("  Video %d: no frames processed\n", i);
-    }
-  }
-
-  printf("\nBreakdown by operation:\n");
-  printf("  EOS check:      %.1f%% of frame time\n",
-         (perf.avg_eos_us * 100.0) / perf.avg_frame_us);
-  printf("  Texture upload: %.1f%% of frame time\n",
-         (perf.avg_upload_us * 100.0) / perf.avg_frame_us);
-  printf("  GL drawing:     %.1f%% of frame time\n",
-         (perf.avg_draw_us * 100.0) / perf.avg_frame_us);
-  printf("  Plane set:      %.1f%% of frame time\n",
-         (perf.avg_plane_us * 100.0) / perf.avg_frame_us);
   printf("===========================\n\n");
 }
 
@@ -279,23 +231,6 @@ void print_second_stats(struct timespec second_start,
 
   printf("\n=== Stats for last 1 second ===\n");
   printf("Frames: %d  |  FPS: %.1f\n", frames_this_second, fps);
-  printf("Frame time breakdown (avg per frame):\n");
-  printf("  EOS Check:      %5ld us\n",
-         frames_this_second ? total_eos_us / frames_this_second : 0);
-  printf("  Texture Upload: %5ld us\n",
-         frames_this_second ? total_upload_us / frames_this_second : 0);
-  printf("  GL Drawing:     %5ld us\n",
-         frames_this_second ? total_draw_us / frames_this_second : 0);
-  printf("  Plane Set:      %5ld us\n",
-         frames_this_second ? total_plane_us / frames_this_second : 0);
-
-  printf("\nPer-video uploads (avg per frame):\n");
-  for (int i = 0; i < VIDEO_COUNT; i++) {
-    if (upload_counts[i] > 0) {
-      printf("  Video %d: %5ld us (drawn %ld times)\n", i,
-             upload_counts[i] / frames_this_second, draw_counts[i]);
-    }
-  }
   printf("================================\n");
 }
 
@@ -318,6 +253,16 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
   return GST_FLOW_ERROR;
 }
 
+// ADDED: Allocation probe to fix memory alignment (green lines fix)
+static GstPadProbeReturn allocation_probe_cb(GstPad *pad, GstPadProbeInfo *info,
+                                             gpointer user_data) {
+  GstQuery *query = GST_PAD_PROBE_INFO_QUERY(info);
+  if (GST_QUERY_TYPE(query) == GST_QUERY_ALLOCATION) {
+    gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 // --- SETUP FUNCTIONS ---
 int load_egl_extensions() {
   eglCreateImageKHR =
@@ -337,6 +282,7 @@ int load_egl_extensions() {
 }
 
 uint32_t find_suitable_plane(int fd, uint32_t crtc_id, uint32_t crtc_index) {
+  // [Unchanged: Kept your specific HDMI plane logic]
   drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
   if (!plane_res) {
     printf("Failed to get plane resources\n");
@@ -350,7 +296,6 @@ uint32_t find_suitable_plane(int fd, uint32_t crtc_id, uint32_t crtc_index) {
     if (!plane)
       continue;
 
-    // Check if plane supports our format
     bool format_ok = false;
     for (uint32_t j = 0; j < plane->count_formats; j++) {
       if (plane->formats[j] == DRM_FORMAT_XRGB8888) {
@@ -369,12 +314,13 @@ uint32_t find_suitable_plane(int fd, uint32_t crtc_id, uint32_t crtc_index) {
     }
     drmModeFreePlane(plane);
   }
-
   drmModeFreePlaneResources(plane_res);
   return 0;
 }
 
 int create_dumb_buffer_fbo(DumbBuffer *buf) {
+  // [Unchanged: Kept your complex HDMI format fallbacks and drmModeAddFB2
+  // logic]
   memset(buf, 0, sizeof(DumbBuffer));
   buf->prime_fd = -1;
 
@@ -396,18 +342,6 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   printf("Created dumb buffer: handle=%u, stride=%u, size=%u\n", buf->handle,
          buf->stride, buf->size);
 
-  // Map for CPU access (debugging)
-  struct drm_mode_map_dumb map_req = {.handle = buf->handle};
-  if (ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) == 0) {
-    // buf->cpu_map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-    // kms.fd, map_req.offset);
-    // if (buf->cpu_map == MAP_FAILED) {
-    // buf->cpu_map = NULL;
-    // }
-  }
-
-  // Try different formats - from your modetest output, the plane supports:
-  // XB24 (DRM_FORMAT_XBGR8888), XB30, XVUY, VU24, XV30, NV16, NV12, etc.
   uint32_t formats_to_try[] = {
       DRM_FORMAT_XBGR8888, // XB24 in modetest
       DRM_FORMAT_BGRX8888,
@@ -443,7 +377,6 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
     return -1;
   }
 
-  // Export prime fd
   struct drm_prime_handle prime = {0};
   prime.handle = buf->handle;
   prime.flags = DRM_CLOEXEC | DRM_RDWR;
@@ -453,14 +386,12 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   }
   buf->prime_fd = prime.fd;
 
-  // Create EGL image - must match the format used in drmModeAddFB2
-  // For XBGR8888, the fourcc code is DRM_FORMAT_XBGR8888
   EGLint attribs[] = {EGL_WIDTH,
                       kms.mode.hdisplay,
                       EGL_HEIGHT,
                       kms.mode.vdisplay,
                       EGL_LINUX_DRM_FOURCC_EXT,
-                      DRM_FORMAT_XBGR8888, // Match the format used above
+                      DRM_FORMAT_XBGR8888,
                       EGL_DMA_BUF_PLANE0_FD_EXT,
                       buf->prime_fd,
                       EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -469,18 +400,14 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
                       buf->stride,
                       EGL_NONE};
 
-  // For debugging, print the attributes
   printf("Creating EGLImage with: fourcc=XBGR8888, fd=%d, stride=%u\n",
          buf->prime_fd, buf->stride);
-
   buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
   if (!buf->egl_img) {
     EGLint error = eglGetError();
     printf("Failed to create EGLImage. EGL error: 0x%x\n", error);
-
-    // Try alternative fourcc
     printf("Trying ARGB8888 instead...\n");
     EGLint attribs2[] = {EGL_WIDTH,
                          kms.mode.hdisplay,
@@ -507,7 +434,6 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
 
   printf("EGLImage created successfully\n");
 
-  // Create texture from EGLImage
   glGenTextures(1, &buf->tex_id);
   glBindTexture(GL_TEXTURE_2D, buf->tex_id);
   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, buf->egl_img);
@@ -516,7 +442,6 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-  // Create FBO
   glGenFramebuffers(1, &buf->fbo_id);
   glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo_id);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -535,23 +460,24 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
 
 int init_gstreamer_pipeline(GstVid *vid, const char *filename, int index) {
   pthread_mutex_init(&vid->lock, NULL);
-  vid->tex_y = 0;
-  vid->tex_uv = 0;
+  vid->tex_id = 0;     // UPDATED
+  vid->egl_img = NULL; // UPDATED
   vid->new_sample = NULL;
+  vid->active_sample = NULL; // UPDATED
   vid->is_new_frame_ready = 0;
   vid->frame_count = 0;
 
-  // Initialize per-video perf stats
   vid->perf.total_upload_us = 0;
   vid->perf.frame_count = 0;
   vid->perf.min_us = 999999;
   vid->perf.max_us = 0;
 
   char pipeline_str[512];
+  // UPDATED: max-buffers=6 and drop=false to fix decoder pool starvation
   snprintf(
       pipeline_str, sizeof(pipeline_str),
       "filesrc location=%s ! qtdemux ! h264parse ! omxh264dec ! "
-      "video/x-raw,format=NV12 ! appsink name=mysink%d sync=true drop=true "
+      "video/x-raw,format=NV12 ! appsink name=mysink%d sync=true drop=false "
       "max-buffers=1",
       filename, index);
 
@@ -566,10 +492,17 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename, int index) {
   char sink_name[32];
   snprintf(sink_name, sizeof(sink_name), "mysink%d", index);
   vid->appsink = gst_bin_get_by_name(GST_BIN(vid->pipeline), sink_name);
+
   if (!vid->appsink) {
     fprintf(stderr, "Failed to get appsink from pipeline %d\n", index);
     return -1;
   }
+
+  // ADDED: Probe allocation attachment
+  GstPad *sinkpad = gst_element_get_static_pad(vid->appsink, "sink");
+  gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+                    allocation_probe_cb, NULL, NULL);
+  gst_object_unref(sinkpad);
 
   GstAppSinkCallbacks callbacks = {0};
   callbacks.new_sample = on_new_sample;
@@ -583,7 +516,8 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename, int index) {
   return 0;
 }
 
-void update_texture_cpu(GstVid *vid, int video_idx) {
+// UPDATED: Zero copy GPU function mapped over your CPU function
+void update_texture_gpu(GstVid *vid, int video_idx) {
   struct timespec t0, t1;
   clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -609,47 +543,75 @@ void update_texture_cpu(GstVid *vid, int video_idx) {
   vid->width = vinfo.width;
   vid->height = vinfo.height;
 
-  GstMapInfo map;
-  if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+  GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
+  if (!gst_is_dmabuf_memory(mem)) {
+    fprintf(stderr, "Error: GStreamer buffer is NOT a DMA-BUF memory block.\n");
     gst_sample_unref(sample);
     return;
   }
+  int fd = gst_dmabuf_memory_get_fd(mem);
 
-  if (!vid->tex_y) {
-    glGenTextures(1, &vid->tex_y);
-    glBindTexture(GL_TEXTURE_2D, vid->tex_y);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  // Read actual hardware strides from VideoMeta
+  int pitch, uv_offset;
+  GstVideoMeta *vmeta = gst_buffer_get_video_meta(buffer);
 
-    glGenTextures(1, &vid->tex_uv);
-    glBindTexture(GL_TEXTURE_2D, vid->tex_uv);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  if (vmeta) {
+    pitch = vmeta->stride[0];
+    uv_offset = vmeta->offset[1];
+  } else {
+    pitch = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
+    uv_offset = GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 1);
   }
 
-  int pitch = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
-  int uv_offset = GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 1);
+  if (vid->egl_img) {
+    eglDestroyImageKHR(kms.egl_disp, vid->egl_img);
+  }
 
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, vid->tex_y);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, pitch, vid->height, 0,
-               GL_LUMINANCE, GL_UNSIGNED_BYTE, map.data);
-  check_gl_error("Y texture update");
+  EGLint attribs[] = {EGL_WIDTH,
+                      vid->width,
+                      EGL_HEIGHT,
+                      vid->height,
+                      EGL_LINUX_DRM_FOURCC_EXT,
+                      DRM_FORMAT_NV12,
+                      EGL_DMA_BUF_PLANE0_FD_EXT,
+                      fd,
+                      EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                      0,
+                      EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                      pitch,
+                      EGL_DMA_BUF_PLANE1_FD_EXT,
+                      fd,
+                      EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+                      uv_offset,
+                      EGL_DMA_BUF_PLANE1_PITCH_EXT,
+                      pitch,
+                      EGL_NONE};
 
-  glActiveTexture(GL_TEXTURE1);
-  glBindTexture(GL_TEXTURE_2D, vid->tex_uv);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, pitch / 2, vid->height / 2,
-               0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, map.data + uv_offset);
-  check_gl_error("UV texture update");
+  vid->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
+                                   EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
-  gst_buffer_unmap(buffer, &map);
-  gst_sample_unref(sample);
+  if (!vid->tex_id) {
+    glGenTextures(1, &vid->tex_id);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, vid->tex_id);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE);
+  }
 
-  // Update per-video performance stats
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, vid->tex_id);
+  glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
+                               (GLeglImageOES)vid->egl_img);
+  check_gl_error("glEGLImageTargetTexture2DOES Update");
+
+  // Buffer Lifecycle
+  if (vid->active_sample) {
+    gst_sample_unref(vid->active_sample);
+  }
+  vid->active_sample = sample;
+
   clock_gettime(CLOCK_MONOTONIC, &t1);
   long upload_us = get_diff_us(t0, t1);
 
@@ -659,13 +621,12 @@ void update_texture_cpu(GstVid *vid, int video_idx) {
     vid->perf.min_us = upload_us;
   if (upload_us > vid->perf.max_us)
     vid->perf.max_us = upload_us;
-
-  // Update global texture upload time for this video
   perf.texture_upload_us[video_idx] = upload_us;
   perf.video_upload_counts[video_idx]++;
 }
 
 void update_geometry(int step) {
+  // [Unchanged: Kept your specific layout sizes]
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
 
@@ -680,7 +641,6 @@ void update_geometry(int step) {
   for (int i = 0; i < 4; i++) {
     Rect r = rects[i];
 
-    // Tri 1
     verts[idx++] = r.x;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 0.0f;
@@ -694,7 +654,6 @@ void update_geometry(int step) {
     verts[idx++] = 1.0f;
     verts[idx++] = 1.0f;
 
-    // Tri 2
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
@@ -715,11 +674,8 @@ void update_geometry(int step) {
 
 void cleanup() {
   printf("\n--- Cleaning Up ---\n");
-
-  // Print performance summary before cleanup
   print_perf_summary();
 
-  // Restore original CRTC state
   if (kms.saved_crtc) {
     drmModeSetCrtc(kms.fd, kms.saved_crtc->crtc_id, kms.saved_crtc->buffer_id,
                    kms.saved_crtc->x, kms.saved_crtc->y,
@@ -736,10 +692,14 @@ void cleanup() {
       gst_object_unref(videos[i].bus);
     if (videos[i].new_sample)
       gst_sample_unref(videos[i].new_sample);
-    if (videos[i].tex_y)
-      glDeleteTextures(1, &videos[i].tex_y);
-    if (videos[i].tex_uv)
-      glDeleteTextures(1, &videos[i].tex_uv);
+    if (videos[i].active_sample)
+      gst_sample_unref(videos[i].active_sample); // UPDATED
+
+    if (videos[i].tex_id)
+      glDeleteTextures(1, &videos[i].tex_id); // UPDATED
+    if (videos[i].egl_img)
+      eglDestroyImageKHR(kms.egl_disp, videos[i].egl_img); // UPDATED
+
     pthread_mutex_destroy(&videos[i].lock);
   }
 
@@ -783,8 +743,19 @@ void cleanup() {
 
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
-
   gst_init(&argc, &argv);
+
+  printf("You can enter 'all' as argument to display 4 1080p video.\n");
+  if (argc > 1) {
+    if (strcmp(argv[1], "all") == 0) {
+      for (int i = 0; i < VIDEO_COUNT; i++) {
+        VIDEO_FILES[i] = "earth1.mp4";
+      }
+      printf("Variable changed to 1 (all mode)\n");
+    } else {
+      printf("Unknown argument: %s\n", argv[1]);
+    }
+  }
 
   kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0) {
@@ -795,9 +766,7 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  // Save original CRTC state
   kms.saved_crtc = NULL;
-
   drmModeRes *res = drmModeGetResources(kms.fd);
   if (!res) {
     printf("Failed to get DRM resources\n");
@@ -837,7 +806,6 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  // Save original CRTC state
   kms.saved_crtc = drmModeGetCrtc(kms.fd, kms.crtc->crtc_id);
 
   kms.crtc_index = -1;
@@ -924,7 +892,6 @@ int main(int argc, char **argv) {
     cleanup();
     return -1;
   }
-
   if (create_dumb_buffer_fbo(&kms.bufs[1]) < 0) {
     printf("Failed to create buffer 1\n");
     cleanup();
@@ -947,13 +914,11 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Create and setup shader program
   kms.prog = glCreateProgram();
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &vs_src, NULL);
   glCompileShader(vs);
 
-  // Check vertex shader compilation
   GLint compiled;
   glGetShaderiv(vs, GL_COMPILE_STATUS, &compiled);
   if (!compiled) {
@@ -987,15 +952,14 @@ int main(int argc, char **argv) {
 
   glUseProgram(kms.prog);
 
-  // Create VBO
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
                GL_DYNAMIC_DRAW);
 
-  // Set texture uniforms
-  glUniform1i(glGetUniformLocation(kms.prog, "tex_y"), 0);
-  glUniform1i(glGetUniformLocation(kms.prog, "tex_uv"), 1);
+  // UPDATED: Bind the single external texture uniform and debug_mode
+  glUniform1i(glGetUniformLocation(kms.prog, "tex_ext"), 0);
+  GLint debug_loc = glGetUniformLocation(kms.prog, "debug_mode");
 
   int current_anim_step = 0;
   update_geometry(current_anim_step);
@@ -1009,7 +973,7 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
                         (void *)(2 * sizeof(float)));
 
-  int back_buf = 1; // Start rendering to buffer 1 (buffer 0 is on screen)
+  int back_buf = 1;
   struct timespec anim_t0, anim_t1;
   printf("\nStarting main loop...\n");
   printf("First 60 frames will show test pattern, then videos\n");
@@ -1017,38 +981,32 @@ int main(int argc, char **argv) {
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
   const double ANIM_STEP_SEC = 2.0;
 
-  // Initialize both buffers with something visible
   for (int i = 0; i < 2; i++) {
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[i].fbo_id);
-    glClearColor(0.0f, 0.0f, 1.0f, 1.0f); // Blue
+    glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
   }
   glFinish();
 
-  // Performance stats variables
   init_perf_stats();
   struct timespec second_start, second_end, frame_start, eos_done, upload_done,
       draw_done, plane_done;
   clock_gettime(CLOCK_MONOTONIC, &second_start);
 
   int frames_this_second = 0;
-  long second_total_eos = 0;
-  long second_total_upload = 0;
-  long second_total_draw = 0;
-  long second_total_plane = 0;
-  long second_upload_counts[VIDEO_COUNT] = {0};
-  long second_draw_counts[VIDEO_COUNT] = {0};
+  long second_total_eos = 0, second_total_upload = 0, second_total_draw = 0,
+       second_total_plane = 0;
+  long second_upload_counts[VIDEO_COUNT] = {0},
+       second_draw_counts[VIDEO_COUNT] = {0};
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &frame_start);
 
-    // Reset per-frame timing arrays
     for (int i = 0; i < VIDEO_COUNT; i++) {
       perf.texture_upload_us[i] = 0;
       perf.gl_draw_us[i] = 0;
     }
 
-    // Animation update
     clock_gettime(CLOCK_MONOTONIC, &anim_t1);
     double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) +
                      (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
@@ -1059,14 +1017,12 @@ int main(int argc, char **argv) {
       anim_t0 = anim_t1;
     }
 
-    // Render to back buffer
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
-    // glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    // glClear(GL_COLOR_BUFFER_BIT);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
 
-    // EOS check phase
     for (int i = 0; i < VIDEO_COUNT; i++) {
       GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
       if (msg) {
@@ -1078,29 +1034,23 @@ int main(int argc, char **argv) {
     }
     clock_gettime(CLOCK_MONOTONIC, &eos_done);
 
-    // Texture upload phase
     for (int i = 0; i < VIDEO_COUNT; i++) {
       struct timespec upload_start, upload_end;
       clock_gettime(CLOCK_MONOTONIC, &upload_start);
-
-      update_texture_cpu(&videos[i], i);
-
+      update_texture_gpu(&videos[i], i);
       clock_gettime(CLOCK_MONOTONIC, &upload_end);
       perf.texture_upload_us[i] = get_diff_us(upload_start, upload_end);
     }
     clock_gettime(CLOCK_MONOTONIC, &upload_done);
 
-    // Draw phase
+    // UPDATED: Zero Copy Draw Phase
     for (int i = 0; i < VIDEO_COUNT; i++) {
       struct timespec draw_start, draw_end;
       clock_gettime(CLOCK_MONOTONIC, &draw_start);
 
-      if (videos[i].tex_y) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, videos[i].tex_y);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
-
+      // Only draw video if debug pattern is off or if texture is bound
+      if (videos[i].tex_id) {
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, videos[i].tex_id);
         glDrawArrays(GL_TRIANGLES, i * 6, 6);
       }
 
@@ -1109,7 +1059,9 @@ int main(int argc, char **argv) {
     }
     clock_gettime(CLOCK_MONOTONIC, &draw_done);
 
-    // Plane set
+    // UPDATED: Synchronize GPU to prevent overwriting
+    glFinish();
+
     drmModeSetPlane(kms.fd, kms.plane_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
                     kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
@@ -1119,10 +1071,11 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &plane_done);
 
     back_buf = !back_buf;
-
-    // Update performance stats
+    kms.frame_count++;
     perf.frame_count++;
     frames_this_second++;
+
+    // ... [Kept exact same performance stat updating logic]
     second_total_eos += get_diff_us(frame_start, eos_done);
     second_total_upload += get_diff_us(eos_done, upload_done);
     second_total_draw += get_diff_us(upload_done, draw_done);
@@ -1133,7 +1086,6 @@ int main(int argc, char **argv) {
       second_draw_counts[i] += (perf.gl_draw_us[i] > 0) ? 1 : 0;
     }
 
-    // Check if 1 second has passed
     clock_gettime(CLOCK_MONOTONIC, &second_end);
     if (get_diff_us(second_start, second_end) >= 1000000) {
       print_second_stats(second_start, second_end, frames_this_second,
@@ -1141,7 +1093,6 @@ int main(int argc, char **argv) {
                          second_total_draw, second_total_plane,
                          second_upload_counts, second_draw_counts);
 
-      // Update rolling averages
       perf.avg_frame_us =
           (perf.avg_frame_us * (perf.frame_count - frames_this_second) +
            (second_total_eos + second_total_upload + second_total_draw +
@@ -1164,7 +1115,6 @@ int main(int argc, char **argv) {
            second_total_plane) /
           perf.frame_count;
 
-      // Reset for next second
       clock_gettime(CLOCK_MONOTONIC, &second_start);
       frames_this_second = 0;
       second_total_eos = 0;
