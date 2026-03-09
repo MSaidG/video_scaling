@@ -296,7 +296,7 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
   snprintf(pipeline_str, sizeof(pipeline_str),
            "filesrc location=%s ! qtdemux ! h264parse ! omxh264dec ! "
            "video/x-raw,format=NV12 ! appsink name=mysink sync=true drop=true "
-           "max-buffers=1",
+           "max-buffers=6",
            filename);
 
   GError *err = NULL;
@@ -661,6 +661,8 @@ int main(int argc, char **argv) {
       perf.gl_draw_us[i] = get_diff_us(draw_start, draw_end);
     }
     clock_gettime(CLOCK_MONOTONIC, &draw_done);
+
+    glFinish();
 
     drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
