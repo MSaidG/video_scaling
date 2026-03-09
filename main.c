@@ -296,7 +296,7 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
   snprintf(pipeline_str, sizeof(pipeline_str),
            "filesrc location=%s ! qtdemux ! h264parse ! omxh264dec ! "
            "video/x-raw,format=NV12 ! appsink name=mysink sync=true drop=true "
-           "max-buffers=6",
+           "max-buffers=1",
            filename);
 
   GError *err = NULL;
