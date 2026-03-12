@@ -20,14 +20,14 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include <gst/allocators/gstdmabuf.h> // REQUIRED FOR DMA-BUF EXTRACTION
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
-#include <gst/allocators/gstdmabuf.h> // REQUIRED FOR DMA-BUF EXTRACTION
 
 // --- CONFIG ---
 #define VIDEO_COUNT 4
-const char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
+char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
                                         "world.mp4"};
 
 // --- EXTENSIONS ---
@@ -68,8 +68,8 @@ typedef struct {
   int height;
   int is_new_frame_ready;
 
-  GLuint tex_id;         // Replaces tex_y and tex_uv
-  EGLImageKHR egl_img;   // Holds the current frame's DMA-BUF mapping
+  GLuint tex_id;       // Replaces tex_y and tex_uv
+  EGLImageKHR egl_img; // Holds the current frame's DMA-BUF mapping
 
   // Per-video performance stats
   struct {
@@ -149,14 +149,13 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "}\n";
 
 // Mali Hardware NV12 to RGB conversion
-const char *fs_src = 
-    "#extension GL_OES_EGL_image_external : require\n"
-    "precision mediump float;\n"
-    "varying vec2 v_tex;\n"
-    "uniform samplerExternalOES tex_ext;\n"
-    "void main() {\n"
-    "  gl_FragColor = texture2D(tex_ext, v_tex);\n"
-    "}\n";
+const char *fs_src = "#extension GL_OES_EGL_image_external : require\n"
+                     "precision mediump float;\n"
+                     "varying vec2 v_tex;\n"
+                     "uniform samplerExternalOES tex_ext;\n"
+                     "void main() {\n"
+                     "  gl_FragColor = texture2D(tex_ext, v_tex);\n"
+                     "}\n";
 
 // --- HELPERS ---
 void handle_sigint(int sig) { running = 0; }
@@ -183,7 +182,7 @@ void init_perf_stats() {
 }
 
 void print_perf_summary() {
-  // [Keeping your original print_perf_summary logic unchanged to save space, 
+  // [Keeping your original print_perf_summary logic unchanged to save space,
   // it works perfectly as is.]
   printf("\n\n=== PERFORMANCE SUMMARY ===\n");
   printf("Frame timing (averaged over %d frames):\n", perf.frame_count);
@@ -192,9 +191,13 @@ void print_perf_summary() {
   long avg_upload_us = perf.frame_count > 0 ? perf.avg_upload_us : 0;
   long avg_draw_us = perf.frame_count > 0 ? perf.avg_draw_us : 0;
   long avg_plane_us = perf.frame_count > 0 ? perf.avg_plane_us : 0;
-  printf("  Total frame:    %5ld us (min: %ld, max: %ld)\n", avg_frame_us, perf.min_frame_us < 999999 ? perf.min_frame_us : 0, perf.max_frame_us);
-  printf("  Texture upload: %5ld us (min: %ld, max: %ld)\n", avg_upload_us, perf.min_upload_us < 999999 ? perf.min_upload_us : 0, perf.max_upload_us);
-  printf("  GL drawing:     %5ld us (min: %ld, max: %ld)\n", avg_draw_us, perf.min_draw_us < 999999 ? perf.min_draw_us : 0, perf.max_draw_us);
+  printf("  Total frame:    %5ld us (min: %ld, max: %ld)\n", avg_frame_us,
+         perf.min_frame_us < 999999 ? perf.min_frame_us : 0, perf.max_frame_us);
+  printf("  Texture upload: %5ld us (min: %ld, max: %ld)\n", avg_upload_us,
+         perf.min_upload_us < 999999 ? perf.min_upload_us : 0,
+         perf.max_upload_us);
+  printf("  GL drawing:     %5ld us (min: %ld, max: %ld)\n", avg_draw_us,
+         perf.min_draw_us < 999999 ? perf.min_draw_us : 0, perf.max_draw_us);
   printf("===========================\n\n");
 }
 
@@ -217,7 +220,8 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
 }
 
 // Intercepts allocation query to promise GStreamer we support custom strides
-static GstPadProbeReturn allocation_probe_cb(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+static GstPadProbeReturn allocation_probe_cb(GstPad *pad, GstPadProbeInfo *info,
+                                             gpointer user_data) {
   GstQuery *query = GST_PAD_PROBE_INFO_QUERY(info);
   if (GST_QUERY_TYPE(query) == GST_QUERY_ALLOCATION) {
     gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
@@ -258,11 +262,19 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
   buf->prime_fd = prime.fd;
 
-  EGLint attribs[] = {EGL_WIDTH, kms.mode.hdisplay, EGL_HEIGHT, kms.mode.vdisplay,
-                      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
-                      EGL_DMA_BUF_PLANE0_FD_EXT, buf->prime_fd,
-                      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-                      EGL_DMA_BUF_PLANE0_PITCH_EXT, buf->stride, EGL_NONE};
+  EGLint attribs[] = {EGL_WIDTH,
+                      kms.mode.hdisplay,
+                      EGL_HEIGHT,
+                      kms.mode.vdisplay,
+                      EGL_LINUX_DRM_FOURCC_EXT,
+                      DRM_FORMAT_ARGB8888,
+                      EGL_DMA_BUF_PLANE0_FD_EXT,
+                      buf->prime_fd,
+                      EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                      0,
+                      EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                      buf->stride,
+                      EGL_NONE};
 
   buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
@@ -275,7 +287,8 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
 
   glGenFramebuffers(1, &buf->fbo_id);
   glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo_id);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, buf->tex_id, 0);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         buf->tex_id, 0);
   return 0;
 }
 
@@ -311,7 +324,8 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
 
   // ATTACH THE PROBE HERE
   GstPad *sinkpad = gst_element_get_static_pad(vid->appsink, "sink");
-  gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, allocation_probe_cb, NULL, NULL);
+  gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+                    allocation_probe_cb, NULL, NULL);
   gst_object_unref(sinkpad);
 
   GstAppSinkCallbacks callbacks = {0};
@@ -331,7 +345,7 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
   pthread_mutex_lock(&vid->lock);
   if (!vid->is_new_frame_ready) {
     pthread_mutex_unlock(&vid->lock);
-    return; 
+    return;
   }
 
   GstSample *sample = vid->new_sample;
@@ -339,7 +353,8 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
   vid->is_new_frame_ready = 0;
   pthread_mutex_unlock(&vid->lock);
 
-  if (!sample) return;
+  if (!sample)
+    return;
 
   GstBuffer *buffer = gst_sample_get_buffer(sample);
   GstCaps *caps = gst_sample_get_caps(sample);
@@ -361,7 +376,7 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
   // Read actual hardware strides from VideoMeta
   int pitch, uv_offset;
   GstVideoMeta *vmeta = gst_buffer_get_video_meta(buffer);
-  
+
   if (vmeta) {
     pitch = vmeta->stride[0];
     uv_offset = vmeta->offset[1];
@@ -374,32 +389,43 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
     eglDestroyImageKHR(kms.egl_disp, vid->egl_img);
   }
 
-  EGLint attribs[] = {
-      EGL_WIDTH, vid->width,
-      EGL_HEIGHT, vid->height,
-      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_NV12,
-      EGL_DMA_BUF_PLANE0_FD_EXT, fd,
-      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-      EGL_DMA_BUF_PLANE0_PITCH_EXT, pitch,
-      EGL_DMA_BUF_PLANE1_FD_EXT, fd,
-      EGL_DMA_BUF_PLANE1_OFFSET_EXT, uv_offset,
-      EGL_DMA_BUF_PLANE1_PITCH_EXT, pitch,
-      EGL_NONE
-  };
+  EGLint attribs[] = {EGL_WIDTH,
+                      vid->width,
+                      EGL_HEIGHT,
+                      vid->height,
+                      EGL_LINUX_DRM_FOURCC_EXT,
+                      DRM_FORMAT_NV12,
+                      EGL_DMA_BUF_PLANE0_FD_EXT,
+                      fd,
+                      EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                      0,
+                      EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                      pitch,
+                      EGL_DMA_BUF_PLANE1_FD_EXT,
+                      fd,
+                      EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+                      uv_offset,
+                      EGL_DMA_BUF_PLANE1_PITCH_EXT,
+                      pitch,
+                      EGL_NONE};
 
-  vid->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+  vid->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
+                                   EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
   if (!vid->tex_id) {
     glGenTextures(1, &vid->tex_id);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, vid->tex_id);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE);
   }
 
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, vid->tex_id);
-  glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)vid->egl_img);
+  glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
+                               (GLeglImageOES)vid->egl_img);
 
   // Release the OLD frame back to the hardware decoder pool
   if (vid->active_sample) {
@@ -412,8 +438,10 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
   long upload_us = get_diff_us(t0, t1);
   vid->perf.total_upload_us += upload_us;
   vid->perf.frame_count++;
-  if (upload_us < vid->perf.min_us) vid->perf.min_us = upload_us;
-  if (upload_us > vid->perf.max_us) vid->perf.max_us = upload_us;
+  if (upload_us < vid->perf.min_us)
+    vid->perf.min_us = upload_us;
+  if (upload_us > vid->perf.max_us)
+    vid->perf.max_us = upload_us;
   perf.texture_upload_us[video_idx] = upload_us;
   perf.video_upload_counts[video_idx]++;
 }
@@ -431,12 +459,30 @@ void update_geometry(int step) {
 
   for (int i = 0; i < 4; i++) {
     Rect r = rects[i];
-    verts[idx++] = r.x; verts[idx++] = r.y + r.h; verts[idx++] = 0.0f; verts[idx++] = 1.0f;
-    verts[idx++] = r.x; verts[idx++] = r.y; verts[idx++] = 0.0f; verts[idx++] = 0.0f;
-    verts[idx++] = r.x + r.w; verts[idx++] = r.y + r.h; verts[idx++] = 1.0f; verts[idx++] = 1.0f;
-    verts[idx++] = r.x + r.w; verts[idx++] = r.y + r.h; verts[idx++] = 1.0f; verts[idx++] = 1.0f;
-    verts[idx++] = r.x; verts[idx++] = r.y; verts[idx++] = 0.0f; verts[idx++] = 0.0f;
-    verts[idx++] = r.x + r.w; verts[idx++] = r.y; verts[idx++] = 1.0f; verts[idx++] = 0.0f;
+    verts[idx++] = r.x;
+    verts[idx++] = r.y + r.h;
+    verts[idx++] = 0.0f;
+    verts[idx++] = 1.0f;
+    verts[idx++] = r.x;
+    verts[idx++] = r.y;
+    verts[idx++] = 0.0f;
+    verts[idx++] = 0.0f;
+    verts[idx++] = r.x + r.w;
+    verts[idx++] = r.y + r.h;
+    verts[idx++] = 1.0f;
+    verts[idx++] = 1.0f;
+    verts[idx++] = r.x + r.w;
+    verts[idx++] = r.y + r.h;
+    verts[idx++] = 1.0f;
+    verts[idx++] = 1.0f;
+    verts[idx++] = r.x;
+    verts[idx++] = r.y;
+    verts[idx++] = 0.0f;
+    verts[idx++] = 0.0f;
+    verts[idx++] = r.x + r.w;
+    verts[idx++] = r.y;
+    verts[idx++] = 1.0f;
+    verts[idx++] = 0.0f;
   }
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
@@ -457,42 +503,55 @@ void cleanup() {
       gst_sample_unref(videos[i].new_sample);
     if (videos[i].active_sample)
       gst_sample_unref(videos[i].active_sample);
-      
+
     if (videos[i].tex_id)
       glDeleteTextures(1, &videos[i].tex_id);
     if (videos[i].egl_img)
       eglDestroyImageKHR(kms.egl_disp, videos[i].egl_img);
-      
+
     pthread_mutex_destroy(&videos[i].lock);
   }
 
-  if (kms.prog) glDeleteProgram(kms.prog);
-  if (kms.vbo) glDeleteBuffers(1, &kms.vbo);
+  if (kms.prog)
+    glDeleteProgram(kms.prog);
+  if (kms.vbo)
+    glDeleteBuffers(1, &kms.vbo);
 
   for (int i = 0; i < 2; i++) {
-    if (kms.bufs[i].fbo_id) glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
-    if (kms.bufs[i].tex_id) glDeleteTextures(1, &kms.bufs[i].tex_id);
-    if (kms.bufs[i].egl_img && eglDestroyImageKHR) eglDestroyImageKHR(kms.egl_disp, kms.bufs[i].egl_img);
-    if (kms.bufs[i].prime_fd >= 0) close(kms.bufs[i].prime_fd);
-    if (kms.bufs[i].fb_id) drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
+    if (kms.bufs[i].fbo_id)
+      glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
+    if (kms.bufs[i].tex_id)
+      glDeleteTextures(1, &kms.bufs[i].tex_id);
+    if (kms.bufs[i].egl_img && eglDestroyImageKHR)
+      eglDestroyImageKHR(kms.egl_disp, kms.bufs[i].egl_img);
+    if (kms.bufs[i].prime_fd >= 0)
+      close(kms.bufs[i].prime_fd);
+    if (kms.bufs[i].fb_id)
+      drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
     if (kms.bufs[i].handle) {
       struct drm_mode_destroy_dumb destroy_req = {.handle = kms.bufs[i].handle};
       ioctl(kms.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_req);
     }
   }
   if (kms.egl_disp != EGL_NO_DISPLAY) {
-    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
     eglTerminate(kms.egl_disp);
   }
-  if (kms.crtc) drmModeFreeCrtc(kms.crtc);
-  if (kms.connector) drmModeFreeConnector(kms.connector);
-  if (kms.fd >= 0) close(kms.fd);
+  if (kms.crtc)
+    drmModeFreeCrtc(kms.crtc);
+  if (kms.connector)
+    drmModeFreeConnector(kms.connector);
+  if (kms.fd >= 0)
+    close(kms.fd);
   printf("Done.\n");
 }
 
-void print_second_stats(struct timespec second_start, struct timespec second_end, int frames_this_second,
-                        long total_upload_us, long total_draw_us, long total_plane_us, 
-                        long upload_counts[VIDEO_COUNT], long draw_counts[VIDEO_COUNT]) {
+void print_second_stats(struct timespec second_start,
+                        struct timespec second_end, int frames_this_second,
+                        long total_upload_us, long total_draw_us,
+                        long total_plane_us, long upload_counts[VIDEO_COUNT],
+                        long draw_counts[VIDEO_COUNT]) {
   // [Kept exact same print_second_stats implementation]
   long second_duration = get_diff_us(second_start, second_end);
   float fps = (frames_this_second * 1000000.0f) / second_duration;
@@ -505,28 +564,56 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
 
+  printf("You can enter 'all' as argument to display 4 1080p video.\n");
+  if (argc > 1) {
+    if (strcmp(argv[1], "all") == 0) {
+      for (int i = 0; i < VIDEO_COUNT; i++) {
+        VIDEO_FILES[i] = "earth1.mp4";
+      }
+      printf("Variable changed to 1 (all mode)\n");
+    } else {
+      printf("Unknown argument: %s\n", argv[1]);
+    }
+  }
+
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) return -1;
+  if (kms.fd < 0)
+    kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  if (kms.fd < 0)
+    return -1;
 
   drmModeRes *res = drmModeGetResources(kms.fd);
-  if (!res) { close(kms.fd); return -1; }
+  if (!res) {
+    close(kms.fd);
+    return -1;
+  }
 
   kms.connector = NULL;
   for (int i = 0; i < res->count_connectors; i++) {
     drmModeConnector *conn = drmModeGetConnector(kms.fd, res->connectors[i]);
-    if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+    if (conn && conn->connection == DRM_MODE_CONNECTED &&
+        conn->count_modes > 0) {
       kms.connector = conn;
       break;
     }
-    if (conn) drmModeFreeConnector(conn);
+    if (conn)
+      drmModeFreeConnector(conn);
   }
 
-  if (!kms.connector) { drmModeFreeResources(res); close(kms.fd); return -1; }
+  if (!kms.connector) {
+    drmModeFreeResources(res);
+    close(kms.fd);
+    return -1;
+  }
 
   kms.mode = kms.connector->modes[0];
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
-  if (!kms.crtc) { drmModeFreeConnector(kms.connector); drmModeFreeResources(res); close(kms.fd); return -1; }
+  if (!kms.crtc) {
+    drmModeFreeConnector(kms.connector);
+    drmModeFreeResources(res);
+    close(kms.fd);
+    return -1;
+  }
   drmModeFreeResources(res);
 
   kms.plane_primary_id = 39;
@@ -541,10 +628,23 @@ int main(int argc, char **argv) {
 
   EGLConfig config;
   EGLint num;
-  EGLint attribs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE};
+  EGLint attribs[] = {EGL_SURFACE_TYPE,
+                      EGL_PBUFFER_BIT,
+                      EGL_RED_SIZE,
+                      8,
+                      EGL_GREEN_SIZE,
+                      8,
+                      EGL_BLUE_SIZE,
+                      8,
+                      EGL_RENDERABLE_TYPE,
+                      EGL_OPENGL_ES2_BIT,
+                      EGL_NONE};
   eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num);
-  kms.egl_surf = eglCreatePbufferSurface(kms.egl_disp, config, (EGLint[]){EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE});
-  kms.egl_ctx = eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
+  kms.egl_surf = eglCreatePbufferSurface(
+      kms.egl_disp, config, (EGLint[]){EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE});
+  kms.egl_ctx =
+      eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
+                       (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
   eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
   load_egl_extensions();
 
@@ -572,7 +672,8 @@ int main(int argc, char **argv) {
 
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
-  glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+  glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
+               GL_DYNAMIC_DRAW);
 
   int current_anim_step = 0;
   update_geometry(current_anim_step);
@@ -583,12 +684,14 @@ int main(int argc, char **argv) {
   glEnableVertexAttribArray(loc_pos);
   glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
   glEnableVertexAttribArray(loc_tex);
-  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride, (void *)(2 * sizeof(float)));
+  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
+                        (void *)(2 * sizeof(float)));
 
   // Bind the single external texture uniform
   glUniform1i(glGetUniformLocation(kms.prog, "tex_ext"), 0);
 
-  drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
+                  0, 0, 0, 0, 0, 0);
 
   int back_buf = 0;
   init_perf_stats();
@@ -599,12 +702,15 @@ int main(int argc, char **argv) {
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
   const double ANIM_STEP_SEC = 2.0;
 
-  struct timespec second_start, second_end, frame_start, eos_done, upload_done, draw_done, plane_done, flip_done;
+  struct timespec second_start, second_end, frame_start, eos_done, upload_done,
+      draw_done, plane_done, flip_done;
   clock_gettime(CLOCK_MONOTONIC, &second_start);
 
   int frames_this_second = 0;
-  long second_total_eos = 0, second_total_upload = 0, second_total_draw = 0, second_total_plane = 0;
-  long second_upload_counts[VIDEO_COUNT] = {0}, second_draw_counts[VIDEO_COUNT] = {0};
+  long second_total_eos = 0, second_total_upload = 0, second_total_draw = 0,
+       second_total_plane = 0;
+  long second_upload_counts[VIDEO_COUNT] = {0},
+       second_draw_counts[VIDEO_COUNT] = {0};
 
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &frame_start);
@@ -615,7 +721,8 @@ int main(int argc, char **argv) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &anim_t1);
-    double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) + (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
+    double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) +
+                     (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
     if (elapsed >= ANIM_STEP_SEC) {
       current_anim_step = (current_anim_step + 1) % 6;
       update_geometry(current_anim_step);
@@ -631,7 +738,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < VIDEO_COUNT; i++) {
       GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
       if (msg) {
-        gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, 0);
+        gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
+                                GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
+                                0);
         gst_message_unref(msg);
       }
     }
@@ -694,7 +803,10 @@ int main(int argc, char **argv) {
 
       clock_gettime(CLOCK_MONOTONIC, &second_start);
       frames_this_second = 0;
-      second_total_eos = 0; second_total_upload = 0; second_total_draw = 0; second_total_plane = 0;
+      second_total_eos = 0;
+      second_total_upload = 0;
+      second_total_draw = 0;
+      second_total_plane = 0;
       memset(second_upload_counts, 0, sizeof(second_upload_counts));
       memset(second_draw_counts, 0, sizeof(second_draw_counts));
     }
