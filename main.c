@@ -272,9 +272,9 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   struct drm_mode_map_dumb map_req = {.handle = buf->handle};
   if (ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) == 0) {
     // buf->cpu_map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                        // kms.fd, map_req.offset);
+    // kms.fd, map_req.offset);
     // if (buf->cpu_map == MAP_FAILED) {
-      // buf->cpu_map = NULL;
+    // buf->cpu_map = NULL;
     // }
   }
 
@@ -670,8 +670,31 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  kms.mode = kms.connector->modes[0];
-  printf("Using mode: %dx%d\n", kms.mode.hdisplay, kms.mode.vdisplay);
+  // --- NEW: Search for 1920x1080 @ 60Hz ---
+  int mode_found = 0;
+  for (int i = 0; i < kms.connector->count_modes; i++) {
+    drmModeModeInfo *current_mode = &kms.connector->modes[i];
+
+    // Check for 1080p and 60Hz
+    if (current_mode->hdisplay == 1920 && current_mode->vdisplay == 1080 &&
+        current_mode->vrefresh == 60) {
+      kms.mode = *current_mode;
+      mode_found = 1;
+      printf("Found requested mode: 1920x1080 @ 60Hz (Index %d)\n", i);
+      break;
+    }
+  }
+
+  // Fallback if the monitor doesn't explicitly report 1920x1080@60Hz
+  if (!mode_found) {
+    printf("Warning: 1920x1080 @ 60Hz not found in connector modes!\n");
+    printf("Falling back to default mode (Index 0).\n");
+    kms.mode = kms.connector->modes[0];
+  }
+
+  printf("Using mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay,
+         kms.mode.vrefresh);
+  // ----------------------------------------
 
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
   if (!kms.crtc) {
