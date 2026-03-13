@@ -51,7 +51,6 @@ typedef struct {
   EGLImageKHR egl_img;
   GLuint tex_id;
   GLuint fbo_id;
-  void *cpu_map; // For debugging
 } DumbBuffer;
 
 typedef struct {
@@ -88,9 +87,8 @@ struct {
   // Shader locations
   int stride;
 
-  // Debug
+  // Counters
   int frame_count;
-  int show_test_pattern;
 
   // CRTC saved state for restoration
   drmModeCrtc *saved_crtc;
@@ -119,7 +117,6 @@ const char *fs_src = "precision mediump float;\n"
                      "varying vec2 v_tex;\n"
                      "uniform sampler2D tex_y;\n"
                      "uniform sampler2D tex_uv;\n"
-                     "uniform int debug_mode;\n"
                      "vec3 yuv2rgb(float y, float u, float v) {\n"
                      "  float r = y + 1.402 * v;\n"
                      "  float g = y - 0.344 * u - 0.714 * v;\n"
@@ -127,26 +124,13 @@ const char *fs_src = "precision mediump float;\n"
                      "  return vec3(r, g, b);\n"
                      "}\n"
                      "void main() {\n"
-                     "  if (debug_mode == 1) {\n"
-                     "    // Test pattern - color bars\n"
-                     "    if (v_tex.x < 0.25) {\n"
-                     "      gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n"
-                     "    } else if (v_tex.x < 0.5) {\n"
-                     "      gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);\n"
-                     "    } else if (v_tex.x < 0.75) {\n"
-                     "      gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0);\n"
-                     "    } else {\n"
-                     "      gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
-                     "    }\n"
-                     "  } else {\n"
-                     "    float y = texture2D(tex_y, v_tex).r;\n"
-                     "    vec4 uv = texture2D(tex_uv, v_tex);\n"
-                     "    float u = uv.r - 0.5;\n"
-                     "    float v = uv.a - 0.5;\n"
-                     "    vec3 rgb = yuv2rgb(y, u, v);\n"
-                     "    // Swap red and blue for BGR framebuffer\n"
-                     "    gl_FragColor = vec4(rgb.b, rgb.g, rgb.r, 1.0);\n"
-                     "  }\n"
+                     "  float y = texture2D(tex_y, v_tex).r;\n"
+                     "  vec4 uv = texture2D(tex_uv, v_tex);\n"
+                     "  float u = uv.r - 0.5;\n"
+                     "  float v = uv.a - 0.5;\n"
+                     "  vec3 rgb = yuv2rgb(y, u, v);\n"
+                     "  // Swap red and blue for BGR framebuffer\n"
+                     "  gl_FragColor = vec4(rgb.b, rgb.g, rgb.r, 1.0);\n"
                      "}\n";
 
 // --- HELPERS ---
@@ -155,14 +139,14 @@ void handle_sigint(int sig) { running = 0; }
 void check_egl_error(const char *msg) {
   EGLint error = eglGetError();
   if (error != EGL_SUCCESS) {
-    printf("EGL error at %s: 0x%x\n", msg, error);
+    fprintf(stderr, "EGL error at %s: 0x%x\n", msg, error);
   }
 }
 
 void check_gl_error(const char *msg) {
   GLenum error = glGetError();
   if (error != GL_NO_ERROR) {
-    printf("GL error at %s: 0x%x\n", msg, error);
+    fprintf(stderr, "GL error at %s: 0x%x\n", msg, error);
   }
 }
 
@@ -201,28 +185,24 @@ int load_egl_extensions() {
           "glEGLImageTargetTexture2DOES");
 
   if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES) {
-    printf("Failed to load EGL extensions\n");
+    fprintf(stderr, "Failed to load EGL extensions\n");
     return -1;
   }
-  printf("EGL extensions loaded successfully\n");
   return 0;
 }
 
 uint32_t find_suitable_plane(int fd, uint32_t crtc_id, uint32_t crtc_index) {
   drmModePlaneRes *plane_res = drmModeGetPlaneResources(fd);
   if (!plane_res) {
-    printf("Failed to get plane resources\n");
+    fprintf(stderr, "Failed to get plane resources\n");
     return 0;
   }
-
-  printf("Searching for plane with crtc_index %u\n", crtc_index);
 
   for (uint32_t i = 0; i < plane_res->count_planes; i++) {
     drmModePlane *plane = drmModeGetPlane(fd, plane_res->planes[i]);
     if (!plane)
       continue;
 
-    // Check if plane supports our format
     bool format_ok = false;
     for (uint32_t j = 0; j < plane->count_formats; j++) {
       if (plane->formats[j] == DRM_FORMAT_XRGB8888) {
@@ -233,8 +213,6 @@ uint32_t find_suitable_plane(int fd, uint32_t crtc_id, uint32_t crtc_index) {
 
     if (format_ok && (plane->possible_crtcs & (1 << crtc_index))) {
       uint32_t plane_id = plane->plane_id;
-      printf("Found suitable plane ID: %u (formats: %d)\n", plane_id,
-             plane->count_formats);
       drmModeFreePlane(plane);
       drmModeFreePlaneResources(plane_res);
       return plane_id;
@@ -265,33 +243,11 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   buf->stride = create_req.pitch;
   buf->size = create_req.size;
 
-  printf("Created dumb buffer: handle=%u, stride=%u, size=%u\n", buf->handle,
-         buf->stride, buf->size);
-
-  // Map for CPU access (debugging)
-  struct drm_mode_map_dumb map_req = {.handle = buf->handle};
-  if (ioctl(kms.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) == 0) {
-    // buf->cpu_map = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-    // kms.fd, map_req.offset);
-    // if (buf->cpu_map == MAP_FAILED) {
-    // buf->cpu_map = NULL;
-    // }
-  }
-
-  // Try different formats - from your modetest output, the plane supports:
-  // XB24 (DRM_FORMAT_XBGR8888), XB30, XVUY, VU24, XV30, NV16, NV12, etc.
   uint32_t formats_to_try[] = {
-      DRM_FORMAT_XBGR8888, // XB24 in modetest
+      DRM_FORMAT_XBGR8888,
       DRM_FORMAT_BGRX8888,
       DRM_FORMAT_XRGB8888,
       DRM_FORMAT_ARGB8888,
-  };
-
-  const char *format_names[] = {
-      "XBGR8888 (XB24)",
-      "BGRX8888",
-      "XRGB8888",
-      "ARGB8888",
   };
 
   int fb_added = 0;
@@ -303,19 +259,16 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
     if (drmModeAddFB2(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay,
                       formats_to_try[f], handles, pitches, offsets, &buf->fb_id,
                       0) == 0) {
-      printf("Added FB with ID: %u using format %s\n", buf->fb_id,
-             format_names[f]);
       fb_added = 1;
       break;
     }
   }
 
   if (!fb_added) {
-    printf("Failed to add FB with any format\n");
+    fprintf(stderr, "Failed to add FB with any format\n");
     return -1;
   }
 
-  // Export prime fd
   struct drm_prime_handle prime = {0};
   prime.handle = buf->handle;
   prime.flags = DRM_CLOEXEC | DRM_RDWR;
@@ -325,14 +278,12 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   }
   buf->prime_fd = prime.fd;
 
-  // Create EGL image - must match the format used in drmModeAddFB2
-  // For XBGR8888, the fourcc code is DRM_FORMAT_XBGR8888
   EGLint attribs[] = {EGL_WIDTH,
                       kms.mode.hdisplay,
                       EGL_HEIGHT,
                       kms.mode.vdisplay,
                       EGL_LINUX_DRM_FOURCC_EXT,
-                      DRM_FORMAT_XBGR8888, // Match the format used above
+                      DRM_FORMAT_XBGR8888,
                       EGL_DMA_BUF_PLANE0_FD_EXT,
                       buf->prime_fd,
                       EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -341,19 +292,10 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
                       buf->stride,
                       EGL_NONE};
 
-  // For debugging, print the attributes
-  printf("Creating EGLImage with: fourcc=XBGR8888, fd=%d, stride=%u\n",
-         buf->prime_fd, buf->stride);
-
   buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
   if (!buf->egl_img) {
-    EGLint error = eglGetError();
-    printf("Failed to create EGLImage. EGL error: 0x%x\n", error);
-
-    // Try alternative fourcc
-    printf("Trying ARGB8888 instead...\n");
     EGLint attribs2[] = {EGL_WIDTH,
                          kms.mode.hdisplay,
                          EGL_HEIGHT,
@@ -371,15 +313,11 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
     buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                      EGL_LINUX_DMA_BUF_EXT, NULL, attribs2);
     if (!buf->egl_img) {
-      error = eglGetError();
-      printf("Still failed with ARGB8888. EGL error: 0x%x\n", error);
+      fprintf(stderr, "Failed to create EGLImage.\n");
       return -1;
     }
   }
 
-  printf("EGLImage created successfully\n");
-
-  // Create texture from EGLImage
   glGenTextures(1, &buf->tex_id);
   glBindTexture(GL_TEXTURE_2D, buf->tex_id);
   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, buf->egl_img);
@@ -388,7 +326,6 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-  // Create FBO
   glGenFramebuffers(1, &buf->fbo_id);
   glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo_id);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -397,10 +334,9 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
 
   GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE) {
-    printf("FBO incomplete: 0x%x\n", status);
+    fprintf(stderr, "FBO incomplete: 0x%x\n", status);
     return -1;
   }
-  printf("FBO created successfully\n");
 
   return 0;
 }
@@ -443,8 +379,6 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename, int index) {
 
   gst_element_set_state(vid->pipeline, GST_STATE_PLAYING);
   vid->bus = gst_element_get_bus(vid->pipeline);
-
-  printf("GStreamer pipeline %d initialized for %s\n", index, filename);
 
   return 0;
 }
@@ -562,9 +496,6 @@ void update_geometry(int step) {
 }
 
 void cleanup() {
-  printf("\n--- Cleaning Up ---\n");
-
-  // Restore original CRTC state
   if (kms.saved_crtc) {
     drmModeSetCrtc(kms.fd, kms.saved_crtc->crtc_id, kms.saved_crtc->buffer_id,
                    kms.saved_crtc->x, kms.saved_crtc->y,
@@ -594,8 +525,6 @@ void cleanup() {
     glDeleteBuffers(1, &kms.vbo);
 
   for (int i = 0; i < 2; i++) {
-    if (kms.bufs[i].cpu_map)
-      munmap(kms.bufs[i].cpu_map, kms.bufs[i].size);
     if (kms.bufs[i].fbo_id)
       glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
     if (kms.bufs[i].tex_id)
@@ -623,7 +552,6 @@ void cleanup() {
     drmModeFreeConnector(kms.connector);
   if (kms.fd >= 0)
     close(kms.fd);
-  printf("Done.\n");
 }
 
 int main(int argc, char **argv) {
@@ -640,12 +568,11 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  // Save original CRTC state
   kms.saved_crtc = NULL;
 
   drmModeRes *res = drmModeGetResources(kms.fd);
   if (!res) {
-    printf("Failed to get DRM resources\n");
+    fprintf(stderr, "Failed to get DRM resources\n");
     close(kms.fd);
     return -1;
   }
@@ -655,8 +582,6 @@ int main(int argc, char **argv) {
     drmModeConnector *c = drmModeGetConnector(kms.fd, res->connectors[i]);
     if (c && c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
       kms.connector = c;
-      printf("Found connector %d with %d modes\n", c->connector_id,
-             c->count_modes);
       break;
     }
     if (c)
@@ -664,48 +589,37 @@ int main(int argc, char **argv) {
   }
 
   if (!kms.connector) {
-    printf("No connected connector found\n");
+    fprintf(stderr, "No connected connector found\n");
     drmModeFreeResources(res);
     close(kms.fd);
     return -1;
   }
 
-  // --- NEW: Search for 1920x1080 @ 60Hz ---
   int mode_found = 0;
   for (int i = 0; i < kms.connector->count_modes; i++) {
     drmModeModeInfo *current_mode = &kms.connector->modes[i];
 
-    // Check for 1080p and 60Hz
     if (current_mode->hdisplay == 1920 && current_mode->vdisplay == 1080 &&
         current_mode->vrefresh == 60) {
       kms.mode = *current_mode;
       mode_found = 1;
-      printf("Found requested mode: 1920x1080 @ 60Hz (Index %d)\n", i);
       break;
     }
   }
 
-  // Fallback if the monitor doesn't explicitly report 1920x1080@60Hz
   if (!mode_found) {
-    printf("Warning: 1920x1080 @ 60Hz not found in connector modes!\n");
-    printf("Falling back to default mode (Index 0).\n");
     kms.mode = kms.connector->modes[0];
   }
 
-  printf("Using mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay,
-         kms.mode.vrefresh);
-  // ----------------------------------------
-
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
   if (!kms.crtc) {
-    printf("Failed to get CRTC\n");
+    fprintf(stderr, "Failed to get CRTC\n");
     drmModeFreeConnector(kms.connector);
     drmModeFreeResources(res);
     close(kms.fd);
     return -1;
   }
 
-  // Save original CRTC state
   kms.saved_crtc = drmModeGetCrtc(kms.fd, kms.crtc->crtc_id);
 
   kms.crtc_index = -1;
@@ -716,23 +630,17 @@ int main(int argc, char **argv) {
     }
   }
 
-  printf("CRTC ID: %u, CRTC index: %d\n", kms.crtc->crtc_id, kms.crtc_index);
-
   if (kms.crtc_index >= 0) {
     kms.plane_id =
         find_suitable_plane(kms.fd, kms.crtc->crtc_id, kms.crtc_index);
   }
 
   if (!kms.plane_id) {
-    printf("Warning: Could not find suitable plane, will use CRTC only\n");
     kms.plane_id = 0;
-  } else {
-    printf("Using plane ID: %u for page flipping\n", kms.plane_id);
   }
 
   drmModeFreeResources(res);
   kms.frame_count = 0;
-  kms.show_test_pattern = 1;
 
   kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (kms.egl_disp == EGL_NO_DISPLAY) {
@@ -740,7 +648,7 @@ int main(int argc, char **argv) {
   }
 
   if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
-    printf("Failed to initialize EGL display\n");
+    fprintf(stderr, "Failed to initialize EGL display\n");
     cleanup();
     return -1;
   }
@@ -762,7 +670,7 @@ int main(int argc, char **argv) {
                       EGL_NONE};
 
   if (!eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num)) {
-    printf("Failed to choose EGL config\n");
+    fprintf(stderr, "Failed to choose EGL config\n");
     cleanup();
     return -1;
   }
@@ -775,12 +683,10 @@ int main(int argc, char **argv) {
       eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, ctx_attribs);
 
   if (!eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx)) {
-    printf("Failed to make EGL context current\n");
+    fprintf(stderr, "Failed to make EGL context current\n");
     cleanup();
     return -1;
   }
-
-  printf("EGL initialized successfully\n");
 
   if (load_egl_extensions() < 0) {
     cleanup();
@@ -788,18 +694,15 @@ int main(int argc, char **argv) {
   }
 
   if (create_dumb_buffer_fbo(&kms.bufs[0]) < 0) {
-    printf("Failed to create buffer 0\n");
     cleanup();
     return -1;
   }
 
   if (create_dumb_buffer_fbo(&kms.bufs[1]) < 0) {
-    printf("Failed to create buffer 1\n");
     cleanup();
     return -1;
   }
 
-  printf("\nSetting CRTC with buffer 0...\n");
   if (drmModeSetCrtc(kms.fd, kms.crtc->crtc_id, kms.bufs[0].fb_id, 0, 0,
                      &kms.connector->connector_id, 1, &kms.mode) < 0) {
     perror("drmModeSetCrtc");
@@ -807,7 +710,6 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  printf("\nInitializing GStreamer pipelines...\n");
   for (int i = 0; i < VIDEO_COUNT; i++) {
     if (init_gstreamer_pipeline(&videos[i], VIDEO_FILES[i], i) < 0) {
       cleanup();
@@ -815,19 +717,17 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Create and setup shader program
   kms.prog = glCreateProgram();
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &vs_src, NULL);
   glCompileShader(vs);
 
-  // Check vertex shader compilation
   GLint compiled;
   glGetShaderiv(vs, GL_COMPILE_STATUS, &compiled);
   if (!compiled) {
     char log[256];
     glGetShaderInfoLog(vs, sizeof(log), NULL, log);
-    printf("Vertex shader compilation failed: %s\n", log);
+    fprintf(stderr, "Vertex shader compilation failed: %s\n", log);
   }
 
   GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
@@ -838,7 +738,7 @@ int main(int argc, char **argv) {
   if (!compiled) {
     char log[256];
     glGetShaderInfoLog(fs, sizeof(log), NULL, log);
-    printf("Fragment shader compilation failed: %s\n", log);
+    fprintf(stderr, "Fragment shader compilation failed: %s\n", log);
   }
 
   glAttachShader(kms.prog, vs);
@@ -850,18 +750,16 @@ int main(int argc, char **argv) {
   if (!linked) {
     char log[256];
     glGetProgramInfoLog(kms.prog, sizeof(log), NULL, log);
-    printf("Program linking failed: %s\n", log);
+    fprintf(stderr, "Program linking failed: %s\n", log);
   }
 
   glUseProgram(kms.prog);
 
-  // Create VBO
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
                GL_DYNAMIC_DRAW);
 
-  // Set texture uniforms
   glUniform1i(glGetUniformLocation(kms.prog, "tex_y"), 0);
   glUniform1i(glGetUniformLocation(kms.prog, "tex_uv"), 1);
 
@@ -877,21 +775,17 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
                         (void *)(2 * sizeof(float)));
 
-  int back_buf = 1; // Start rendering to buffer 1 (buffer 0 is on screen)
+  int back_buf = 1; 
   struct timespec t0, t1, anim_t0, anim_t1;
   long total_us = 0;
   int count = 0;
 
-  printf("\nStarting main loop...\n");
-  printf("First 60 frames will show test pattern, then videos\n");
-
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
   const double ANIM_STEP_SEC = 2.0;
 
-  // Initialize both buffers with something visible
   for (int i = 0; i < 2; i++) {
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[i].fbo_id);
-    glClearColor(0.0f, 0.0f, 1.0f, 1.0f); // Blue
+    glClearColor(0.0f, 0.0f, 1.0f, 1.0f); 
     glClear(GL_COLOR_BUFFER_BIT);
   }
   glFinish();
@@ -899,7 +793,6 @@ int main(int argc, char **argv) {
   while (running) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    // Animation update
     clock_gettime(CLOCK_MONOTONIC, &anim_t1);
     double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) +
                      (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
@@ -910,7 +803,6 @@ int main(int argc, char **argv) {
       anim_t0 = anim_t1;
     }
 
-    // Render to back buffer
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
     glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
 
@@ -918,27 +810,22 @@ int main(int argc, char **argv) {
     glClear(GL_COLOR_BUFFER_BIT);
 
     for (int i = 0; i < VIDEO_COUNT; i++) {
-      // Check for EOS and restart
       GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
       if (msg) {
-        printf("Video %d reached EOS, restarting\n", i);
         gst_element_seek_simple(videos[i].pipeline, GST_FORMAT_TIME,
                                 GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
                                 0);
         gst_message_unref(msg);
       }
 
-      // Update video texture
       update_texture_cpu(&videos[i]);
 
-      // Render video if texture is ready
       if (videos[i].tex_y) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, videos[i].tex_y);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, videos[i].tex_uv);
 
-        // Draw this video's quad
         glDrawArrays(GL_TRIANGLES, i * 6, 6);
       }
     }
@@ -954,7 +841,7 @@ int main(int argc, char **argv) {
     total_us += get_diff_us(t0, t1);
     count++;
     if (count >= 60) {
-      printf("FPS: %ld\r\n", 1000000 / (total_us / 60));
+      // printf("FPS: %ld\r\n", 1000000 / (total_us / 60));
       total_us = 0;
       count = 0;
     }
