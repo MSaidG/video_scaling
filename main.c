@@ -117,20 +117,20 @@ const char *fs_src = "precision mediump float;\n"
                      "varying vec2 v_tex;\n"
                      "uniform sampler2D tex_y;\n"
                      "uniform sampler2D tex_uv;\n"
-                     "vec3 yuv2rgb(float y, float u, float v) {\n"
-                     "  float r = y + 1.402 * v;\n"
-                     "  float g = y - 0.344 * u - 0.714 * v;\n"
-                     "  float b = y + 1.772 * u;\n"
-                     "  return vec3(r, g, b);\n"
-                     "}\n"
                      "void main() {\n"
+                     "  // 1. Get raw Y, U, and V\n"
                      "  float y = texture2D(tex_y, v_tex).r;\n"
                      "  vec4 uv = texture2D(tex_uv, v_tex);\n"
-                     "  float u = uv.r - 0.5;\n"
-                     "  float v = uv.a - 0.5;\n"
-                     "  vec3 rgb = yuv2rgb(y, u, v);\n"
-                     "  // Swap red and blue for BGR framebuffer\n"
-                     "  gl_FragColor = vec4(rgb.b, rgb.g, rgb.r, 1.0);\n"
+                     "  float u = uv.r;\n"
+                     "  float v = uv.a;\n"
+                     "  \n"
+                     "  // 2. Correct brightness for limited-range video\n"
+                     "  y = 1.1643 * (y - 0.0627);\n"
+                     "  \n"
+                     "  // 3. Pack the Macropixel!\n"
+                     "  // OpenGL vec4 is (R, G, B, A)\n"
+                     "  // We map (V, Y, U, Y) so memory becomes [U, Y, V, Y]\n"
+                     "  gl_FragColor = vec4(v, y, u, y);\n"
                      "}\n";
 
 // --- HELPERS ---
@@ -231,59 +231,43 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   struct drm_mode_create_dumb create_req = {0};
   create_req.width = kms.mode.hdisplay;
   create_req.height = kms.mode.vdisplay;
-  create_req.bpp = 32;
+  create_req.bpp = 16; // FIX 1: 16 bits per pixel for UYVY (pitch = 3840)
   create_req.flags = 0;
 
   if (ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req) < 0) {
     perror("DRM_IOCTL_MODE_CREATE_DUMB");
     return -1;
   }
-
   buf->handle = create_req.handle;
   buf->stride = create_req.pitch;
   buf->size = create_req.size;
 
-  uint32_t formats_to_try[] = {
-      DRM_FORMAT_XBGR8888,
-      DRM_FORMAT_BGRX8888,
-      DRM_FORMAT_XRGB8888,
-      DRM_FORMAT_ARGB8888,
-  };
+  // FIX 2: Tell the hardware Display Controller it is reading UYVY
+  uint32_t handles[4] = {buf->handle};
+  uint32_t pitches[4] = {buf->stride};
+  uint32_t offsets[4] = {0};
 
-  int fb_added = 0;
-  for (int f = 0; f < 4; f++) {
-    uint32_t handles[4] = {buf->handle};
-    uint32_t pitches[4] = {buf->stride};
-    uint32_t offsets[4] = {0};
-
-    if (drmModeAddFB2(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay,
-                      formats_to_try[f], handles, pitches, offsets, &buf->fb_id,
-                      0) == 0) {
-      fb_added = 1;
-      break;
-    }
-  }
-
-  if (!fb_added) {
-    fprintf(stderr, "Failed to add FB with any format\n");
+  if (drmModeAddFB2(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay,
+                    DRM_FORMAT_UYVY, handles, pitches, offsets, &buf->fb_id,
+                    0) != 0) {
+    printf("Failed to add UYVY FB\n");
     return -1;
   }
 
+  // Export prime fd
   struct drm_prime_handle prime = {0};
   prime.handle = buf->handle;
   prime.flags = DRM_CLOEXEC | DRM_RDWR;
-  if (ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) < 0) {
-    perror("DRM_IOCTL_PRIME_HANDLE_TO_FD");
-    return -1;
-  }
+  ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
   buf->prime_fd = prime.fd;
 
+  // FIX 3: Trick EGL. 1920x1080 @ 16-bit == 960x1080 @ 32-bit
   EGLint attribs[] = {EGL_WIDTH,
-                      kms.mode.hdisplay,
+                      kms.mode.hdisplay / 2, // <-- CRITICAL: Half width!
                       EGL_HEIGHT,
                       kms.mode.vdisplay,
                       EGL_LINUX_DRM_FOURCC_EXT,
-                      DRM_FORMAT_XBGR8888,
+                      DRM_FORMAT_ARGB8888,
                       EGL_DMA_BUF_PLANE0_FD_EXT,
                       buf->prime_fd,
                       EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -775,7 +759,7 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
                         (void *)(2 * sizeof(float)));
 
-  int back_buf = 1; 
+  int back_buf = 1;
   struct timespec t0, t1, anim_t0, anim_t1;
   long total_us = 0;
   int count = 0;
@@ -785,7 +769,7 @@ int main(int argc, char **argv) {
 
   for (int i = 0; i < 2; i++) {
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[i].fbo_id);
-    glClearColor(0.0f, 0.0f, 1.0f, 1.0f); 
+    glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
   }
   glFinish();
@@ -804,9 +788,9 @@ int main(int argc, char **argv) {
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
-    glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
+    glViewport(0, 0, kms.mode.hdisplay / 2, kms.mode.vdisplay);
 
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(0.5f, 0.0627f, 0.5f, 0.0627f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     for (int i = 0; i < VIDEO_COUNT; i++) {
