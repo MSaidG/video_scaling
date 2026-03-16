@@ -20,7 +20,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#include <gst/allocators/gstdmabuf.h> // REQUIRED FOR DMA-BUF EXTRACTION
+#include <gst/allocators/gstdmabuf.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
@@ -28,7 +28,7 @@
 // --- CONFIG ---
 #define VIDEO_COUNT 4
 char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
-                                        "world.mp4"};
+                                  "world.mp4"};
 
 // --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
@@ -62,16 +62,15 @@ typedef struct {
 
   pthread_mutex_t lock;
   GstSample *new_sample;
-  GstSample *active_sample; // Holds the frame currently on screen
+  GstSample *active_sample;
 
   int width;
   int height;
   int is_new_frame_ready;
 
-  GLuint tex_id;       // Replaces tex_y and tex_uv
-  EGLImageKHR egl_img; // Holds the current frame's DMA-BUF mapping
+  GLuint tex_id;
+  EGLImageKHR egl_img;
 
-  // Per-video performance stats
   struct {
     long total_upload_us;
     int frame_count;
@@ -132,12 +131,10 @@ typedef struct {
   float x, y, w, h;
 } Rect;
 
-const Rect default_rects[4] = {
-    {-1.0f, -1.0f, 1.0f, 1.0f}, // TL (Video 0)
-    {0.0f, -1.0f, 1.0f, 1.0f},  // TR (Video 1)
-    {-1.0f, 0.0f, 1.0f, 1.0f},  // BL (Video 2)
-    {0.0f, 0.0f, 1.0f, 1.0f}    // BR (Video 3)
-};
+const Rect default_rects[4] = {{-1.0f, -1.0f, 1.0f, 1.0f},
+                               {0.0f, -1.0f, 1.0f, 1.0f},
+                               {-1.0f, 0.0f, 1.0f, 1.0f},
+                               {0.0f, 0.0f, 1.0f, 1.0f}};
 
 // --- SHADERS ---
 const char *vs_src = "attribute vec4 a_pos;\n"
@@ -148,7 +145,6 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "   v_tex = a_tex;\n"
                      "}\n";
 
-// Mali Hardware NV12 to RGB conversion
 const char *fs_src = "#extension GL_OES_EGL_image_external : require\n"
                      "precision mediump float;\n"
                      "varying vec2 v_tex;\n"
@@ -182,8 +178,6 @@ void init_perf_stats() {
 }
 
 void print_perf_summary() {
-  // [Keeping your original print_perf_summary logic unchanged to save space,
-  // it works perfectly as is.]
   printf("\n\n=== PERFORMANCE SUMMARY ===\n");
   printf("Frame timing (averaged over %d frames):\n", perf.frame_count);
   long avg_frame_us = perf.frame_count > 0 ? perf.avg_frame_us : 0;
@@ -219,11 +213,11 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
   return GST_FLOW_ERROR;
 }
 
-// Intercepts allocation query to promise GStreamer we support custom strides
 static GstPadProbeReturn allocation_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                              gpointer user_data) {
   GstQuery *query = GST_PAD_PROBE_INFO_QUERY(info);
   if (GST_QUERY_TYPE(query) == GST_QUERY_ALLOCATION) {
+    printf("[DEBUG GST] Received ALLOCATION query downstream.\n");
     gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
   }
   return GST_PAD_PROBE_OK;
@@ -238,29 +232,48 @@ int load_egl_extensions() {
   glEGLImageTargetTexture2DOES =
       (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
           "glEGLImageTargetTexture2DOES");
+
+  printf("[DEBUG EGL] eglCreateImageKHR loaded: %p\n", eglCreateImageKHR);
+  printf("[DEBUG EGL] eglDestroyImageKHR loaded: %p\n", eglDestroyImageKHR);
+  printf("[DEBUG EGL] glEGLImageTargetTexture2DOES loaded: %p\n",
+         glEGLImageTargetTexture2DOES);
+
   return (eglCreateImageKHR && glEGLImageTargetTexture2DOES) ? 0 : -1;
 }
 
 int create_dumb_buffer_fbo(DumbBuffer *buf) {
-  // [Kept exact same create_dumb_buffer_fbo implementation]
   struct drm_mode_create_dumb create_req = {0};
   create_req.width = kms.mode.hdisplay;
   create_req.height = kms.mode.vdisplay;
   create_req.bpp = 32;
-  ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req);
+
+  printf("[DEBUG DRM] Requesting Dumb Buffer: %dx%d @ %d bpp\n",
+         create_req.width, create_req.height, create_req.bpp);
+
+  int ret = ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req);
+  if (ret < 0) {
+    printf("[DEBUG DRM ERROR] Failed to create dumb buffer. Code: %d\n", ret);
+  }
 
   buf->handle = create_req.handle;
   buf->stride = create_req.pitch;
   buf->size = create_req.size;
 
-  drmModeAddFB(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay, 24, 32,
-               buf->stride, buf->handle, &buf->fb_id);
+  printf("[DEBUG DRM] Dumb Buffer Created - Handle: %u, Stride: %u, Size: %u\n",
+         buf->handle, buf->stride, buf->size);
+
+  ret = drmModeAddFB(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay, 32, 32,
+                     buf->stride, buf->handle, &buf->fb_id);
+  printf("[DEBUG DRM] drmModeAddFB Result: %d | FB ID: %u\n", ret, buf->fb_id);
 
   struct drm_prime_handle prime = {0};
   prime.handle = buf->handle;
   prime.flags = DRM_CLOEXEC | DRM_RDWR;
-  ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
+  ret = ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
   buf->prime_fd = prime.fd;
+
+  printf("[DEBUG DRM] PRIME FD Exported: %d (Result: %d)\n", buf->prime_fd,
+         ret);
 
   EGLint attribs[] = {EGL_WIDTH,
                       kms.mode.hdisplay,
@@ -279,16 +292,28 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
+  printf("[DEBUG EGL] eglCreateImageKHR for Dumb Buffer returned: %p | EGL "
+         "Error: 0x%04x\n",
+         buf->egl_img, eglGetError());
+
   glGenTextures(1, &buf->tex_id);
   glBindTexture(GL_TEXTURE_2D, buf->tex_id);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, buf->egl_img);
+  printf("[DEBUG GL] Bound EGLImage to GL_TEXTURE_2D. GL Error: 0x%04x\n",
+         glGetError());
 
   glGenFramebuffers(1, &buf->fbo_id);
   glBindFramebuffer(GL_FRAMEBUFFER, buf->fbo_id);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                          buf->tex_id, 0);
+
+  GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  printf("[DEBUG GL] FBO %u Status: 0x%04x\n", buf->fbo_id, status);
+  if (status != GL_FRAMEBUFFER_COMPLETE) {
+    printf("[DEBUG GL ERROR] FBO is NOT complete!\n");
+  }
   return 0;
 }
 
@@ -312,6 +337,8 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
            "max-buffers=1",
            filename);
 
+  printf("[DEBUG GST] Launching pipeline: %s\n", pipeline_str);
+
   GError *err = NULL;
   vid->pipeline = gst_parse_launch(pipeline_str, &err);
   if (err) {
@@ -322,7 +349,6 @@ int init_gstreamer_pipeline(GstVid *vid, const char *filename) {
 
   vid->appsink = gst_bin_get_by_name(GST_BIN(vid->pipeline), "mysink");
 
-  // ATTACH THE PROBE HERE
   GstPad *sinkpad = gst_element_get_static_pad(vid->appsink, "sink");
   gst_pad_add_probe(sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
                     allocation_probe_cb, NULL, NULL);
@@ -358,31 +384,49 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
 
   GstBuffer *buffer = gst_sample_get_buffer(sample);
   GstCaps *caps = gst_sample_get_caps(sample);
+
+  static int first_frame_log[VIDEO_COUNT] = {0};
+  if (!first_frame_log[video_idx]) {
+    gchar *caps_str = gst_caps_to_string(caps);
+    printf("[DEBUG GST Vid %d] First Frame CAPS: %s\n", video_idx, caps_str);
+    g_free(caps_str);
+    first_frame_log[video_idx] = 1;
+  }
+
   GstVideoInfo vinfo;
   gst_video_info_from_caps(&vinfo, caps);
 
   vid->width = vinfo.width;
   vid->height = vinfo.height;
 
-  // Verify memory is DMA-BUF
   GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
   if (!gst_is_dmabuf_memory(mem)) {
-    fprintf(stderr, "Error: GStreamer buffer is NOT a DMA-BUF memory block.\n");
+    fprintf(
+        stderr,
+        "[DEBUG GST ERROR] GStreamer buffer is NOT a DMA-BUF memory block.\n");
     gst_sample_unref(sample);
     return;
   }
   int fd = gst_dmabuf_memory_get_fd(mem);
 
-  // Read actual hardware strides from VideoMeta
   int pitch, uv_offset;
   GstVideoMeta *vmeta = gst_buffer_get_video_meta(buffer);
 
   if (vmeta) {
     pitch = vmeta->stride[0];
     uv_offset = vmeta->offset[1];
+    if (vid->perf.frame_count == 0) {
+      printf("[DEBUG GST Vid %d] Using VideoMeta - Pitch: %d, UV Offset: %d\n",
+             video_idx, pitch, uv_offset);
+    }
   } else {
     pitch = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
     uv_offset = GST_VIDEO_INFO_PLANE_OFFSET(&vinfo, 1);
+    if (vid->perf.frame_count == 0) {
+      printf("[DEBUG GST Vid %d] Using VideoInfo (No Meta) - Pitch: %d, UV "
+             "Offset: %d\n",
+             video_idx, pitch, uv_offset);
+    }
   }
 
   if (vid->egl_img) {
@@ -412,6 +456,15 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
   vid->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
+  if (vid->perf.frame_count == 0) {
+    printf("[DEBUG EGL Vid %d] eglCreateImageKHR returned: %p | EGL Error: "
+           "0x%04x\n",
+           video_idx, vid->egl_img, eglGetError());
+    printf("[DEBUG EGL Vid %d] Attributes used: FD=%d, Pitch=%d, UV_Offset=%d, "
+           "W=%d, H=%d\n",
+           video_idx, fd, pitch, uv_offset, vid->width, vid->height);
+  }
+
   if (!vid->tex_id) {
     glGenTextures(1, &vid->tex_id);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, vid->tex_id);
@@ -421,17 +474,22 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
                     GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
                     GL_CLAMP_TO_EDGE);
+    printf("[DEBUG GL Vid %d] Generated external texture ID: %u\n", video_idx,
+           vid->tex_id);
   }
 
   glBindTexture(GL_TEXTURE_EXTERNAL_OES, vid->tex_id);
   glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
                                (GLeglImageOES)vid->egl_img);
 
-  // Release the OLD frame back to the hardware decoder pool
+  if (vid->perf.frame_count == 0) {
+    printf("[DEBUG GL Vid %d] Bind External Image Error: 0x%04x\n", video_idx,
+           glGetError());
+  }
+
   if (vid->active_sample) {
     gst_sample_unref(vid->active_sample);
   }
-  // Keep the new frame alive
   vid->active_sample = sample;
 
   clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -447,7 +505,6 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
 }
 
 void update_geometry(int step) {
-  // [Kept exact same update_geometry implementation]
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
   float m = (step + 1) / 6.0f;
@@ -552,7 +609,6 @@ void print_second_stats(struct timespec second_start,
                         long total_upload_us, long total_draw_us,
                         long total_plane_us, long upload_counts[VIDEO_COUNT],
                         long draw_counts[VIDEO_COUNT]) {
-  // [Kept exact same print_second_stats implementation]
   long second_duration = get_diff_us(second_start, second_end);
   float fps = (frames_this_second * 1000000.0f) / second_duration;
   printf("\n=== Stats for last 1 second ===\n");
@@ -577,23 +633,35 @@ int main(int argc, char **argv) {
   }
 
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0)
+  if (kms.fd >= 0) {
+    printf("[DEBUG DRM] Opened /dev/dri/card0 (fd: %d)\n", kms.fd);
+  } else {
     kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+    printf("[DEBUG DRM] Opened /dev/dri/card1 (fd: %d)\n", kms.fd);
+  }
   if (kms.fd < 0)
     return -1;
 
   drmModeRes *res = drmModeGetResources(kms.fd);
   if (!res) {
+    printf("[DEBUG DRM ERROR] drmModeGetResources failed.\n");
     close(kms.fd);
     return -1;
   }
+  printf("[DEBUG DRM] Found %d connectors, %d CRTCs.\n", res->count_connectors,
+         res->count_crtcs);
 
   kms.connector = NULL;
   for (int i = 0; i < res->count_connectors; i++) {
     drmModeConnector *conn = drmModeGetConnector(kms.fd, res->connectors[i]);
+    if (conn) {
+      printf("[DEBUG DRM] Connector %d: ID=%d, Connection=%d, Modes=%d\n", i,
+             conn->connector_id, conn->connection, conn->count_modes);
+    }
     if (conn && conn->connection == DRM_MODE_CONNECTED &&
         conn->count_modes > 0) {
       kms.connector = conn;
+      printf("[DEBUG DRM] Selected Connector ID: %d\n", conn->connector_id);
       break;
     }
     if (conn)
@@ -607,23 +675,39 @@ int main(int argc, char **argv) {
   }
 
   kms.mode = kms.connector->modes[0];
+  printf("[DEBUG DRM] Selected Mode: %dx%d @ %dHz\n", kms.mode.hdisplay,
+         kms.mode.vdisplay, kms.mode.vrefresh);
+
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
   if (!kms.crtc) {
+    printf("[DEBUG DRM ERROR] Failed to get CRTC ID %d\n", res->crtcs[0]);
     drmModeFreeConnector(kms.connector);
     drmModeFreeResources(res);
     close(kms.fd);
     return -1;
   }
+  printf("[DEBUG DRM] Using CRTC ID: %d\n", kms.crtc->crtc_id);
   drmModeFreeResources(res);
 
-  kms.plane_primary_id = 39;
-  kms.plane_overlay_id = 41;
+  kms.plane_primary_id = 41;
+  kms.plane_overlay_id = 39;
+  printf("[DEBUG DRM] Using Planes: Primary=%d, Overlay=%d\n",
+         kms.plane_primary_id, kms.plane_overlay_id);
 
   kms.egl_disp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (!eglInitialize(kms.egl_disp, NULL, NULL)) {
+    printf("[DEBUG EGL ERROR] EGL_DEFAULT_DISPLAY failed, trying Native DRM "
+           "FD.\n");
     kms.egl_disp = eglGetDisplay((EGLNativeDisplayType)kms.fd);
     eglInitialize(kms.egl_disp, NULL, NULL);
   }
+  printf("[DEBUG EGL] Display initialized: %p\n", kms.egl_disp);
+  printf("[DEBUG EGL] Vendor: %s\n", eglQueryString(kms.egl_disp, EGL_VENDOR));
+  printf("[DEBUG EGL] Version: %s\n",
+         eglQueryString(kms.egl_disp, EGL_VERSION));
+  printf("[DEBUG EGL] Extensions: %s\n",
+         eglQueryString(kms.egl_disp, EGL_EXTENSIONS));
+
   eglBindAPI(EGL_OPENGL_ES_API);
 
   EGLConfig config;
@@ -636,16 +720,29 @@ int main(int argc, char **argv) {
                       8,
                       EGL_BLUE_SIZE,
                       8,
+                      EGL_ALPHA_SIZE, // <-- ADD THIS
+                      8,              // <-- ADD THIS
                       EGL_RENDERABLE_TYPE,
                       EGL_OPENGL_ES2_BIT,
                       EGL_NONE};
   eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num);
+  printf("[DEBUG EGL] eglChooseConfig found %d configs.\n", num);
+
   kms.egl_surf = eglCreatePbufferSurface(
       kms.egl_disp, config, (EGLint[]){EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE});
   kms.egl_ctx =
       eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
                        (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
-  eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
+
+  EGLBoolean made_current =
+      eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
+  printf("[DEBUG EGL] eglMakeCurrent status: %d | EGL Error: 0x%04x\n",
+         made_current, eglGetError());
+
+  printf("[DEBUG GL] GL Version: %s\n", glGetString(GL_VERSION));
+  printf("[DEBUG GL] GL Renderer: %s\n", glGetString(GL_RENDERER));
+  printf("[DEBUG GL] GL Extensions: %s\n", glGetString(GL_EXTENSIONS));
+
   load_egl_extensions();
 
   create_dumb_buffer_fbo(&kms.bufs[0]);
@@ -662,12 +759,40 @@ int main(int argc, char **argv) {
   GLuint vs = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vs, 1, &vs_src, NULL);
   glCompileShader(vs);
+
+  GLint compiled;
+  glGetShaderiv(vs, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    char log[512];
+    glGetShaderInfoLog(vs, 512, NULL, log);
+    printf("[DEBUG GL ERROR] VS Compile failed: %s\n", log);
+  }
+
   GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
   glShaderSource(fs, 1, &fs_src, NULL);
   glCompileShader(fs);
+
+  glGetShaderiv(fs, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    char log[512];
+    glGetShaderInfoLog(fs, 512, NULL, log);
+    printf("[DEBUG GL ERROR] FS Compile failed: %s\n", log);
+  }
+
   glAttachShader(kms.prog, vs);
   glAttachShader(kms.prog, fs);
   glLinkProgram(kms.prog);
+
+  GLint linked;
+  glGetProgramiv(kms.prog, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    char log[512];
+    glGetProgramInfoLog(kms.prog, 512, NULL, log);
+    printf("[DEBUG GL ERROR] Program Link failed: %s\n", log);
+  } else {
+    printf("[DEBUG GL] Program Linked successfully.\n");
+  }
+
   glUseProgram(kms.prog);
 
   glGenBuffers(1, &kms.vbo);
@@ -687,7 +812,6 @@ int main(int argc, char **argv) {
   glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
                         (void *)(2 * sizeof(float)));
 
-  // Bind the single external texture uniform
   glUniform1i(glGetUniformLocation(kms.prog, "tex_ext"), 0);
 
   drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
@@ -755,7 +879,6 @@ int main(int argc, char **argv) {
     }
     clock_gettime(CLOCK_MONOTONIC, &upload_done);
 
-    // ZERO COPY DRAW PHASE
     for (int i = 0; i < VIDEO_COUNT; i++) {
       struct timespec draw_start, draw_end;
       clock_gettime(CLOCK_MONOTONIC, &draw_start);
