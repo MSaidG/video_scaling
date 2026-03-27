@@ -126,6 +126,7 @@ PerfStats perf = {0};
 // --- GLOBALS ---
 GstVid videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
+int enable_anim = 0; // Default to static 2x2 grid
 
 // --- LAYOUT SYSTEM ---
 typedef struct {
@@ -564,15 +565,21 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
 
-  printf("You can enter 'all' as argument to display 4 1080p video.\n");
-  if (argc > 1) {
-    if (strcmp(argv[1], "all") == 0) {
-      for (int i = 0; i < VIDEO_COUNT; i++) {
-        VIDEO_FILES[i] = "earth1.mp4";
+  printf("Arguments: 'all' (4x same video), '--anim=yes' or '--anim=no'\n");
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "all") == 0) {
+      for (int j = 0; j < VIDEO_COUNT; j++) {
+        VIDEO_FILES[j] = "earth1.mp4";
       }
-      printf("Variable changed to 1 (all mode)\n");
+      printf("Mode: 'all'\n");
+    } else if (strcmp(argv[i], "--anim=yes") == 0) {
+      enable_anim = 1;
+      printf("Animation: Enabled\n");
+    } else if (strcmp(argv[i], "--anim=no") == 0) {
+      enable_anim = 0;
+      printf("Animation: Disabled (Static 2x2 grid)\n");
     } else {
-      printf("Unknown argument: %s\n", argv[1]);
+      printf("Unknown argument: %s\n", argv[i]);
     }
   }
 
@@ -675,7 +682,8 @@ int main(int argc, char **argv) {
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
                GL_DYNAMIC_DRAW);
 
-  int current_anim_step = 0;
+  // Step 5 results in m=1.0f (a perfect 2x2 grid without overlap)
+  int current_anim_step = enable_anim ? 0 : 5;
   update_geometry(current_anim_step);
 
   GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
@@ -720,13 +728,15 @@ int main(int argc, char **argv) {
       perf.gl_draw_us[i] = 0;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &anim_t1);
-    double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) +
-                     (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
-    if (elapsed >= ANIM_STEP_SEC) {
-      current_anim_step = (current_anim_step + 1) % 6;
-      update_geometry(current_anim_step);
-      anim_t0 = anim_t1;
+    if (enable_anim) {
+      clock_gettime(CLOCK_MONOTONIC, &anim_t1);
+      double elapsed = (anim_t1.tv_sec - anim_t0.tv_sec) +
+                       (anim_t1.tv_nsec - anim_t0.tv_nsec) / 1e9;
+      if (elapsed >= ANIM_STEP_SEC) {
+        current_anim_step = (current_anim_step + 1) % 6;
+        update_geometry(current_anim_step);
+        anim_t0 = anim_t1;
+      }
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
