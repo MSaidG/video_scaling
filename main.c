@@ -28,7 +28,7 @@
 // --- CONFIG ---
 #define VIDEO_COUNT 4
 char *VIDEO_FILES[VIDEO_COUNT] = {"earth1.mp4", "zoo.mp4", "sea.mp4",
-                                        "world.mp4"};
+                                  "world.mp4"};
 
 // --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
@@ -800,6 +800,28 @@ int main(int argc, char **argv) {
                          second_total_upload, second_total_draw,
                          second_total_plane, second_upload_counts,
                          second_draw_counts);
+
+      perf.avg_frame_us =
+          (perf.avg_frame_us * (perf.frame_count - frames_this_second) +
+           (second_total_eos + second_total_upload + second_total_draw +
+            second_total_plane)) /
+          perf.frame_count;
+      perf.avg_eos_us =
+          (perf.avg_eos_us * (perf.frame_count - frames_this_second) +
+           second_total_eos) /
+          perf.frame_count;
+      perf.avg_upload_us =
+          (perf.avg_upload_us * (perf.frame_count - frames_this_second) +
+           second_total_upload) /
+          perf.frame_count;
+      perf.avg_draw_us =
+          (perf.avg_draw_us * (perf.frame_count - frames_this_second) +
+           second_total_draw) /
+          perf.frame_count;
+      perf.avg_plane_us =
+          (perf.avg_plane_us * (perf.frame_count - frames_this_second) +
+           second_total_plane) /
+          perf.frame_count;
 
       clock_gettime(CLOCK_MONOTONIC, &second_start);
       frames_this_second = 0;

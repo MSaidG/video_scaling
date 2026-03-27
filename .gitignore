@@ -9,3 +9,5 @@ commands
 decode_app*
 main
 main_hdmi
+main_test_debug
+main_test_fbdev
