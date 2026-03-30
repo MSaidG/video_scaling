@@ -675,9 +675,10 @@ void *input_thread(void *arg) {
   return NULL;
 }
 
-static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
-    int *waiting_for_flip = (int *)data;
-    *waiting_for_flip = 0;
+static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
+                              unsigned int usec, void *data) {
+  int *waiting_for_flip = (int *)data;
+  *waiting_for_flip = 0;
 }
 
 // --- RENDER THREAD ---
@@ -765,42 +766,45 @@ void *render_loop_thread(void *arg) {
     }
     glFinish();
 
-// --- REPLACE THE FLIP BLOCK WITH THIS ---
-        if (ctx->disp->is_hdmi) {
-            // HDMI requires proper Page Flip Event handling to sync to VSYNC
-            int waiting_for_flip = 1;
-            drmEventContext evctx = {0};
-            evctx.version = 2;
-            evctx.page_flip_handler = page_flip_handler;
+    // --- REPLACE THE FLIP BLOCK WITH THIS ---
+    if (ctx->disp->is_hdmi) {
+      // HDMI requires proper Page Flip Event handling to sync to VSYNC
+      int waiting_for_flip = 1;
+      drmEventContext evctx = {0};
+      evctx.version = 2;
+      evctx.page_flip_handler = page_flip_handler;
 
-            drmModePageFlip(ctx->disp->fd, ctx->disp->crtc->crtc_id,
-                            ctx->disp->bufs[ctx->disp->back_buf].fb_id,
-                            DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+      drmModePageFlip(ctx->disp->fd, ctx->disp->crtc->crtc_id,
+                      ctx->disp->bufs[ctx->disp->back_buf].fb_id,
+                      DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
 
-            // Wait for the hardware VSYNC interrupt cleanly
-            fd_set fds;
-            while (waiting_for_flip && running) {
-                FD_ZERO(&fds);
-                FD_SET(ctx->disp->fd, &fds);
-                struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms timeout
-                int ret = select(ctx->disp->fd + 1, &fds, NULL, NULL, &timeout);
-                if (ret > 0) {
-                    drmHandleEvent(ctx->disp->fd, &evctx); // This triggers page_flip_handler
-                } else {
-                    break; // Timeout: prevents the slide show if the driver hiccups
-                }
-            }
+      // Wait for the hardware VSYNC interrupt cleanly
+      fd_set fds;
+      while (waiting_for_flip && running) {
+        FD_ZERO(&fds);
+        FD_SET(ctx->disp->fd, &fds);
+        struct timeval timeout = {.tv_sec = 0,
+                                  .tv_usec = 100000}; // 100ms timeout
+        int ret = select(ctx->disp->fd + 1, &fds, NULL, NULL, &timeout);
+        if (ret > 0) {
+          drmHandleEvent(ctx->disp->fd,
+                         &evctx); // This triggers page_flip_handler
         } else {
-            // DP driver handles synchronous SetPlane perfectly fine
-            drmModeSetPlane(ctx->disp->fd, ctx->disp->plane_primary_id, ctx->disp->crtc->crtc_id,
-                            ctx->disp->bufs[ctx->disp->back_buf].fb_id, 0, 0, 0,
-                            ctx->disp->mode.hdisplay, ctx->disp->mode.vdisplay, 0, 0,
-                            ctx->disp->mode.hdisplay << 16, ctx->disp->mode.vdisplay << 16);
+          break; // Timeout: prevents the slide show if the driver hiccups
         }
+      }
+    } else {
+      // DP driver handles synchronous SetPlane perfectly fine
+      drmModeSetPlane(
+          ctx->disp->fd, ctx->disp->plane_primary_id, ctx->disp->crtc->crtc_id,
+          ctx->disp->bufs[ctx->disp->back_buf].fb_id, 0, 0, 0,
+          ctx->disp->mode.hdisplay, ctx->disp->mode.vdisplay, 0, 0,
+          ctx->disp->mode.hdisplay << 16, ctx->disp->mode.vdisplay << 16);
+    }
 
-        ctx->disp->back_buf = !ctx->disp->back_buf;
-        frames_this_second++;
-        // ----------------------------------------
+    ctx->disp->back_buf = !ctx->disp->back_buf;
+    frames_this_second++;
+    // ----------------------------------------
 
     clock_gettime(CLOCK_MONOTONIC, &second_end);
     if (get_diff_us(second_start, second_end) >= 1000000) {
