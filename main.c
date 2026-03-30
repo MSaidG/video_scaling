@@ -742,6 +742,11 @@ void cleanup() {
   printf("Done.\n");
 }
 
+static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
+    int *waiting_for_flip = (int *)data;
+    *waiting_for_flip = 0;
+}
+
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
@@ -994,6 +999,7 @@ int main(int argc, char **argv) {
     glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
   }
+  
   glFinish();
 
   init_perf_stats();
@@ -1071,12 +1077,39 @@ int main(int argc, char **argv) {
     // UPDATED: Synchronize GPU to prevent overwriting
     glFinish();
 
+    // --- NEW HDMI VSYNC LOGIC ---
+    int waiting_for_flip = 1;
+    drmEventContext evctx = {0};
+    evctx.version = 2;
+    evctx.page_flip_handler = page_flip_handler;
+
     drmModeSetPlane(kms.fd, kms.plane_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
                     kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
                     kms.mode.vdisplay << 16);
+                    
     drmModePageFlip(kms.fd, kms.crtc->crtc_id, kms.bufs[back_buf].fb_id,
-                    DRM_MODE_PAGE_FLIP_EVENT, NULL);
+                    DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+
+    // Wait for the hardware VSYNC interrupt cleanly using select()
+    fd_set fds;
+    while (waiting_for_flip && running) {
+        FD_ZERO(&fds);
+        FD_SET(kms.fd, &fds);
+        struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms timeout
+        int ret = select(kms.fd + 1, &fds, NULL, NULL, &timeout);
+        if (ret > 0) {
+            drmHandleEvent(kms.fd, &evctx); // This triggers page_flip_handler
+        } else {
+            break; // Timeout, prevents freezing if driver drops the event
+        }
+    }
+    // ----------------------------
+
+    clock_gettime(CLOCK_MONOTONIC, &plane_done);
+
+    back_buf = !back_buf;
+    
     clock_gettime(CLOCK_MONOTONIC, &plane_done);
 
     back_buf = !back_buf;
