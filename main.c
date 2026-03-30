@@ -8,7 +8,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <termios.h> 
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -27,9 +27,9 @@
 
 // --- CONFIG ---
 #define TOTAL_VIDEOS 8
-char *VIDEO_FILES[TOTAL_VIDEOS] = {"earth1.mp4", "camel.mp4",    "meerkat_.mp4",
-                                   "muskox_.mp4",  "nature_bbc_.mp4", "penguin_.mp4",
-                                   "squirrel_.mp4",    "wild_hamster_.mp4"};
+char *VIDEO_FILES[TOTAL_VIDEOS] = {
+    "earth1.mp4",      "camel.mp4",    "meerkat_.mp4",  "muskox_.mp4",
+    "nature_bbc_.mp4", "penguin_.mp4", "squirrel_.mp4", "wild_hamster_.mp4"};
 
 // --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
@@ -126,21 +126,20 @@ const GLfloat split_verts[2 * 6 * 4] = {
 
 const GLfloat grid_verts[4 * 6 * 4] = {
     // Quad 0 (Draw 1st): Target Top-Left
-    -1.0f,  0.0f,  0.0f, 1.0f,  -1.0f, -1.0f,  0.0f, 0.0f,   0.0f,  0.0f,  1.0f, 1.0f,
-     0.0f,  0.0f,  1.0f, 1.0f,  -1.0f, -1.0f,  0.0f, 0.0f,   0.0f, -1.0f,  1.0f, 0.0f,
+    -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
+    0.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f,
 
     // Quad 1 (Draw 2nd): Target Top-Right
-     0.0f,  0.0f,  0.0f, 1.0f,   0.0f, -1.0f,  0.0f, 0.0f,   1.0f,  0.0f,  1.0f, 1.0f,
-     1.0f,  0.0f,  1.0f, 1.0f,   0.0f, -1.0f,  0.0f, 0.0f,   1.0f, -1.0f,  1.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f,
+    1.0f, 0.0f, 1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f,
 
     // Quad 2 (Draw 3rd): Target Bottom-Left
-    -1.0f,  1.0f,  0.0f, 1.0f,  -1.0f,  0.0f,  0.0f, 0.0f,   0.0f,  1.0f,  1.0f, 1.0f,
-     0.0f,  1.0f,  1.0f, 1.0f,  -1.0f,  0.0f,  0.0f, 0.0f,   0.0f,  0.0f,  1.0f, 0.0f,
+    -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f,
+    0.0f, 1.0f, 1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
 
     // Quad 3 (Draw 4th): Target Bottom-Right
-     0.0f,  1.0f,  0.0f, 1.0f,   0.0f,  0.0f,  0.0f, 0.0f,   1.0f,  1.0f,  1.0f, 1.0f,
-     1.0f,  1.0f,  1.0f, 1.0f,   0.0f,  0.0f,  0.0f, 0.0f,   1.0f,  0.0f,  1.0f, 0.0f
-};
+    0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f};
 
 // --- HELPERS ---
 void handle_sigint(int sig) { running = 0; }
@@ -676,6 +675,11 @@ void *input_thread(void *arg) {
   return NULL;
 }
 
+static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
+    int *waiting_for_flip = (int *)data;
+    *waiting_for_flip = 0;
+}
+
 // --- RENDER THREAD ---
 void *render_loop_thread(void *arg) {
   RenderThreadCtx *ctx = (RenderThreadCtx *)arg;
@@ -684,6 +688,13 @@ void *render_loop_thread(void *arg) {
   GLuint local_textures[TOTAL_VIDEOS] = {0};
   EGLImageKHR local_egl_images[TOTAL_VIDEOS] = {0};
   GstSample *local_active_samples[TOTAL_VIDEOS] = {NULL};
+
+  // NEW: Array to track individual video frame updates
+  int video_frames_this_second[TOTAL_VIDEOS] = {0};
+
+  struct timespec second_start, second_end;
+  clock_gettime(CLOCK_MONOTONIC, &second_start);
+  int frames_this_second = 0;
 
   while (running) {
     for (int i = 0; i < TOTAL_VIDEOS; i++) {
@@ -709,10 +720,14 @@ void *render_loop_thread(void *arg) {
           ctx->disp, &videos[global_vid_idx], &local_textures[global_vid_idx],
           &local_egl_images[global_vid_idx],
           local_active_samples[global_vid_idx]);
+
+      // If we actually mapped a new frame, increment the video's specific
+      // counter
       if (new_samp) {
         if (local_active_samples[global_vid_idx])
           gst_sample_unref(local_active_samples[global_vid_idx]);
         local_active_samples[global_vid_idx] = new_samp;
+        video_frames_this_second[global_vid_idx]++; // <-- NEW: Track the frame
       }
     }
 
@@ -723,7 +738,6 @@ void *render_loop_thread(void *arg) {
     glClear(GL_COLOR_BUFFER_BIT);
 
     glBindBuffer(GL_ARRAY_BUFFER, ctx->disp->vbo);
-    // NEW: Select the correct geometry based on the active queue
     if (num_vids == 1) {
       glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(single_verts), single_verts);
     } else if (num_vids == 2) {
@@ -751,23 +765,63 @@ void *render_loop_thread(void *arg) {
     }
     glFinish();
 
-    if (ctx->disp->is_hdmi) {
-      drmModeSetPlane(
-          ctx->disp->fd, ctx->disp->plane_id, ctx->disp->crtc->crtc_id,
-          ctx->disp->bufs[ctx->disp->back_buf].fb_id, 0, 0, 0,
-          ctx->disp->mode.hdisplay, ctx->disp->mode.vdisplay, 0, 0,
-          ctx->disp->mode.hdisplay << 16, ctx->disp->mode.vdisplay << 16);
-      drmModePageFlip(ctx->disp->fd, ctx->disp->crtc->crtc_id,
-                      ctx->disp->bufs[ctx->disp->back_buf].fb_id,
-                      DRM_MODE_PAGE_FLIP_EVENT, NULL);
-    } else {
-      drmModeSetPlane(
-          ctx->disp->fd, ctx->disp->plane_primary_id, ctx->disp->crtc->crtc_id,
-          ctx->disp->bufs[ctx->disp->back_buf].fb_id, 0, 0, 0,
-          ctx->disp->mode.hdisplay, ctx->disp->mode.vdisplay, 0, 0,
-          ctx->disp->mode.hdisplay << 16, ctx->disp->mode.vdisplay << 16);
+// --- REPLACE THE FLIP BLOCK WITH THIS ---
+        if (ctx->disp->is_hdmi) {
+            // HDMI requires proper Page Flip Event handling to sync to VSYNC
+            int waiting_for_flip = 1;
+            drmEventContext evctx = {0};
+            evctx.version = 2;
+            evctx.page_flip_handler = page_flip_handler;
+
+            drmModePageFlip(ctx->disp->fd, ctx->disp->crtc->crtc_id,
+                            ctx->disp->bufs[ctx->disp->back_buf].fb_id,
+                            DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+
+            // Wait for the hardware VSYNC interrupt cleanly
+            fd_set fds;
+            while (waiting_for_flip && running) {
+                FD_ZERO(&fds);
+                FD_SET(ctx->disp->fd, &fds);
+                struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms timeout
+                int ret = select(ctx->disp->fd + 1, &fds, NULL, NULL, &timeout);
+                if (ret > 0) {
+                    drmHandleEvent(ctx->disp->fd, &evctx); // This triggers page_flip_handler
+                } else {
+                    break; // Timeout: prevents the slide show if the driver hiccups
+                }
+            }
+        } else {
+            // DP driver handles synchronous SetPlane perfectly fine
+            drmModeSetPlane(ctx->disp->fd, ctx->disp->plane_primary_id, ctx->disp->crtc->crtc_id,
+                            ctx->disp->bufs[ctx->disp->back_buf].fb_id, 0, 0, 0,
+                            ctx->disp->mode.hdisplay, ctx->disp->mode.vdisplay, 0, 0,
+                            ctx->disp->mode.hdisplay << 16, ctx->disp->mode.vdisplay << 16);
+        }
+
+        ctx->disp->back_buf = !ctx->disp->back_buf;
+        frames_this_second++;
+        // ----------------------------------------
+
+    clock_gettime(CLOCK_MONOTONIC, &second_end);
+    if (get_diff_us(second_start, second_end) >= 1000000) {
+      float loop_fps = (frames_this_second * 1000000.0f) /
+                       get_diff_us(second_start, second_end);
+
+      // NEW: Print the hardware loop speed, followed by each video's decode
+      // speed
+      printf("[%s] Loop: %.1f FPS | ", ctx->name, loop_fps);
+      for (int i = 0; i < num_vids; i++) {
+        int global_vid_idx = active_vids[i];
+        printf("V%d: %d fps ", global_vid_idx + 1,
+               video_frames_this_second[global_vid_idx]);
+        video_frames_this_second[global_vid_idx] =
+            0; // Reset for the next second
+      }
+      printf("\n");
+
+      clock_gettime(CLOCK_MONOTONIC, &second_start);
+      frames_this_second = 0;
     }
-    ctx->disp->back_buf = !ctx->disp->back_buf;
   }
 
   for (int i = 0; i < TOTAL_VIDEOS; i++) {
