@@ -5,12 +5,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <termios.h> // NEW: Added ncurses
+#include <termios.h> 
 #include <time.h>
 #include <unistd.h>
 
@@ -29,9 +27,9 @@
 
 // --- CONFIG ---
 #define TOTAL_VIDEOS 8
-char *VIDEO_FILES[TOTAL_VIDEOS] = {"earth1.mp4", "zoo.mp4",    "sea.mp4",
-                                   "world.mp4",  "earth1.mp4", "zoo.mp4",
-                                   "sea.mp4",    "world.mp4"};
+char *VIDEO_FILES[TOTAL_VIDEOS] = {"earth1.mp4", "camel.mp4",    "meerkat_.mp4",
+                                   "muskox_.mp4",  "nature_bbc_.mp4", "penguin_.mp4",
+                                   "squirrel_.mp4",    "wild_hamster_.mp4"};
 
 // --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
@@ -127,18 +125,22 @@ const GLfloat split_verts[2 * 6 * 4] = {
     1.0f, 1.0f, 1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f};
 
 const GLfloat grid_verts[4 * 6 * 4] = {
-    // Quad 0 (TL): x=-1 to 0, y=0 to 1
-    -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f,
-    0.0f, 1.0f, 1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-    // Quad 1 (TR): x=0 to 1, y=0 to 1
-    0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f,
-    // Quad 2 (BL): x=-1 to 0, y=-1 to 0
-    -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
-    0.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f,
-    // Quad 3 (BR): x=0 to 1, y=-1 to 0
-    0.0f, 0.0f, 0.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f,
-    1.0f, 0.0f, 1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f};
+    // Quad 0 (Draw 1st): Target Top-Left
+    -1.0f,  0.0f,  0.0f, 1.0f,  -1.0f, -1.0f,  0.0f, 0.0f,   0.0f,  0.0f,  1.0f, 1.0f,
+     0.0f,  0.0f,  1.0f, 1.0f,  -1.0f, -1.0f,  0.0f, 0.0f,   0.0f, -1.0f,  1.0f, 0.0f,
+
+    // Quad 1 (Draw 2nd): Target Top-Right
+     0.0f,  0.0f,  0.0f, 1.0f,   0.0f, -1.0f,  0.0f, 0.0f,   1.0f,  0.0f,  1.0f, 1.0f,
+     1.0f,  0.0f,  1.0f, 1.0f,   0.0f, -1.0f,  0.0f, 0.0f,   1.0f, -1.0f,  1.0f, 0.0f,
+
+    // Quad 2 (Draw 3rd): Target Bottom-Left
+    -1.0f,  1.0f,  0.0f, 1.0f,  -1.0f,  0.0f,  0.0f, 0.0f,   0.0f,  1.0f,  1.0f, 1.0f,
+     0.0f,  1.0f,  1.0f, 1.0f,  -1.0f,  0.0f,  0.0f, 0.0f,   0.0f,  0.0f,  1.0f, 0.0f,
+
+    // Quad 3 (Draw 4th): Target Bottom-Right
+     0.0f,  1.0f,  0.0f, 1.0f,   0.0f,  0.0f,  0.0f, 0.0f,   1.0f,  1.0f,  1.0f, 1.0f,
+     1.0f,  1.0f,  1.0f, 1.0f,   0.0f,  0.0f,  0.0f, 0.0f,   1.0f,  0.0f,  1.0f, 0.0f
+};
 
 // --- HELPERS ---
 void handle_sigint(int sig) { running = 0; }
