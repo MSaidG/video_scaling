@@ -561,6 +561,27 @@ void print_second_stats(struct timespec second_start,
   printf("================================\n");
 }
 
+uint32_t get_plane_property_id(int fd, uint32_t plane_id, const char *prop_name) {
+    uint32_t prop_id = 0;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+    
+    if (!props) return 0;
+
+    for (uint32_t i = 0; i < props->count_props; i++) {
+        drmModePropertyRes *prop = drmModeGetProperty(fd, props->props[i]);
+        if (prop) {
+            if (strcmp(prop->name, prop_name) == 0) {
+                prop_id = prop->prop_id;
+            }
+            drmModeFreeProperty(prop);
+            if (prop_id) break; // Found it
+        }
+    }
+    
+    drmModeFreeObjectProperties(props);
+    return prop_id;
+}
+
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
@@ -697,6 +718,22 @@ int main(int argc, char **argv) {
 
   // Bind the single external texture uniform
   glUniform1i(glGetUniformLocation(kms.prog, "tex_ext"), 0);
+
+  // Find the alpha property ID for plane 41 (overlay)
+  uint32_t alpha_prop_id = get_plane_property_id(kms.fd, kms.plane_overlay_id, "alpha");
+
+  if (alpha_prop_id > 0) {
+      // Set alpha to 0x0000 (fully transparent)
+      int ret = drmModeObjectSetProperty(kms.fd, kms.plane_overlay_id, 
+                                         DRM_MODE_OBJECT_PLANE, alpha_prop_id, 0x0000);
+      if (ret < 0) {
+          fprintf(stderr, "Failed to set alpha to 0: %m\n");
+      } else {
+          printf("Successfully set Plane %d alpha to 0 (Transparent).\n", kms.plane_overlay_id);
+      }
+  } else {
+      printf("Warning: 'alpha' property not found on Plane %d.\n", kms.plane_overlay_id);
+  }
 
   drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
                   0, 0, 0, 0, 0, 0);
