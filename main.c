@@ -153,16 +153,30 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "}\n";
 
 // UPDATED: Zero-Copy shader with debug logic and R/B swap preserved
-const char *fs_src = "#extension GL_OES_EGL_image_external : require\n"
-                     "precision mediump float;\n"
-                     "varying vec2 v_tex;\n"
-                     "uniform samplerExternalOES tex_ext;\n"
-                     "uniform int debug_mode;\n"
-                     "void main() {\n"
-                     "    vec4 rgb = texture2D(tex_ext, v_tex);\n"
-                     "    // Swap red and blue for BGR framebuffer\n"
-                     "    gl_FragColor = vec4(rgb.b, rgb.g, rgb.r, 1.0);\n"
-                     "}\n";
+const char *fs_src =
+    "#extension GL_OES_EGL_image_external : require\n"
+    "precision mediump float;\n"
+    "varying vec2 v_tex;\n"
+    "uniform samplerExternalOES tex_ext;\n"
+    "uniform int debug_mode;\n"
+    "void main() {\n"
+    "    // Source is 1920px wide. Offset by 0.5 pixel to sample left and "
+    "right.\n"
+    "    // 0.5 / 1920.0 = 0.0002604\n"
+    "    vec4 rgb0 = texture2D(tex_ext, vec2(v_tex.x - 0.0002604, v_tex.y));\n"
+    "    vec4 rgb1 = texture2D(tex_ext, vec2(v_tex.x + 0.0002604, v_tex.y));\n"
+    "\n"
+    "    // Convert RGB to ITU-R BT.601 Limited Range YCbCr\n"
+    "    float y0 = 0.0627 + 0.2568*rgb0.r + 0.5041*rgb0.g + 0.0979*rgb0.b;\n"
+    "    float y1 = 0.0627 + 0.2568*rgb1.r + 0.5041*rgb1.g + 0.0979*rgb1.b;\n"
+    "    float u  = 0.5020 - 0.1482*rgb0.r - 0.2910*rgb0.g + 0.4392*rgb0.b;\n"
+    "    float v  = 0.5020 + 0.4392*rgb0.r - 0.3678*rgb0.g - 0.0714*rgb0.b;\n"
+    "\n"
+    "    // Pack into RGBA. Under ABGR8888 little-endian, this writes:\n"
+    "    // Byte 0: U, Byte 1: Y0, Byte 2: V, Byte 3: Y1 (Perfect UYVY "
+    "format)\n"
+    "    gl_FragColor = vec4(u, y0, v, y1);\n"
+    "}\n";
 
 // --- HELPERS ---
 void handle_sigint(int sig) { running = 0; }
@@ -319,15 +333,13 @@ uint32_t find_suitable_plane(int fd, uint32_t crtc_id, uint32_t crtc_index) {
 }
 
 int create_dumb_buffer_fbo(DumbBuffer *buf) {
-  // [Unchanged: Kept your complex HDMI format fallbacks and drmModeAddFB2
-  // logic]
   memset(buf, 0, sizeof(DumbBuffer));
   buf->prime_fd = -1;
 
   struct drm_mode_create_dumb create_req = {0};
   create_req.width = kms.mode.hdisplay;
   create_req.height = kms.mode.vdisplay;
-  create_req.bpp = 32;
+  create_req.bpp = 16; // CHANGED: UYVY is 16 bits per pixel
   create_req.flags = 0;
 
   if (ioctl(kms.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_req) < 0) {
@@ -342,38 +354,15 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   printf("Created dumb buffer: handle=%u, stride=%u, size=%u\n", buf->handle,
          buf->stride, buf->size);
 
-  uint32_t formats_to_try[] = {
-      DRM_FORMAT_XBGR8888, // XB24 in modetest
-      DRM_FORMAT_BGRX8888,
-      DRM_FORMAT_XRGB8888,
-      DRM_FORMAT_ARGB8888,
-  };
+  // CHANGED: Force DRM to register this as UYVY
+  uint32_t handles[4] = {buf->handle};
+  uint32_t pitches[4] = {buf->stride};
+  uint32_t offsets[4] = {0};
 
-  const char *format_names[] = {
-      "XBGR8888 (XB24)",
-      "BGRX8888",
-      "XRGB8888",
-      "ARGB8888",
-  };
-
-  int fb_added = 0;
-  for (int f = 0; f < 4; f++) {
-    uint32_t handles[4] = {buf->handle};
-    uint32_t pitches[4] = {buf->stride};
-    uint32_t offsets[4] = {0};
-
-    if (drmModeAddFB2(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay,
-                      formats_to_try[f], handles, pitches, offsets, &buf->fb_id,
-                      0) == 0) {
-      printf("Added FB with ID: %u using format %s\n", buf->fb_id,
-             format_names[f]);
-      fb_added = 1;
-      break;
-    }
-  }
-
-  if (!fb_added) {
-    printf("Failed to add FB with any format\n");
+  if (drmModeAddFB2(kms.fd, kms.mode.hdisplay, kms.mode.vdisplay,
+                    DRM_FORMAT_UYVY, handles, pitches, offsets, &buf->fb_id,
+                    0) != 0) {
+    printf("Failed to add FB with UYVY format\n");
     return -1;
   }
 
@@ -386,12 +375,15 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   }
   buf->prime_fd = prime.fd;
 
+  // CHANGED: Trick EGL by mapping it as a half-width 32-bit ABGR8888 buffer.
+  // 1920 pixels * 16bpp = 3840 bytes pitch.
+  // 960 pixels * 32bpp = 3840 bytes pitch. Memory footprint aligns perfectly.
   EGLint attribs[] = {EGL_WIDTH,
-                      kms.mode.hdisplay,
+                      kms.mode.hdisplay / 2,
                       EGL_HEIGHT,
                       kms.mode.vdisplay,
                       EGL_LINUX_DRM_FOURCC_EXT,
-                      DRM_FORMAT_XBGR8888,
+                      DRM_FORMAT_ABGR8888,
                       EGL_DMA_BUF_PLANE0_FD_EXT,
                       buf->prime_fd,
                       EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -400,36 +392,13 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
                       buf->stride,
                       EGL_NONE};
 
-  printf("Creating EGLImage with: fourcc=XBGR8888, fd=%d, stride=%u\n",
-         buf->prime_fd, buf->stride);
   buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
 
   if (!buf->egl_img) {
     EGLint error = eglGetError();
     printf("Failed to create EGLImage. EGL error: 0x%x\n", error);
-    printf("Trying ARGB8888 instead...\n");
-    EGLint attribs2[] = {EGL_WIDTH,
-                         kms.mode.hdisplay,
-                         EGL_HEIGHT,
-                         kms.mode.vdisplay,
-                         EGL_LINUX_DRM_FOURCC_EXT,
-                         DRM_FORMAT_ARGB8888,
-                         EGL_DMA_BUF_PLANE0_FD_EXT,
-                         buf->prime_fd,
-                         EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-                         0,
-                         EGL_DMA_BUF_PLANE0_PITCH_EXT,
-                         buf->stride,
-                         EGL_NONE};
-
-    buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
-                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs2);
-    if (!buf->egl_img) {
-      error = eglGetError();
-      printf("Still failed with ARGB8888. EGL error: 0x%x\n", error);
-      return -1;
-    }
+    return -1;
   }
 
   printf("EGLImage created successfully\n");
@@ -741,6 +710,11 @@ void cleanup() {
   printf("Done.\n");
 }
 
+static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data) {
+    int *waiting_for_flip = (int *)data;
+    *waiting_for_flip = 0;
+}
+
 int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
@@ -821,7 +795,7 @@ int main(int argc, char **argv) {
   // ----------------------------------------
 
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
-  
+
   if (!kms.crtc) {
     printf("Failed to get CRTC\n");
     drmModeFreeConnector(kms.connector);
@@ -1042,9 +1016,9 @@ int main(int argc, char **argv) {
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, kms.bufs[back_buf].fbo_id);
-    glViewport(0, 0, kms.mode.hdisplay, kms.mode.vdisplay);
+    glViewport(0, 0, kms.mode.hdisplay / 2, kms.mode.vdisplay);
 
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(0.5f, 0.0627f, 0.5f, 0.0627f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     for (int i = 0; i < VIDEO_COUNT; i++) {
@@ -1086,13 +1060,34 @@ int main(int argc, char **argv) {
     // UPDATED: Synchronize GPU to prevent overwriting
     glFinish();
 
+    // --- NEW HDMI VSYNC LOGIC ---
+    int waiting_for_flip = 1;
+    drmEventContext evctx = {0};
+    evctx.version = 2;
+    evctx.page_flip_handler = page_flip_handler;
+
     drmModeSetPlane(kms.fd, kms.plane_id, kms.crtc->crtc_id,
                     kms.bufs[back_buf].fb_id, 0, 0, 0, kms.mode.hdisplay,
                     kms.mode.vdisplay, 0, 0, kms.mode.hdisplay << 16,
                     kms.mode.vdisplay << 16);
+                    
     drmModePageFlip(kms.fd, kms.crtc->crtc_id, kms.bufs[back_buf].fb_id,
-                    DRM_MODE_PAGE_FLIP_EVENT, NULL);
-    clock_gettime(CLOCK_MONOTONIC, &plane_done);
+                    DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+
+    // Wait for the hardware VSYNC interrupt cleanly using select()
+    fd_set fds;
+    while (waiting_for_flip && running) {
+        FD_ZERO(&fds);
+        FD_SET(kms.fd, &fds);
+        struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms timeout
+        int ret = select(kms.fd + 1, &fds, NULL, NULL, &timeout);
+        if (ret > 0) {
+            drmHandleEvent(kms.fd, &evctx); // This triggers page_flip_handler
+        } else {
+            break; // Timeout, prevents freezing if driver drops the event
+        }
+    }
+    // ----------------------------
 
     back_buf = !back_buf;
     kms.frame_count++;
