@@ -8,5 +8,6 @@ vgcore*
 commands
 decode_app*
 main
+main_test*
 main_hdmi
 main_cam

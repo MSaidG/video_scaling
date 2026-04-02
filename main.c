@@ -1,16 +1,14 @@
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <poll.h>
 
 #include <linux/videodev2.h>
 
@@ -32,10 +30,6 @@ const char *CAMERA_DEVICE = "/dev/video0";
 #define CAM_WIDTH 1920
 #define CAM_HEIGHT 1080
 #define CAM_BUF_COUNT 4
-
-#ifndef GL_TEXTURE_EXTERNAL_OES
-#define GL_TEXTURE_EXTERNAL_OES 0x8D65
-#endif
 
 // --- EXTENSIONS ---
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(
@@ -100,13 +94,46 @@ const char *vs_src = "attribute vec4 a_pos;\n"
                      "   v_tex = a_tex;\n"
                      "}\n";
 
-const char *fs_src = "#extension GL_OES_EGL_image_external : require\n"
-                     "precision mediump float;\n"
-                     "varying vec2 v_tex;\n"
-                     "uniform samplerExternalOES tex_cam;\n"
-                     "void main() {\n"
-                     "  gl_FragColor = texture2D(tex_cam, v_tex);\n"
-                     "}\n";
+const char *fs_src =
+    "#extension GL_OES_EGL_image_external : require\n"
+    "precision mediump float;\n"
+    "varying vec2 v_tex;\n"
+    "uniform samplerExternalOES tex_cam;\n"
+    "void main() {\n"
+    "  // Sample the raw bytes (mapped 0.0 to 1.0 by the GPU)\n"
+    "  vec4 raw_bytes = texture2D(tex_cam, v_tex);\n"
+    "  \n"
+    "  // Scale back up to 0-255 range for byte math\n"
+    "  float b0 = raw_bytes.r * 255.0;\n"
+    "  float b1 = raw_bytes.g * 255.0;\n"
+    "  float b2 = raw_bytes.b * 255.0;\n"
+    "  float b3 = raw_bytes.a * 255.0;\n"
+    "  \n"
+    "  // Extract 10-bit Y, U, V values (0 to 1023)\n"
+    "  // Y: b0 + (lower 2 bits of b1 shifted left by 8)\n"
+    "  float y10 = b0 + mod(b1, 4.0) * 256.0;\n"
+    "  \n"
+    "  // U: (upper 6 bits of b1 shifted right by 2) + (lower 4 bits of b2 "
+    "shifted left by 6)\n"
+    "  float u10 = floor(b1 / 4.0) + mod(b2, 16.0) * 64.0;\n"
+    "  \n"
+    "  // V: (upper 4 bits of b2 shifted right by 4) + (lower 6 bits of b3 "
+    "shifted left by 4)\n"
+    "  float v10 = floor(b2 / 16.0) + mod(b3, 64.0) * 16.0;\n"
+    "  \n"
+    "  // Normalize Limited Range 10-bit values\n"
+    "  // Y is 64-940, U/V are 64-960 in 10-bit limited range\n"
+    "  float y = (y10 - 64.0) / 876.0;\n"
+    "  float u = (u10 - 512.0) / 896.0;\n"
+    "  float v = (v10 - 512.0) / 896.0;\n"
+    "  \n"
+    "  // Rec.709 YUV to RGB conversion\n"
+    "  float r = y + 1.5748 * v;\n"
+    "  float g = y - 0.1873 * u - 0.4681 * v;\n"
+    "  float b_col = y + 1.8556 * u;\n"
+    "  \n"
+    "  gl_FragColor = vec4(r, g, b_col, 1.0);\n"
+    "}\n";
 
 // --- HELPERS ---
 void handle_sigint(int sig) { running = 0; }
@@ -148,12 +175,18 @@ int create_dumb_buffer_fbo(DumbBuffer *buf) {
   ioctl(kms.fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
   buf->prime_fd = prime.fd;
 
-  EGLint attribs[] = {EGL_WIDTH, kms.mode.hdisplay,
-                      EGL_HEIGHT, kms.mode.vdisplay,
-                      EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
-                      EGL_DMA_BUF_PLANE0_FD_EXT, buf->prime_fd,
-                      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-                      EGL_DMA_BUF_PLANE0_PITCH_EXT, buf->stride,
+  EGLint attribs[] = {EGL_WIDTH,
+                      kms.mode.hdisplay,
+                      EGL_HEIGHT,
+                      kms.mode.vdisplay,
+                      EGL_LINUX_DRM_FOURCC_EXT,
+                      DRM_FORMAT_ARGB8888,
+                      EGL_DMA_BUF_PLANE0_FD_EXT,
+                      buf->prime_fd,
+                      EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                      0,
+                      EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                      buf->stride,
                       EGL_NONE};
 
   buf->egl_img = eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT,
@@ -193,9 +226,9 @@ int init_camera() {
     perror("Failed to set camera format");
     return -1;
   }
-  
+
   int pitch = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
-  printf("Camera format set to X410 %dx%d (Multiplanar, Pitch: %d)\n", 
+  printf("Camera format set to X410 %dx%d (Multiplanar, Pitch: %d)\n",
          fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height, pitch);
 
   // 2. Request Multiplanar Buffers
@@ -211,7 +244,7 @@ int init_camera() {
 
   // Pre-map all camera buffers directly to OpenGL Textures
   for (int i = 0; i < CAM_BUF_COUNT; i++) {
-      
+
     struct v4l2_plane planes[1] = {0};
     struct v4l2_buffer buf = {0};
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -220,7 +253,8 @@ int init_camera() {
     buf.length = 1;
     buf.m.planes = planes;
 
-    // **THE MISSING LINK** - Query the buffer to let the kernel populate the exact lengths
+    // **THE MISSING LINK** - Query the buffer to let the kernel populate the
+    // exact lengths
     if (ioctl(camera.fd, VIDIOC_QUERYBUF, &buf) < 0) {
       perror("Failed to query buffer lengths");
       return -1;
@@ -230,8 +264,8 @@ int init_camera() {
     struct v4l2_exportbuffer expbuf = {0};
     expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     expbuf.index = i;
-    expbuf.plane = 0; 
-    
+    expbuf.plane = 0;
+
     if (ioctl(camera.fd, VIDIOC_EXPBUF, &expbuf) < 0) {
       perror("Failed to export buffer");
       return -1;
@@ -240,20 +274,26 @@ int init_camera() {
     camera.bufs[i].index = i;
     camera.bufs[i].dbuf_fd = expbuf.fd;
 
-    // Map DMABUF directly to an EGL Image as standard ARGB8888 
-    EGLint egl_img_attr[] = {
-        EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
-        EGL_DMA_BUF_PLANE0_FD_EXT, camera.bufs[i].dbuf_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, pitch, 
-        EGL_WIDTH, CAM_WIDTH,
-        EGL_HEIGHT, CAM_HEIGHT,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888, // Lying to the GPU here!
-        EGL_NONE
-    };
+    // Map DMABUF directly to an EGL Image as standard ARGB8888
+    EGLint egl_img_attr[] = {EGL_IMAGE_PRESERVED_KHR,
+                             EGL_TRUE,
+                             EGL_DMA_BUF_PLANE0_FD_EXT,
+                             camera.bufs[i].dbuf_fd,
+                             EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                             0,
+                             EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                             pitch,
+                             EGL_WIDTH,
+                             CAM_WIDTH,
+                             EGL_HEIGHT,
+                             CAM_HEIGHT,
+                             EGL_LINUX_DRM_FOURCC_EXT,
+                             DRM_FORMAT_ABGR8888, // Lying to the GPU here!
+                             EGL_NONE};
 
-    camera.bufs[i].egl_img = eglCreateImageKHR(
-        kms.egl_disp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, egl_img_attr);
+    camera.bufs[i].egl_img =
+        eglCreateImageKHR(kms.egl_disp, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                          NULL, egl_img_attr);
 
     if (camera.bufs[i].egl_img == EGL_NO_IMAGE_KHR) {
       fprintf(stderr, "Failed to create EGL image for buffer %d\n", i);
@@ -263,11 +303,14 @@ int init_camera() {
     // Create a persistent OpenGL texture
     glGenTextures(1, &camera.bufs[i].tex_id);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, camera.bufs[i].tex_id);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, camera.bufs[i].egl_img);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES,
+                                 camera.bufs[i].egl_img);
 
     // 4. Queue Multiplanar Buffer using the properly sized arrays from QUERYBUF
     if (ioctl(camera.fd, VIDIOC_QBUF, &buf) < 0) {
@@ -288,13 +331,13 @@ int init_camera() {
 
 void update_geometry() {
   GLfloat verts[] = {
-    // x,      y,     u,    v
-    -1.0f,  1.0f,  0.0f, 1.0f, // TL
-    -1.0f, -1.0f,  0.0f, 0.0f, // BL
-     1.0f,  1.0f,  1.0f, 1.0f, // TR
-     1.0f,  1.0f,  1.0f, 1.0f, // TR
-    -1.0f, -1.0f,  0.0f, 0.0f, // BL
-     1.0f, -1.0f,  1.0f, 0.0f  // BR
+      // x,      y,     u,    v
+      -1.0f, 1.0f,  0.0f, 1.0f, // TL
+      -1.0f, -1.0f, 0.0f, 0.0f, // BL
+      1.0f,  1.0f,  1.0f, 1.0f, // TR
+      1.0f,  1.0f,  1.0f, 1.0f, // TR
+      -1.0f, -1.0f, 0.0f, 0.0f, // BL
+      1.0f,  -1.0f, 1.0f, 0.0f  // BR
   };
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
@@ -307,22 +350,32 @@ void cleanup() {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     ioctl(camera.fd, VIDIOC_STREAMOFF, &type);
     for (int i = 0; i < CAM_BUF_COUNT; i++) {
-      if (camera.bufs[i].tex_id) glDeleteTextures(1, &camera.bufs[i].tex_id);
-      if (camera.bufs[i].egl_img) eglDestroyImageKHR(kms.egl_disp, camera.bufs[i].egl_img);
-      if (camera.bufs[i].dbuf_fd >= 0) close(camera.bufs[i].dbuf_fd);
+      if (camera.bufs[i].tex_id)
+        glDeleteTextures(1, &camera.bufs[i].tex_id);
+      if (camera.bufs[i].egl_img)
+        eglDestroyImageKHR(kms.egl_disp, camera.bufs[i].egl_img);
+      if (camera.bufs[i].dbuf_fd >= 0)
+        close(camera.bufs[i].dbuf_fd);
     }
     close(camera.fd);
   }
 
-  if (kms.prog) glDeleteProgram(kms.prog);
-  if (kms.vbo) glDeleteBuffers(1, &kms.vbo);
+  if (kms.prog)
+    glDeleteProgram(kms.prog);
+  if (kms.vbo)
+    glDeleteBuffers(1, &kms.vbo);
 
   for (int i = 0; i < 2; i++) {
-    if (kms.bufs[i].fbo_id) glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
-    if (kms.bufs[i].tex_id) glDeleteTextures(1, &kms.bufs[i].tex_id);
-    if (kms.bufs[i].egl_img && eglDestroyImageKHR) eglDestroyImageKHR(kms.egl_disp, kms.bufs[i].egl_img);
-    if (kms.bufs[i].prime_fd >= 0) close(kms.bufs[i].prime_fd);
-    if (kms.bufs[i].fb_id) drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
+    if (kms.bufs[i].fbo_id)
+      glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
+    if (kms.bufs[i].tex_id)
+      glDeleteTextures(1, &kms.bufs[i].tex_id);
+    if (kms.bufs[i].egl_img && eglDestroyImageKHR)
+      eglDestroyImageKHR(kms.egl_disp, kms.bufs[i].egl_img);
+    if (kms.bufs[i].prime_fd >= 0)
+      close(kms.bufs[i].prime_fd);
+    if (kms.bufs[i].fb_id)
+      drmModeRmFB(kms.fd, kms.bufs[i].fb_id);
     if (kms.bufs[i].handle) {
       struct drm_mode_destroy_dumb destroy_req = {.handle = kms.bufs[i].handle};
       ioctl(kms.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_req);
@@ -330,12 +383,16 @@ void cleanup() {
   }
 
   if (kms.egl_disp != EGL_NO_DISPLAY) {
-    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglMakeCurrent(kms.egl_disp, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
     eglTerminate(kms.egl_disp);
   }
-  if (kms.crtc) drmModeFreeCrtc(kms.crtc);
-  if (kms.connector) drmModeFreeConnector(kms.connector);
-  if (kms.fd >= 0) close(kms.fd);
+  if (kms.crtc)
+    drmModeFreeCrtc(kms.crtc);
+  if (kms.connector)
+    drmModeFreeConnector(kms.connector);
+  if (kms.fd >= 0)
+    close(kms.fd);
   printf("Done.\n");
 }
 
@@ -343,28 +400,36 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
 
   kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) return -1;
+  if (kms.fd < 0)
+    kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
+  if (kms.fd < 0)
+    return -1;
 
   drmModeRes *res = drmModeGetResources(kms.fd);
-  if (!res) return -1;
+  if (!res)
+    return -1;
 
   kms.connector = NULL;
   for (int i = 0; i < res->count_connectors; i++) {
     drmModeConnector *conn = drmModeGetConnector(kms.fd, res->connectors[i]);
-    if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+    if (conn && conn->connection == DRM_MODE_CONNECTED &&
+        conn->count_modes > 0) {
       kms.connector = conn;
       break;
     }
-    if (conn) drmModeFreeConnector(conn);
+    if (conn)
+      drmModeFreeConnector(conn);
   }
-  if (!kms.connector) return -1;
+  if (!kms.connector)
+    return -1;
 
   kms.mode = kms.connector->modes[0];
-  printf("Display mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay, kms.mode.vrefresh);
+  printf("Display mode: %dx%d @ %dHz\n", kms.mode.hdisplay, kms.mode.vdisplay,
+         kms.mode.vrefresh);
 
   kms.crtc = drmModeGetCrtc(kms.fd, res->crtcs[0]);
-  if (!kms.crtc) return -1;
+  if (!kms.crtc)
+    return -1;
   drmModeFreeResources(res);
 
   kms.plane_primary_id = 39;
@@ -379,12 +444,23 @@ int main(int argc, char **argv) {
 
   EGLConfig config;
   EGLint num;
-  EGLint attribs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-                      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-                      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE};
+  EGLint attribs[] = {EGL_SURFACE_TYPE,
+                      EGL_PBUFFER_BIT,
+                      EGL_RED_SIZE,
+                      8,
+                      EGL_GREEN_SIZE,
+                      8,
+                      EGL_BLUE_SIZE,
+                      8,
+                      EGL_RENDERABLE_TYPE,
+                      EGL_OPENGL_ES2_BIT,
+                      EGL_NONE};
   eglChooseConfig(kms.egl_disp, attribs, &config, 1, &num);
-  kms.egl_surf = eglCreatePbufferSurface(kms.egl_disp, config, (EGLint[]){EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE});
-  kms.egl_ctx = eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT, (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
+  kms.egl_surf = eglCreatePbufferSurface(
+      kms.egl_disp, config, (EGLint[]){EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE});
+  kms.egl_ctx =
+      eglCreateContext(kms.egl_disp, config, EGL_NO_CONTEXT,
+                       (EGLint[]){EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE});
   eglMakeCurrent(kms.egl_disp, kms.egl_surf, kms.egl_surf, kms.egl_ctx);
   load_egl_extensions();
 
@@ -419,15 +495,17 @@ int main(int argc, char **argv) {
   glEnableVertexAttribArray(loc_pos);
   glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
   glEnableVertexAttribArray(loc_tex);
-  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride, (void *)(2 * sizeof(float)));
+  glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
+                        (void *)(2 * sizeof(float)));
 
   glUniform1i(glGetUniformLocation(kms.prog, "tex_cam"), 0);
 
-  drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
+                  0, 0, 0, 0, 0, 0);
 
   int back_buf = 0;
-  struct pollfd fds = { .fd = camera.fd, .events = POLLIN };
-  
+  struct pollfd fds = {.fd = camera.fd, .events = POLLIN};
+
   struct timespec sec_start, sec_end;
   clock_gettime(CLOCK_MONOTONIC, &sec_start);
   int frames_this_sec = 0;
@@ -436,7 +514,7 @@ int main(int argc, char **argv) {
 
   while (running) {
     if (poll(&fds, 1, 5000) > 0 && (fds.revents & POLLIN)) {
-      
+
       struct v4l2_plane planes[1] = {0};
       struct v4l2_buffer vb = {0};
       vb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -456,7 +534,7 @@ int main(int argc, char **argv) {
 
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_EXTERNAL_OES, camera.bufs[vb.index].tex_id);
-      
+
       glDrawArrays(GL_TRIANGLES, 0, 6);
 
       // Requeue the buffer exactly as it was dequeued
