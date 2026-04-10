@@ -9,6 +9,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -66,6 +67,8 @@ typedef struct {
 
   int width;
   int height;
+  int source_fps_n; // NEW: Numerator
+  int source_fps_d; // NEW: Denominator
   int is_new_frame_ready;
 
   GLuint tex_id;       // Replaces tex_y and tex_uv
@@ -139,6 +142,101 @@ const Rect default_rects[4] = {
     {-1.0f, 0.0f, 1.0f, 1.0f},  // BL (Video 2)
     {0.0f, 0.0f, 1.0f, 1.0f}    // BR (Video 3)
 };
+
+struct termios orig_termios;
+
+volatile Rect current_rects[4];
+volatile int show_metadata = 0;
+volatile long current_fps = 0;
+volatile long current_latency_us = 0;
+
+// Font texture ID
+GLuint font_tex;
+GLuint text_prog; // Add this global
+
+// 96 characters (ASCII 32 to 127), 8 bytes per character (8x8 pixels)
+const unsigned char font8x8[768] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x3C, 0x3C, 0x18,
+    0x18, 0x00, 0x18, 0x00, 0x6C, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6C, 0x6C, 0xFE, 0x6C, 0xFE, 0x6C, 0x6C, 0x00, 0x18, 0x7E, 0xC0, 0x7E,
+    0x06, 0x7E, 0x18, 0x00, 0x00, 0xC6, 0xCC, 0x18, 0x30, 0x66, 0xC6, 0x00,
+    0x38, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0x76, 0x00, 0x18, 0x18, 0x30, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00,
+    0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00, 0x00, 0x66, 0x3C, 0xFF,
+    0x3C, 0x66, 0x00, 0x00, 0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x7E,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00,
+    0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0x80, 0x00, 0x3C, 0x66, 0x6E, 0x76,
+    0x66, 0x66, 0x3C, 0x00, 0x18, 0x38, 0x58, 0x18, 0x18, 0x18, 0x7E, 0x00,
+    0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x3C, 0x66, 0x06, 0x1C,
+    0x06, 0x66, 0x3C, 0x00, 0x1C, 0x3C, 0x6C, 0xCC, 0xFE, 0x0C, 0x0C, 0x00,
+    0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00, 0x3C, 0x66, 0x60, 0x7C,
+    0x66, 0x66, 0x3C, 0x00, 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00,
+    0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00, 0x3C, 0x66, 0x66, 0x3E,
+    0x06, 0x66, 0x3C, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00,
+    0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x30, 0x06, 0x0C, 0x18, 0x30,
+    0x18, 0x0C, 0x06, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x60, 0x30, 0x18, 0x0C, 0x18, 0x30, 0x60, 0x00, 0x3C, 0x66, 0x0C, 0x18,
+    0x18, 0x00, 0x18, 0x00, 0x3C, 0x66, 0x6E, 0x6E, 0x60, 0x66, 0x3C, 0x00,
+    0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00, 0x7C, 0x66, 0x66, 0x7C,
+    0x66, 0x66, 0x7C, 0x00, 0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00,
+    0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00, 0x7E, 0x60, 0x60, 0x78,
+    0x60, 0x60, 0x7E, 0x00, 0x7E, 0x60, 0x60, 0x78, 0x60, 0x60, 0x60, 0x00,
+    0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3C, 0x00, 0x66, 0x66, 0x66, 0x7E,
+    0x66, 0x66, 0x66, 0x00, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00,
+    0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0x00, 0x66, 0x6C, 0x78, 0x70,
+    0x78, 0x6C, 0x66, 0x00, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00,
+    0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00, 0x66, 0x76, 0x7E, 0x7E,
+    0x6E, 0x66, 0x66, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00,
+    0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00, 0x3C, 0x66, 0x66, 0x66,
+    0x66, 0x3C, 0x0E, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x78, 0x6C, 0x66, 0x00,
+    0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00, 0x7E, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x00, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00,
+    0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00, 0x63, 0x63, 0x63, 0x6B,
+    0x7F, 0x77, 0x63, 0x00, 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00,
+    0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00, 0x7E, 0x06, 0x0C, 0x18,
+    0x30, 0x60, 0x7E, 0x00, 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00,
+    0x80, 0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x00, 0x3C, 0x0C, 0x0C, 0x0C,
+    0x0C, 0x0C, 0x3C, 0x00, 0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x30, 0x18, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00,
+    0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00, 0x00, 0x00, 0x3C, 0x60,
+    0x60, 0x60, 0x3C, 0x00, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00,
+    0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00, 0x1C, 0x30, 0x7C, 0x30,
+    0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x3C,
+    0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00, 0x18, 0x00, 0x38, 0x18,
+    0x18, 0x18, 0x3C, 0x00, 0x0C, 0x00, 0x1C, 0x0C, 0x0C, 0x0C, 0x0C, 0x38,
+    0x60, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0x00, 0x38, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0xEC, 0xFE, 0xD6, 0xD6, 0xD6, 0x00,
+    0x00, 0x00, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x3C, 0x66,
+    0x66, 0x66, 0x3C, 0x00, 0x00, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60,
+    0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x00, 0x00, 0x7C, 0x66,
+    0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x00,
+    0x30, 0x30, 0x7C, 0x30, 0x30, 0x34, 0x18, 0x00, 0x00, 0x00, 0x66, 0x66,
+    0x66, 0x66, 0x3E, 0x00, 0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00,
+    0x00, 0x00, 0xC6, 0xD6, 0xFE, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x66, 0x3C,
+    0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C,
+    0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x0E, 0x18, 0x18, 0x70,
+    0x18, 0x18, 0x0E, 0x00, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00,
+    0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0x00, 0x3B, 0x6E, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00};
+
+const char *text_vs_src = "attribute vec2 pos;\n"
+                          "attribute vec2 tex;\n"
+                          "varying vec2 v_tex;\n"
+                          "void main() {\n"
+                          "  gl_Position = vec4(pos, 0.0, 1.0);\n"
+                          "  v_tex = tex;\n"
+                          "}\n";
+
+const char *text_fs_src = "precision mediump float;\n"
+                          "varying vec2 v_tex;\n"
+                          "uniform sampler2D atlas;\n"
+                          "void main() {\n"
+                          "  float alpha = texture2D(atlas, v_tex).r;\n"
+                          "  if (alpha < 0.5) discard;\n"
+                          "  gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
+                          "}\n";
 
 // --- SHADERS ---
 const char *vs_src = "attribute vec4 a_pos;\n"
@@ -365,6 +463,10 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
   vid->width = vinfo.width;
   vid->height = vinfo.height;
 
+  // Extract Source FPS (Numerator / Denominator)
+  vid->source_fps_n = GST_VIDEO_INFO_FPS_N(&vinfo);
+  vid->source_fps_d = GST_VIDEO_INFO_FPS_D(&vinfo);
+
   // Verify memory is DMA-BUF
   GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
   if (!gst_is_dmabuf_memory(mem)) {
@@ -452,14 +554,14 @@ void update_geometry(int step) {
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
   float m = (step + 1) / 6.0f;
-  Rect rects[4];
-  rects[0] = (Rect){-1.0f, -1.0f, m, m};
-  rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
-  rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
-  rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+
+  current_rects[0] = (Rect){-1.0f, -1.0f, m, m};
+  current_rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
+  current_rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
+  current_rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
 
   for (int i = 0; i < 4; i++) {
-    Rect r = rects[i];
+    Rect r = current_rects[i];
     verts[idx++] = r.x;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 0.0f;
@@ -518,6 +620,11 @@ void cleanup() {
   if (kms.vbo)
     glDeleteBuffers(1, &kms.vbo);
 
+  if (text_prog)
+    glDeleteProgram(text_prog);
+  if (font_tex)
+    glDeleteTextures(1, &font_tex);
+
   for (int i = 0; i < 2; i++) {
     if (kms.bufs[i].fbo_id)
       glDeleteFramebuffers(1, &kms.bufs[i].fbo_id);
@@ -561,25 +668,205 @@ void print_second_stats(struct timespec second_start,
   printf("================================\n");
 }
 
-uint32_t get_plane_property_id(int fd, uint32_t plane_id, const char *prop_name) {
-    uint32_t prop_id = 0;
-    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
-    
-    if (!props) return 0;
+uint32_t get_plane_property_id(int fd, uint32_t plane_id,
+                               const char *prop_name) {
+  uint32_t prop_id = 0;
+  drmModeObjectProperties *props =
+      drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
 
-    for (uint32_t i = 0; i < props->count_props; i++) {
-        drmModePropertyRes *prop = drmModeGetProperty(fd, props->props[i]);
-        if (prop) {
-            if (strcmp(prop->name, prop_name) == 0) {
-                prop_id = prop->prop_id;
-            }
-            drmModeFreeProperty(prop);
-            if (prop_id) break; // Found it
-        }
+  if (!props)
+    return 0;
+
+  for (uint32_t i = 0; i < props->count_props; i++) {
+    drmModePropertyRes *prop = drmModeGetProperty(fd, props->props[i]);
+    if (prop) {
+      if (strcmp(prop->name, prop_name) == 0) {
+        prop_id = prop->prop_id;
+      }
+      drmModeFreeProperty(prop);
+      if (prop_id)
+        break; // Found it
     }
-    
-    drmModeFreeObjectProperties(props);
-    return prop_id;
+  }
+
+  drmModeFreeObjectProperties(props);
+  return prop_id;
+}
+
+void init_text_rendering() {
+  // Compile Text Shaders
+  GLuint v = glCreateShader(GL_VERTEX_SHADER);
+  glShaderSource(v, 1, &text_vs_src, 0);
+  glCompileShader(v);
+
+  GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+  glShaderSource(f, 1, &text_fs_src, 0);
+  glCompileShader(f);
+
+  text_prog = glCreateProgram();
+  glAttachShader(text_prog, v);
+  glAttachShader(text_prog, f);
+  glLinkProgram(text_prog);
+
+  glDeleteShader(v);
+  glDeleteShader(f);
+
+  // Unpack the 1-bit font array into an 8-bit luminance texture atlas
+  unsigned char *atlas_data = calloc(96 * 8, 8);
+  for (int c = 0; c < 96; c++) {
+    for (int y = 0; y < 8; y++) {
+      unsigned char row = font8x8[c * 8 + y];
+      for (int x = 0; x < 8; x++) {
+        if (row & (1 << (7 - x))) {
+          atlas_data[y * (96 * 8) + (c * 8) + x] = 255;
+        }
+      }
+    }
+  }
+
+  glGenTextures(1, &font_tex);
+  glBindTexture(GL_TEXTURE_2D, font_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 96 * 8, 8, 0, GL_LUMINANCE,
+               GL_UNSIGNED_BYTE, atlas_data);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  free(atlas_data);
+}
+
+void draw_text(float start_x, float start_y, const char *str) {
+  glUseProgram(text_prog);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, font_tex);
+
+  // Explicitly tell the shader to use texture unit 0
+  glUniform1i(glGetUniformLocation(text_prog, "atlas"), 0);
+
+  // Scale for a 1920x1080 display (adjust if your output resolution is
+  // different)
+  float char_w = 2.0f * (8.0f / 1920.0f);
+  float char_h = 2.0f * (16.0f / 1080.0f);
+
+  int len = strlen(str);
+  GLfloat *verts = malloc(len * 6 * 4 * sizeof(GLfloat));
+  int idx = 0;
+
+  for (int i = 0; i < len; i++) {
+    int c = str[i] - 32;
+    if (c < 0 || c >= 96)
+      c = 63;
+
+    float x = start_x + (i * char_w);
+    float y = start_y;
+
+    float u_start = (float)(c * 8) / (96.0f * 8.0f);
+    float u_end = (float)((c + 1) * 8) / (96.0f * 8.0f);
+
+    // Because the screen Y is inverted, V=0.0 is the top, V=1.0 is the bottom
+    float v_start = 0.0f;
+    float v_end = 1.0f;
+
+    // Use `y + char_h` instead of `y - char_h` to draw downwards
+    // Triangle 1
+    verts[idx++] = x;
+    verts[idx++] = y;
+    verts[idx++] = u_start;
+    verts[idx++] = v_start;
+    verts[idx++] = x + char_w;
+    verts[idx++] = y;
+    verts[idx++] = u_end;
+    verts[idx++] = v_start;
+    verts[idx++] = x;
+    verts[idx++] = y + char_h;
+    verts[idx++] = u_start;
+    verts[idx++] = v_end;
+
+    // Triangle 2
+    verts[idx++] = x + char_w;
+    verts[idx++] = y;
+    verts[idx++] = u_end;
+    verts[idx++] = v_start;
+    verts[idx++] = x + char_w;
+    verts[idx++] = y + char_h;
+    verts[idx++] = u_end;
+    verts[idx++] = v_end;
+    verts[idx++] = x;
+    verts[idx++] = y + char_h;
+    verts[idx++] = u_start;
+    verts[idx++] = v_end;
+  }
+
+  GLuint txt_vbo;
+  glGenBuffers(1, &txt_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, txt_vbo);
+  glBufferData(GL_ARRAY_BUFFER, len * 6 * 4 * sizeof(GLfloat), verts,
+               GL_STREAM_DRAW);
+
+  GLint pos_loc = glGetAttribLocation(text_prog, "pos");
+  GLint tex_loc = glGetAttribLocation(text_prog, "tex");
+
+  glEnableVertexAttribArray(pos_loc);
+  glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
+  glEnableVertexAttribArray(tex_loc);
+  glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
+
+  glDrawArrays(GL_TRIANGLES, 0, len * 6);
+
+  glDisableVertexAttribArray(pos_loc);
+  glDisableVertexAttribArray(tex_loc);
+  glDeleteBuffers(1, &txt_vbo);
+  free(verts);
+}
+
+void reset_terminal_mode() { tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios); }
+
+void set_terminal_raw_mode() {
+  struct termios new_termios;
+  tcgetattr(STDIN_FILENO, &orig_termios);
+  memcpy(&new_termios, &orig_termios, sizeof(new_termios));
+
+  // Disable canonical mode (line buffering) and echo
+  new_termios.c_lflag &= ~(ICANON | ECHO);
+
+  // Set the new attributes immediately
+  tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+
+  // Ensure terminal is restored when program exits normally or crashes
+  atexit(reset_terminal_mode);
+}
+
+void *input_thread(void *arg) {
+  set_terminal_raw_mode();
+
+  while (running) {
+    fd_set readfds;
+    struct timeval tv;
+
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+
+    // 100ms timeout so the loop doesn't block forever
+    // This allows the thread to check 'running' and exit cleanly
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+
+    int ret = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
+
+    if (ret > 0 && FD_ISSET(STDIN_FILENO, &readfds)) {
+      char c;
+      if (read(STDIN_FILENO, &c, 1) > 0) {
+        if (c == 'o' || c == 'O') {
+          show_metadata = !show_metadata;
+        } else if (c == 'q' || c == 'Q' || c == 27) { // 'q' or ESC to quit
+          running = 0; // Signals the main loop to shut down
+        }
+      }
+    }
+  }
+  return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -698,6 +985,8 @@ int main(int argc, char **argv) {
   glLinkProgram(kms.prog);
   glUseProgram(kms.prog);
 
+  init_text_rendering();
+
   glGenBuffers(1, &kms.vbo);
   glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
   glBufferData(GL_ARRAY_BUFFER, 4 * 6 * 4 * sizeof(float), NULL,
@@ -720,19 +1009,23 @@ int main(int argc, char **argv) {
   glUniform1i(glGetUniformLocation(kms.prog, "tex_ext"), 0);
 
   // Find the alpha property ID for plane 41 (overlay)
-  uint32_t alpha_prop_id = get_plane_property_id(kms.fd, kms.plane_overlay_id, "alpha");
+  uint32_t alpha_prop_id =
+      get_plane_property_id(kms.fd, kms.plane_overlay_id, "alpha");
 
   if (alpha_prop_id > 0) {
-      // Set alpha to 0x0000 (fully transparent)
-      int ret = drmModeObjectSetProperty(kms.fd, kms.plane_overlay_id, 
-                                         DRM_MODE_OBJECT_PLANE, alpha_prop_id, 0x0000);
-      if (ret < 0) {
-          fprintf(stderr, "Failed to set alpha to 0: %m\n");
-      } else {
-          printf("Successfully set Plane %d alpha to 0 (Transparent).\n", kms.plane_overlay_id);
-      }
+    // Set alpha to 0x0000 (fully transparent)
+    int ret =
+        drmModeObjectSetProperty(kms.fd, kms.plane_overlay_id,
+                                 DRM_MODE_OBJECT_PLANE, alpha_prop_id, 0x0000);
+    if (ret < 0) {
+      fprintf(stderr, "Failed to set alpha to 0: %m\n");
+    } else {
+      printf("Successfully set Plane %d alpha to 0 (Transparent).\n",
+             kms.plane_overlay_id);
+    }
   } else {
-      printf("Warning: 'alpha' property not found on Plane %d.\n", kms.plane_overlay_id);
+    printf("Warning: 'alpha' property not found on Plane %d.\n",
+           kms.plane_overlay_id);
   }
 
   drmModeSetPlane(kms.fd, kms.plane_overlay_id, kms.crtc->crtc_id, 0, 0, 0, 0,
@@ -742,6 +1035,9 @@ int main(int argc, char **argv) {
   init_perf_stats();
 
   printf("Running 4x Zero-Copy DMA-BUF Video... Press Ctrl+C to exit.\n");
+
+  pthread_t input_tid;
+  pthread_create(&input_tid, NULL, input_thread, NULL);
 
   struct timespec anim_t0, anim_t1;
   clock_gettime(CLOCK_MONOTONIC, &anim_t0);
@@ -818,6 +1114,57 @@ int main(int argc, char **argv) {
     }
     clock_gettime(CLOCK_MONOTONIC, &draw_done);
 
+    // --- NEW TEXT OVERLAY BLOCK ---
+    if (show_metadata) {
+      char buf_src[64];
+      char buf_out[64];
+
+      for (int i = 0; i < VIDEO_COUNT; i++) {
+        // Find the top-left corner using the globally tracked animation state
+        float tl_x = current_rects[i].x + 0.02f;
+        float tl_y = current_rects[i].y + 0.05f;
+
+        // 1. Calculate Source FPS safely
+        int src_fps = 0;
+        if (videos[i].source_fps_d > 0) {
+          src_fps = videos[i].source_fps_n / videos[i].source_fps_d;
+        }
+
+        // 2. Calculate dynamic output pixel size based on the animation
+        // geometry OpenGL NDC width/height is 2.0.
+        int out_px_w = (int)((current_rects[i].w / 2.0f) * kms.mode.hdisplay);
+        int out_px_h = (int)((current_rects[i].h / 2.0f) * kms.mode.vdisplay);
+
+        // 3. Format Line 1 (Source Info)
+        snprintf(buf_src, sizeof(buf_src), "SRC: %dx%d @ %dfps",
+                 videos[i].width, videos[i].height, src_fps);
+
+        // 4. Format Line 2 (Output/Render Info + Latency)
+        snprintf(buf_out, sizeof(buf_out), "OUT: %dx%d @ %ldfps %ldms",
+                 out_px_w, out_px_h, current_fps, current_latency_us / 1000);
+
+        // Draw Line 1
+        draw_text(tl_x, tl_y, buf_src);
+
+        // Draw Line 2 just slightly lower (adjust the 0.04f to change line
+        // spacing)
+        draw_text(tl_x, tl_y + 0.04f, buf_out);
+      }
+
+      // CRITICAL: Rebind the main video shader state for the next frame
+      glUseProgram(kms.prog);
+      glBindBuffer(GL_ARRAY_BUFFER, kms.vbo);
+      GLint loc_pos = glGetAttribLocation(kms.prog, "a_pos");
+      GLint loc_tex = glGetAttribLocation(kms.prog, "a_tex");
+      int stride = 4 * sizeof(float);
+      glEnableVertexAttribArray(loc_pos);
+      glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
+      glEnableVertexAttribArray(loc_tex);
+      glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride,
+                            (void *)(2 * sizeof(float)));
+    }
+    // ------------------------------
+
     glFinish();
 
     drmModeSetPlane(kms.fd, kms.plane_primary_id, kms.crtc->crtc_id,
@@ -847,6 +1194,11 @@ int main(int argc, char **argv) {
                          second_total_upload, second_total_draw,
                          second_total_plane, second_upload_counts,
                          second_draw_counts);
+
+      current_fps = frames_this_second;
+      current_latency_us = (second_total_eos + second_total_upload +
+                            second_total_draw + second_total_plane) /
+                           frames_this_second;
 
       perf.avg_frame_us =
           (perf.avg_frame_us * (perf.frame_count - frames_this_second) +
@@ -881,6 +1233,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  pthread_join(input_tid, NULL);
   cleanup();
   return 0;
 }
