@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -68,6 +70,12 @@ typedef struct {
   EGLSurface egl_surf;
 
   GLuint prog, vbo;
+  
+  // TEXT OVERLAY RESOURCES (Per-Context)
+  GLuint text_prog;
+  GLuint font_tex;
+  long current_fps;
+  long current_latency_us;
 
   // --- ROUTING MATRIX CONFIG ---
   pthread_mutex_t route_lock;
@@ -81,6 +89,8 @@ typedef struct {
   pthread_mutex_t lock;
   GstSample *new_sample;
   int width, height;
+  int source_fps_n; // Source Numerator
+  int source_fps_d; // Source Denominator
 } GstVid;
 
 typedef struct {
@@ -93,6 +103,92 @@ DisplayOutput disp_dp = {0};
 DisplayOutput disp_hdmi = {0};
 GstVid videos[TOTAL_VIDEOS];
 volatile sig_atomic_t running = 1;
+volatile int show_metadata = 0;
+
+// --- TEXT FONT ARRAY ---
+const unsigned char font8x8[768] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x3C, 0x3C, 0x18,
+    0x18, 0x00, 0x18, 0x00, 0x6C, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6C, 0x6C, 0xFE, 0x6C, 0xFE, 0x6C, 0x6C, 0x00, 0x18, 0x7E, 0xC0, 0x7E,
+    0x06, 0x7E, 0x18, 0x00, 0x00, 0xC6, 0xCC, 0x18, 0x30, 0x66, 0xC6, 0x00,
+    0x38, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0x76, 0x00, 0x18, 0x18, 0x30, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00,
+    0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00, 0x00, 0x66, 0x3C, 0xFF,
+    0x3C, 0x66, 0x00, 0x00, 0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x7E,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00,
+    0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0x80, 0x00, 0x3C, 0x66, 0x6E, 0x76,
+    0x66, 0x66, 0x3C, 0x00, 0x18, 0x38, 0x58, 0x18, 0x18, 0x18, 0x7E, 0x00,
+    0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x3C, 0x66, 0x06, 0x1C,
+    0x06, 0x66, 0x3C, 0x00, 0x1C, 0x3C, 0x6C, 0xCC, 0xFE, 0x0C, 0x0C, 0x00,
+    0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00, 0x3C, 0x66, 0x60, 0x7C,
+    0x66, 0x66, 0x3C, 0x00, 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00,
+    0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00, 0x3C, 0x66, 0x66, 0x3E,
+    0x06, 0x66, 0x3C, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00,
+    0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x30, 0x06, 0x0C, 0x18, 0x30,
+    0x18, 0x0C, 0x06, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00,
+    0x60, 0x30, 0x18, 0x0C, 0x18, 0x30, 0x60, 0x00, 0x3C, 0x66, 0x0C, 0x18,
+    0x18, 0x00, 0x18, 0x00, 0x3C, 0x66, 0x6E, 0x6E, 0x60, 0x66, 0x3C, 0x00,
+    0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00, 0x7C, 0x66, 0x66, 0x7C,
+    0x66, 0x66, 0x7C, 0x00, 0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00,
+    0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00, 0x7E, 0x60, 0x60, 0x78,
+    0x60, 0x60, 0x7E, 0x00, 0x7E, 0x60, 0x60, 0x78, 0x60, 0x60, 0x60, 0x00,
+    0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3C, 0x00, 0x66, 0x66, 0x66, 0x7E,
+    0x66, 0x66, 0x66, 0x00, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00,
+    0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0x00, 0x66, 0x6C, 0x78, 0x70,
+    0x78, 0x6C, 0x66, 0x00, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00,
+    0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00, 0x66, 0x76, 0x7E, 0x7E,
+    0x6E, 0x66, 0x66, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00,
+    0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00, 0x3C, 0x66, 0x66, 0x66,
+    0x66, 0x3C, 0x0E, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x78, 0x6C, 0x66, 0x00,
+    0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00, 0x7E, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x18, 0x00, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00,
+    0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00, 0x63, 0x63, 0x63, 0x6B,
+    0x7F, 0x77, 0x63, 0x00, 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00,
+    0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00, 0x7E, 0x06, 0x0C, 0x18,
+    0x30, 0x60, 0x7E, 0x00, 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00,
+    0x80, 0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x00, 0x3C, 0x0C, 0x0C, 0x0C,
+    0x0C, 0x0C, 0x3C, 0x00, 0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x30, 0x18, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00,
+    0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00, 0x00, 0x00, 0x3C, 0x60,
+    0x60, 0x60, 0x3C, 0x00, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00,
+    0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00, 0x1C, 0x30, 0x7C, 0x30,
+    0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x3C,
+    0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00, 0x18, 0x00, 0x38, 0x18,
+    0x18, 0x18, 0x3C, 0x00, 0x0C, 0x00, 0x1C, 0x0C, 0x0C, 0x0C, 0x0C, 0x38,
+    0x60, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0x00, 0x38, 0x18, 0x18, 0x18,
+    0x18, 0x18, 0x3C, 0x00, 0x00, 0x00, 0xEC, 0xFE, 0xD6, 0xD6, 0xD6, 0x00,
+    0x00, 0x00, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x3C, 0x66,
+    0x66, 0x66, 0x3C, 0x00, 0x00, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60,
+    0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x00, 0x00, 0x7C, 0x66,
+    0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x00,
+    0x30, 0x30, 0x7C, 0x30, 0x30, 0x34, 0x18, 0x00, 0x00, 0x00, 0x66, 0x66,
+    0x66, 0x66, 0x3E, 0x00, 0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00,
+    0x00, 0x00, 0xC6, 0xD6, 0xFE, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x66, 0x3C,
+    0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C,
+    0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x0E, 0x18, 0x18, 0x70,
+    0x18, 0x18, 0x0E, 0x00, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00,
+    0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0x00, 0x3B, 0x6E, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00};
+
+const char *text_vs_src = "attribute vec2 pos;\n"
+                          "attribute vec2 tex;\n"
+                          "varying vec2 v_tex;\n"
+                          "void main() {\n"
+                          "  gl_Position = vec4(pos, 0.0, 1.0);\n"
+                          "  v_tex = tex;\n"
+                          "}\n";
+
+const char *text_fs_src =
+    "precision mediump float;\n"
+    "varying vec2 v_tex;\n"
+    "uniform sampler2D atlas;\n"
+    "void main() {\n"
+    "  float alpha = texture2D(atlas, v_tex).r;\n"
+    "  if (alpha < 0.5) discard;\n" 
+    "  gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);\n" 
+    "}\n";
 
 // --- SHADERS & GEOMETRY ---
 const char *vs_src =
@@ -115,29 +211,19 @@ const GLfloat single_verts[6 * 4] = {
     -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f,  1.0f, 1.0f,
     1.0f,  1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f};
 
-// NEW: 2-Video Split Screen Geometry
 const GLfloat split_verts[2 * 6 * 4] = {
-    // Left Video: x=-1 to 0
     -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f,
     0.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f,
-    // Right Video: x=0 to 1
     0.0f, 1.0f, 0.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
     1.0f, 1.0f, 1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f};
 
 const GLfloat grid_verts[4 * 6 * 4] = {
-    // Quad 0 (Draw 1st): Target Top-Left
     -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
     0.0f, 0.0f, 1.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f,
-
-    // Quad 1 (Draw 2nd): Target Top-Right
     0.0f, 0.0f, 0.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f,
     1.0f, 0.0f, 1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f,
-
-    // Quad 2 (Draw 3rd): Target Bottom-Left
     -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f,
     0.0f, 1.0f, 1.0f, 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-
-    // Quad 3 (Draw 4th): Target Bottom-Right
     0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f,
     1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f};
 
@@ -149,6 +235,106 @@ long get_diff_us(struct timespec start, struct timespec end) {
 }
 void make_current(DisplayOutput *disp) {
   eglMakeCurrent(disp->egl_disp, disp->egl_surf, disp->egl_surf, disp->egl_ctx);
+}
+
+// --- TEXT RENDERER (PER-DISPLAY) ---
+void init_text_rendering(DisplayOutput *disp) {
+  GLuint v = glCreateShader(GL_VERTEX_SHADER);
+  glShaderSource(v, 1, &text_vs_src, 0);
+  glCompileShader(v);
+
+  GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+  glShaderSource(f, 1, &text_fs_src, 0);
+  glCompileShader(f);
+
+  disp->text_prog = glCreateProgram();
+  glAttachShader(disp->text_prog, v);
+  glAttachShader(disp->text_prog, f);
+  glLinkProgram(disp->text_prog);
+
+  glDeleteShader(v);
+  glDeleteShader(f);
+
+  unsigned char* atlas_data = calloc(96 * 8, 8); 
+  for (int c = 0; c < 96; c++) {
+    for (int y = 0; y < 8; y++) {
+      unsigned char row = font8x8[c * 8 + y];
+      for (int x = 0; x < 8; x++) {
+        if (row & (1 << (7 - x))) {
+          atlas_data[y * (96 * 8) + (c * 8) + x] = 255;
+        }
+      }
+    }
+  }
+
+  glGenTextures(1, &disp->font_tex);
+  glBindTexture(GL_TEXTURE_2D, disp->font_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 96 * 8, 8, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, atlas_data);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  free(atlas_data);
+}
+
+void draw_text(DisplayOutput *disp, float start_x, float start_y, const char* str) {
+  glUseProgram(disp->text_prog);
+  
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, disp->font_tex);
+  glUniform1i(glGetUniformLocation(disp->text_prog, "atlas"), 0);
+
+  // Adjusted size to 8/16 for smaller text
+  float char_w = 2.0f * (8.0f / (float)disp->mode.hdisplay); 
+  float char_h = 2.0f * (16.0f / (float)disp->mode.vdisplay); 
+
+  int len = strlen(str);
+  GLfloat* verts = malloc(len * 6 * 4 * sizeof(GLfloat)); 
+  int idx = 0;
+
+  for (int i = 0; i < len; i++) {
+    int c = str[i] - 32; 
+    if (c < 0 || c >= 96) c = 63; 
+
+    float x = start_x + (i * char_w);
+    float y = start_y;
+
+    float u_start = (float)(c * 8) / (96.0f * 8.0f);
+    float u_end = (float)((c + 1) * 8) / (96.0f * 8.0f);
+    
+    float v_start = 0.0f; 
+    float v_end = 1.0f;
+
+    // Draw downwards
+    verts[idx++] = x;          verts[idx++] = y;          verts[idx++] = u_start; verts[idx++] = v_start;
+    verts[idx++] = x + char_w; verts[idx++] = y;          verts[idx++] = u_end;   verts[idx++] = v_start;
+    verts[idx++] = x;          verts[idx++] = y + char_h; verts[idx++] = u_start; verts[idx++] = v_end;
+
+    verts[idx++] = x + char_w; verts[idx++] = y;          verts[idx++] = u_end;   verts[idx++] = v_start;
+    verts[idx++] = x + char_w; verts[idx++] = y + char_h; verts[idx++] = u_end;   verts[idx++] = v_end;
+    verts[idx++] = x;          verts[idx++] = y + char_h; verts[idx++] = u_start; verts[idx++] = v_end;
+  }
+
+  GLuint txt_vbo;
+  glGenBuffers(1, &txt_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, txt_vbo);
+  glBufferData(GL_ARRAY_BUFFER, len * 6 * 4 * sizeof(GLfloat), verts, GL_STREAM_DRAW);
+
+  GLint pos_loc = glGetAttribLocation(disp->text_prog, "pos");
+  GLint tex_loc = glGetAttribLocation(disp->text_prog, "tex");
+  
+  glEnableVertexAttribArray(pos_loc);
+  glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 16, (void*)0);
+  glEnableVertexAttribArray(tex_loc);
+  glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE, 16, (void*)8);
+
+  glDrawArrays(GL_TRIANGLES, 0, len * 6);
+
+  glDisableVertexAttribArray(pos_loc);
+  glDisableVertexAttribArray(tex_loc);
+  glDeleteBuffers(1, &txt_vbo);
+  free(verts);
 }
 
 // --- GSTREAMER ---
@@ -177,6 +363,8 @@ static GstPadProbeReturn allocation_probe_cb(GstPad *pad, GstPadProbeInfo *info,
 int init_gstreamer_pipeline(GstVid *vid, const char *filename, int index) {
   pthread_mutex_init(&vid->lock, NULL);
   vid->new_sample = NULL;
+  vid->source_fps_n = 0;
+  vid->source_fps_d = 1;
 
   char pipeline_str[512];
   snprintf(pipeline_str, sizeof(pipeline_str),
@@ -352,6 +540,10 @@ int init_display(DisplayOutput *disp, const char *primary_node,
                         (void *)(2 * sizeof(float)));
 
   glUniform1i(glGetUniformLocation(disp->prog, "tex_ext"), 0);
+  
+  // Initialize text rendering specifically for this context
+  init_text_rendering(disp);
+
   disp->back_buf = 0;
   return 0;
 }
@@ -442,8 +634,6 @@ int create_buffer(DisplayOutput *disp, DumbBuffer *buf) {
   return 0;
 }
 
-// Map the DMA-BUF from the GStreamer pool into the specific Display's EGL
-// context
 GstSample *route_video_to_display(DisplayOutput *disp, GstVid *vid,
                                   GLuint *out_tex_id, EGLImageKHR *out_egl_img,
                                   GstSample *current_local_sample) {
@@ -462,6 +652,12 @@ GstSample *route_video_to_display(DisplayOutput *disp, GstVid *vid,
   GstCaps *caps = gst_sample_get_caps(sample);
   GstVideoInfo vinfo;
   gst_video_info_from_caps(&vinfo, caps);
+  
+  // Extract Source FPS Information
+  vid->source_fps_n = GST_VIDEO_INFO_FPS_N(&vinfo);
+  vid->source_fps_d = GST_VIDEO_INFO_FPS_D(&vinfo);
+  vid->width = vinfo.width;
+  vid->height = vinfo.height;
 
   GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
   int fd = gst_dmabuf_memory_get_fd(mem);
@@ -519,9 +715,8 @@ GstSample *route_video_to_display(DisplayOutput *disp, GstVid *vid,
   return sample;
 }
 
-// --- STANDARD C INPUT THREAD (No ncurses needed) ---
+// --- STANDARD C INPUT THREAD ---
 void print_menu(int target_mon, int *q_vids, int q_count) {
-  // ANSI escape code to clear screen and move cursor to top-left
   printf("\033[H\033[J");
   printf("=================================================\n");
   printf("   HARDWARE VIDEO MATRIX ROUTER (8 CHANNELS)     \n");
@@ -529,7 +724,8 @@ void print_menu(int target_mon, int *q_vids, int q_count) {
   printf(" CONTROLS:\n");
   printf("  [1] Select DP Monitor    [2] Select HDMI Monitor\n");
   printf("  [1-8] Add Videos (Max 4) [ENTER] Apply Layout\n");
-  printf("  [0] Reset All to Default [Q] Quit\n");
+  printf("  [0] Reset All to Default [O] Toggle Metadata\n");
+  printf("  [Q] Quit\n");
   printf("-------------------------------------------------\n");
 
   if (target_mon == -1) {
@@ -547,23 +743,20 @@ void print_menu(int target_mon, int *q_vids, int q_count) {
     else
       printf("\n Press Enter to apply, or keep adding videos.\n");
   }
-  fflush(stdout); // Force print to screen immediately
+  fflush(stdout); 
 }
 
 void *input_thread(void *arg) {
-  // Set terminal to non-canonical, non-echo mode (so you don't have to press
-  // enter for numbers)
   struct termios oldt, newt;
   tcgetattr(STDIN_FILENO, &oldt);
   newt = oldt;
   newt.c_lflag &= ~(ICANON | ECHO);
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-  // Make standard input non-blocking
   int oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
   fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
 
-  int target_mon = -1; // -1: Idle, 0: DP, 1: HDMI
+  int target_mon = -1; 
   int q_vids[4];
   int q_count = 0;
 
@@ -576,8 +769,13 @@ void *input_thread(void *arg) {
         running = 0;
         break;
       }
+      
+      // TOGGLE METADATA
+      if (ch == 'o' || ch == 'O') {
+        show_metadata = !show_metadata;
+        continue;
+      }
 
-      // Global Reset
       if (ch == '0') {
         pthread_mutex_lock(&disp_dp.route_lock);
         disp_dp.num_active_videos = 1;
@@ -595,22 +793,17 @@ void *input_thread(void *arg) {
         continue;
       }
 
-      // Target Selection (Idle State)
       if (target_mon == -1) {
         if (ch == '1' || ch == '2') {
           target_mon = ch - '1';
-          q_vids[0] = (target_mon == 0) ? 0 : 1; // Default base video
+          q_vids[0] = (target_mon == 0) ? 0 : 1;
           q_count = 1;
           print_menu(target_mon, q_vids, q_count);
         }
       }
-      // Adding State
       else {
-        // Number pressed
         if (ch >= '1' && ch <= '8') {
           int vid_idx = ch - '1';
-
-          // Check for Duplicates
           int is_duplicate = 0;
           for (int i = 0; i < q_count; i++) {
             if (q_vids[i] == vid_idx)
@@ -621,9 +814,8 @@ void *input_thread(void *arg) {
             q_vids[q_count++] = vid_idx;
             print_menu(target_mon, q_vids, q_count);
 
-            // Rule 2: Auto-Apply if we hit 4
             if (q_count == 4) {
-              usleep(500000); // Give user half a second to see the text
+              usleep(500000);
               DisplayOutput *d = (target_mon == 0) ? &disp_dp : &disp_hdmi;
               pthread_mutex_lock(&d->route_lock);
               d->num_active_videos = 4;
@@ -637,16 +829,12 @@ void *input_thread(void *arg) {
             }
           }
         }
-        // Enter pressed
         else if (ch == '\n' || ch == '\r') {
           if (q_count == 1) {
-            // Added nothing, reset back to idle
             target_mon = -1;
             q_count = 0;
             print_menu(target_mon, q_vids, q_count);
           } else {
-            // If user queued 3 total videos, drop the last one to fallback to
-            // split-screen (2)
             if (q_count == 3) {
               q_count = 2;
             }
@@ -665,10 +853,9 @@ void *input_thread(void *arg) {
         }
       }
     }
-    usleep(10000); // 10ms poll
+    usleep(10000); 
   }
 
-  // Cleanly restore terminal to normal behavior before exiting
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
   fcntl(STDIN_FILENO, F_SETFL, oldf);
 
@@ -681,6 +868,21 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec,
   *waiting_for_flip = 0;
 }
 
+// Helper to determine the geometry of the current layout for the text overlay
+void get_video_rect(int num_vids, int i, float *x, float *y, float *w, float *h) {
+  if (num_vids == 1) {
+    *x = -1.0f; *y = -1.0f; *w = 2.0f; *h = 2.0f;
+  } else if (num_vids == 2) {
+    *x = (i == 0) ? -1.0f : 0.0f;
+    *y = -1.0f;
+    *w = 1.0f; *h = 2.0f;
+  } else {
+    *x = (i == 0 || i == 2) ? -1.0f : 0.0f;
+    *y = (i < 2) ? -1.0f : 0.0f;
+    *w = 1.0f; *h = 1.0f;
+  }
+}
+
 // --- RENDER THREAD ---
 void *render_loop_thread(void *arg) {
   RenderThreadCtx *ctx = (RenderThreadCtx *)arg;
@@ -690,14 +892,15 @@ void *render_loop_thread(void *arg) {
   EGLImageKHR local_egl_images[TOTAL_VIDEOS] = {0};
   GstSample *local_active_samples[TOTAL_VIDEOS] = {NULL};
 
-  // NEW: Array to track individual video frame updates
   int video_frames_this_second[TOTAL_VIDEOS] = {0};
 
-  struct timespec second_start, second_end;
+  struct timespec second_start, second_end, frame_start, frame_end;
   clock_gettime(CLOCK_MONOTONIC, &second_start);
   int frames_this_second = 0;
 
   while (running) {
+    clock_gettime(CLOCK_MONOTONIC, &frame_start);
+
     for (int i = 0; i < TOTAL_VIDEOS; i++) {
       GstMessage *msg = gst_bus_pop_filtered(videos[i].bus, GST_MESSAGE_EOS);
       if (msg) {
@@ -722,13 +925,11 @@ void *render_loop_thread(void *arg) {
           &local_egl_images[global_vid_idx],
           local_active_samples[global_vid_idx]);
 
-      // If we actually mapped a new frame, increment the video's specific
-      // counter
       if (new_samp) {
         if (local_active_samples[global_vid_idx])
           gst_sample_unref(local_active_samples[global_vid_idx]);
         local_active_samples[global_vid_idx] = new_samp;
-        video_frames_this_second[global_vid_idx]++; // <-- NEW: Track the frame
+        video_frames_this_second[global_vid_idx]++; 
       }
     }
 
@@ -764,11 +965,51 @@ void *render_loop_thread(void *arg) {
         glDrawArrays(GL_TRIANGLES, i * 6, 6);
       }
     }
+
+    // --- TEXT METADATA OVERLAY ---
+    if (show_metadata) {
+      char buf_src[64];
+      char buf_out[64];
+
+      for (int i = 0; i < num_vids; i++) {
+        int global_vid_idx = active_vids[i];
+        float rx, ry, rw, rh;
+        get_video_rect(num_vids, i, &rx, &ry, &rw, &rh);
+
+        float tl_x = rx + 0.02f;
+        float tl_y = ry + 0.05f;
+
+        int src_fps = 0;
+        if (videos[global_vid_idx].source_fps_d > 0) {
+            src_fps = videos[global_vid_idx].source_fps_n / videos[global_vid_idx].source_fps_d;
+        }
+
+        int out_px_w = (int)((rw / 2.0f) * ctx->disp->mode.hdisplay);
+        int out_px_h = (int)((rh / 2.0f) * ctx->disp->mode.vdisplay);
+
+        snprintf(buf_src, sizeof(buf_src), "SRC: %dx%d @ %dfps", 
+                 videos[global_vid_idx].width, videos[global_vid_idx].height, src_fps);
+
+        snprintf(buf_out, sizeof(buf_out), "OUT: %dx%d @ %ldfps %ldms", 
+                 out_px_w, out_px_h, ctx->disp->current_fps, ctx->disp->current_latency_us / 1000);
+
+        draw_text(ctx->disp, tl_x, tl_y, buf_src);
+        draw_text(ctx->disp, tl_x, tl_y + 0.04f, buf_out); 
+      }
+
+      // Restore main shader state
+      glUseProgram(ctx->disp->prog);
+      glBindBuffer(GL_ARRAY_BUFFER, ctx->disp->vbo);
+      glEnableVertexAttribArray(loc_pos);
+      glVertexAttribPointer(loc_pos, 2, GL_FLOAT, GL_FALSE, stride, (void *)0);
+      glEnableVertexAttribArray(loc_tex);
+      glVertexAttribPointer(loc_tex, 2, GL_FLOAT, GL_FALSE, stride, (void *)(2 * sizeof(float)));
+    }
+    // ----------------------------
+
     glFinish();
 
-    // --- REPLACE THE FLIP BLOCK WITH THIS ---
     if (ctx->disp->is_hdmi) {
-      // HDMI requires proper Page Flip Event handling to sync to VSYNC
       int waiting_for_flip = 1;
       drmEventContext evctx = {0};
       evctx.version = 2;
@@ -778,23 +1019,19 @@ void *render_loop_thread(void *arg) {
                       ctx->disp->bufs[ctx->disp->back_buf].fb_id,
                       DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
 
-      // Wait for the hardware VSYNC interrupt cleanly
       fd_set fds;
       while (waiting_for_flip && running) {
         FD_ZERO(&fds);
         FD_SET(ctx->disp->fd, &fds);
-        struct timeval timeout = {.tv_sec = 0,
-                                  .tv_usec = 100000}; // 100ms timeout
+        struct timeval timeout = {.tv_sec = 0, .tv_usec = 100000}; 
         int ret = select(ctx->disp->fd + 1, &fds, NULL, NULL, &timeout);
         if (ret > 0) {
-          drmHandleEvent(ctx->disp->fd,
-                         &evctx); // This triggers page_flip_handler
+          drmHandleEvent(ctx->disp->fd, &evctx); 
         } else {
-          break; // Timeout: prevents the slide show if the driver hiccups
+          break; 
         }
       }
     } else {
-      // DP driver handles synchronous SetPlane perfectly fine
       drmModeSetPlane(
           ctx->disp->fd, ctx->disp->plane_primary_id, ctx->disp->crtc->crtc_id,
           ctx->disp->bufs[ctx->disp->back_buf].fb_id, 0, 0, 0,
@@ -804,22 +1041,24 @@ void *render_loop_thread(void *arg) {
 
     ctx->disp->back_buf = !ctx->disp->back_buf;
     frames_this_second++;
-    // ----------------------------------------
+
+    // Calculate latency for the frame
+    clock_gettime(CLOCK_MONOTONIC, &frame_end);
+    ctx->disp->current_latency_us = get_diff_us(frame_start, frame_end);
 
     clock_gettime(CLOCK_MONOTONIC, &second_end);
     if (get_diff_us(second_start, second_end) >= 1000000) {
       float loop_fps = (frames_this_second * 1000000.0f) /
                        get_diff_us(second_start, second_end);
+      
+      ctx->disp->current_fps = (long)loop_fps; // Save for the text overlay
 
-      // NEW: Print the hardware loop speed, followed by each video's decode
-      // speed
       printf("[%s] Loop: %.1f FPS | ", ctx->name, loop_fps);
       for (int i = 0; i < num_vids; i++) {
         int global_vid_idx = active_vids[i];
         printf("V%d: %d fps ", global_vid_idx + 1,
                video_frames_this_second[global_vid_idx]);
-        video_frames_this_second[global_vid_idx] =
-            0; // Reset for the next second
+        video_frames_this_second[global_vid_idx] = 0;
       }
       printf("\n");
 
@@ -835,7 +1074,7 @@ void *render_loop_thread(void *arg) {
   return NULL;
 }
 
-// --- CLEANUP (Called at exit) ---
+// --- CLEANUP ---
 void cleanup_display(DisplayOutput *disp) {
   if (disp->fd < 0)
     return;
@@ -845,6 +1084,13 @@ void cleanup_display(DisplayOutput *disp) {
       glDeleteProgram(disp->prog);
     if (disp->vbo)
       glDeleteBuffers(1, &disp->vbo);
+      
+    // Cleanup Text Resources
+    if (disp->text_prog)
+      glDeleteProgram(disp->text_prog);
+    if (disp->font_tex)
+      glDeleteTextures(1, &disp->font_tex);
+
     for (int i = 0; i < 2; i++) {
       if (disp->bufs[i].fbo_id)
         glDeleteFramebuffers(1, &disp->bufs[i].fbo_id);
@@ -942,7 +1188,6 @@ int main(int argc, char **argv) {
   pthread_join(hdmi_thread, NULL);
   pthread_join(input_tid, NULL);
 
-  // Ensure terminal restores cleanly
   cleanup();
   printf("\nClean exit.\n");
   return 0;
