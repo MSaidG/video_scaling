@@ -62,6 +62,7 @@ typedef struct {
 VideoSource videos[VIDEO_COUNT];
 
 volatile sig_atomic_t running = 1;
+volatile int pip_mode = 0;
 int waiting_for_flip = 0;
 
 volatile int show_metadata = 0;
@@ -154,8 +155,7 @@ const char *text_fs_src =
     "uniform sampler2D atlas;\n"
     "void main() {\n"
     "  float alpha = texture2D(atlas, v_tex).r;\n"
-    "  if (alpha < 0.5) discard;\n" // Very important for performance: throw
-                                    // away background pixels
+    "  if (alpha < 0.9) discard;\n" 
     "  gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);\n" // Solid Green Text
     "}\n";
 
@@ -192,6 +192,8 @@ const Rect default_rects[4] = {
     {0.0f, -1.0f, 1.0f, 1.0f}   // BR
 };
 
+
+
 volatile int layout_dirty = 1; // Flag to tell Main Thread to re-upload vertices
 
 // --- UTILS ---
@@ -206,9 +208,27 @@ int rects_overlap(Rect r1, Rect r2) {
 }
 
 // Helper: Reset grid to default
+// Helper: Reset grid to default
 void reset_layout() {
-  for (int i = 0; i < 4; i++)
-    slot_rects[i] = default_rects[i];
+  if (pip_mode) {
+    // Picture-in-Picture layout
+    // Slot 0 (Fullscreen, drawn first)
+    slot_rects[0] = (Rect){-1.0f, -1.0f, 2.0f, 2.0f}; 
+    
+    // Slot 1 (Top-Right PiP, drawn on top)
+    // x: 0.45, y: 0.45, w: 0.5, h: 0.5
+    // Ends at x=0.95 and y=0.95, leaving a 0.05 margin from the 1.0 edges.
+    slot_rects[1] = (Rect){0.45f, 0.45f, 0.5f, 0.5f};   
+    
+    // Slots 2 & 3 (Hidden)
+    slot_rects[2] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};   
+    slot_rects[3] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};   
+  } else {
+    // Standard 2x2 Layout
+    for (int i = 0; i < 4; i++) {
+      slot_rects[i] = default_rects[i];
+    }
+  }
   layout_dirty = 1;
 }
 
@@ -963,7 +983,15 @@ long get_diff_us(struct timespec start, struct timespec end) {
          (end.tv_nsec - start.tv_nsec) / 1000;
 }
 
-int main() {
+int main(int argc, char **argv) {
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-pip") == 0) {
+      pip_mode = 1;
+      printf("Starting in Picture-in-Picture Mode!\n");
+    }
+  }
+
   signal(SIGINT, handle_signal);
 
   if (init_kms() != 0)
