@@ -137,6 +137,7 @@ PerfStats perf = {0};
 // --- GLOBALS ---
 GstVid videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
+int pip_mode = 0;
 
 // --- LAYOUT SYSTEM ---
 typedef struct {
@@ -595,17 +596,25 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
 }
 
 void update_geometry(int step) {
-  // [Unchanged: Kept your specific layout sizes]
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
 
-  float m = (step + 1) / 6.0f;
-
   Rect rects[4];
-  rects[0] = (Rect){-1.0f, -1.0f, m, m};
-  rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
-  rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
-  rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+
+  if (pip_mode) {
+    rects[0] = (Rect){-1.0f, -1.0f, 2.0f, 2.0f};
+    rects[1] = (Rect){0.35f, 0.35f, 0.6f, 0.6f};
+    
+    rects[2] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};
+    rects[3] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};
+  } else {
+    // Original Animation/Grid Logic
+    float m = (step + 1) / 6.0f;
+    rects[0] = (Rect){-1.0f, -1.0f, m, m};
+    rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
+    rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
+    rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+  }
 
   for (int i = 0; i < 4; i++) {
     Rect r = rects[i];
@@ -719,15 +728,18 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
 
-  printf("You can enter 'all' as argument to display 4 1080p video.\n");
-  if (argc > 1) {
-    if (strcmp(argv[1], "all") == 0) {
-      for (int i = 0; i < VIDEO_COUNT; i++) {
-        VIDEO_FILES[i] = "earth1.mp4";
+printf("Arguments: 'all' (4x same video) or '--pip' (Picture-in-Picture)\n");
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "all") == 0) {
+      for (int j = 0; j < VIDEO_COUNT; j++) {
+        VIDEO_FILES[j] = "earth1.mp4";
       }
       printf("Variable changed to 1 (all mode)\n");
+    } else if (strcmp(argv[i], "--pip") == 0) {
+      pip_mode = 1;
+      printf("Mode: Picture-in-Picture (PiP)\n");
     } else {
-      printf("Unknown argument: %s\n", argv[1]);
+      printf("Unknown argument: %s\n", argv[i]);
     }
   }
 
