@@ -138,6 +138,7 @@ PerfStats perf = {0};
 GstVid videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
 int enable_anim = 0;
+int pip_mode = 0;
 
 // --- LAYOUT SYSTEM ---
 typedef struct {
@@ -627,18 +628,34 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
 }
 
 void update_geometry(int step) {
-  // [Unchanged: Kept your specific layout sizes]
   GLfloat verts[4 * 6 * 4];
   int idx = 0;
 
-  float m = (step + 1) / 6.0f;
-
   Rect rects[4];
-  rects[0] = (Rect){-1.0f, -1.0f, m, m};
-  rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
-  rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
-  rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
 
+  if (pip_mode) {
+    // Video 0: Fullscreen background
+    rects[0] = (Rect){-1.0f, -1.0f, 2.0f, 2.0f};
+    
+    // Video 1: PiP window in Top-Right
+    // Width and Height are 0.6 (30% of the 2.0 total screen size).
+    // Starting X and Y at 0.35f means it ends at 0.95f, 
+    // leaving a 0.05f margin from the right and top edges.
+    rects[1] = (Rect){0.35f, 0.35f, 0.6f, 0.6f};
+    
+    // Videos 2 & 3: Hidden (Zero dimension triangles are dropped by the GPU)
+    rects[2] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};
+    rects[3] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};
+  } else {
+    // Original Grid/Animation Logic
+    float m = (step + 1) / 6.0f;
+    rects[0] = (Rect){-1.0f, -1.0f, m, m};
+    rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
+    rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
+    rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+  }
+
+  // The rest of the vertex mapping remains untouched
   for (int i = 0; i < 4; i++) {
     Rect r = rects[i];
 
@@ -646,10 +663,12 @@ void update_geometry(int step) {
     verts[idx++] = r.y + r.h;
     verts[idx++] = 0.0f;
     verts[idx++] = 1.0f;
+    
     verts[idx++] = r.x;
     verts[idx++] = r.y;
     verts[idx++] = 0.0f;
     verts[idx++] = 0.0f;
+    
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
@@ -659,10 +678,12 @@ void update_geometry(int step) {
     verts[idx++] = r.y + r.h;
     verts[idx++] = 1.0f;
     verts[idx++] = 1.0f;
+    
     verts[idx++] = r.x;
     verts[idx++] = r.y;
     verts[idx++] = 0.0f;
     verts[idx++] = 0.0f;
+    
     verts[idx++] = r.x + r.w;
     verts[idx++] = r.y;
     verts[idx++] = 1.0f;
@@ -751,7 +772,7 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
 
-  printf("Arguments: 'all' (4x same video), '--anim=yes' or '--anim=no'\n");
+  printf("Arguments: 'all' (4x same video), '--anim=yes', '--anim=no', or '--pip'\n");
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "all") == 0) {
       for (int j = 0; j < VIDEO_COUNT; j++) {
@@ -764,15 +785,15 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--anim=no") == 0) {
       enable_anim = 0;
       printf("Animation: Disabled (Static 2x2 grid)\n");
+    } else if (strcmp(argv[i], "--pip") == 0) {
+      pip_mode = 1; 
+      printf("Mode: Picture-in-Picture\n");
     } else {
       printf("Unknown argument: %s\n", argv[i]);
     }
   }
 
-  kms.fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
-  if (kms.fd < 0) {
-    kms.fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  }
+  kms.fd = open("/dev/dri/card2", O_RDWR | O_CLOEXEC);
   if (kms.fd < 0) {
     perror("Failed to open DRM device");
     return -1;
