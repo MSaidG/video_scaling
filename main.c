@@ -130,6 +130,7 @@ PerfStats perf = {0};
 GstVid videos[VIDEO_COUNT];
 volatile sig_atomic_t running = 1;
 int enable_anim = 0; // Default to static 2x2 grid
+int pip_mode = 0;
 
 // --- LAYOUT SYSTEM ---
 typedef struct {
@@ -550,15 +551,23 @@ void update_texture_gpu(GstVid *vid, int video_idx) {
 }
 
 void update_geometry(int step) {
-  // [Kept exact same update_geometry implementation]
-  GLfloat verts[4 * 6 * 4];
+GLfloat verts[4 * 6 * 4];
   int idx = 0;
-  float m = (step + 1) / 6.0f;
-
-  current_rects[0] = (Rect){-1.0f, -1.0f, m, m};
-  current_rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
-  current_rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
-  current_rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+  
+  if (pip_mode) {
+    current_rects[0] = (Rect){-1.0f, -1.0f, 2.0f, 2.0f};
+    current_rects[1] = (Rect){0.35f, 0.35f, 0.6f, 0.6f};
+    
+    current_rects[2] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};
+    current_rects[3] = (Rect){0.0f, 0.0f, 0.0f, 0.0f};
+  } else {
+    // Eski 2x2 Grid / Animasyon mantığı
+    float m = (step + 1) / 6.0f;
+    current_rects[0] = (Rect){-1.0f, -1.0f, m, m};
+    current_rects[1] = (Rect){0.0f, -1.0f, 1.0f, m};
+    current_rects[2] = (Rect){-1.0f, 0.0f, m, 1.0f};
+    current_rects[3] = (Rect){0.0f, 0.0f, 1.0f, 1.0f};
+  }
 
   for (int i = 0; i < 4; i++) {
     Rect r = current_rects[i];
@@ -873,7 +882,7 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_sigint);
   gst_init(&argc, &argv);
 
-  printf("Arguments: 'all' (4x same video), '--anim=yes' or '--anim=no'\n");
+printf("Arguments: 'all' (4x same video), '--anim=yes', '--anim=no' or '--pip'\n");
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "all") == 0) {
       for (int j = 0; j < VIDEO_COUNT; j++) {
@@ -886,7 +895,11 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--anim=no") == 0) {
       enable_anim = 0;
       printf("Animation: Disabled (Static 2x2 grid)\n");
-    } else {
+    } else if (strcmp(argv[i], "--pip") == 0) { // EKLENEN BLOK BAŞLANGICI
+      pip_mode = 1;
+      printf("Mode: Picture-in-Picture (PiP)\n");
+    } // EKLENEN BLOK BİTİŞİ
+    else {
       printf("Unknown argument: %s\n", argv[i]);
     }
   }
